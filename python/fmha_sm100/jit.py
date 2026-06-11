@@ -10,6 +10,7 @@ To recompile after kernel changes: scripts/clear_fmha_cache.sh
 """
 
 import itertools
+import fcntl
 import logging
 import os
 import shutil
@@ -40,6 +41,19 @@ def _compute_cache_base():
 
 
 CACHE_BASE = _compute_cache_base()
+
+
+def _acquire_file_lock(lock_path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o666)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _release_file_lock(fd):
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
 
 # Kernel sources and CUTLASS headers are shipped inside the package directory
 # so that JIT compilation works from both editable and wheel installs.
@@ -277,12 +291,16 @@ class FMHAVariantManager:
             # Try per-variant .so
             cache_dir = CACHE_BASE / variant_name
             so_path = cache_dir / f"{variant_name}.so"
-            if not so_path.exists():
-                self._compile_only(variant_name, params)
+            lock_fd = _acquire_file_lock(cache_dir / ".compile.lock")
+            try:
+                if not so_path.exists():
+                    self._compile_only(variant_name, params)
 
-            import tvm_ffi
-            module = tvm_ffi.load_module(str(so_path))
-            fn = getattr(module, fn_name)
+                import tvm_ffi
+                module = tvm_ffi.load_module(str(so_path))
+                fn = getattr(module, fn_name)
+            finally:
+                _release_file_lock(lock_fd)
             self._loaded[variant_name] = _VariantWrapper(fn)
             return self._loaded[variant_name]
 
@@ -437,10 +455,14 @@ def _compile_plan_only():
 
 def _compile_plan_module():
     """Compile and load plan kernel."""
-    _do_compile_plan()
-    import tvm_ffi
-    so_path = CACHE_BASE / "plan" / "fmha_sm100_plan.so"
-    return tvm_ffi.load_module(str(so_path))
+    lock_fd = _acquire_file_lock(CACHE_BASE / "plan.lock")
+    try:
+        _do_compile_plan()
+        import tvm_ffi
+        so_path = CACHE_BASE / "plan" / "fmha_sm100_plan.so"
+        return tvm_ffi.load_module(str(so_path))
+    finally:
+        _release_file_lock(lock_fd)
 
 
 def get_plan_fn():
@@ -531,10 +553,14 @@ def get_sparse_topk_module():
     with _sparse_topk_lock:
         if _sparse_topk_module is not None:
             return _sparse_topk_module
-        _do_compile_sparse_topk()
-        import tvm_ffi
-        so_path = CACHE_BASE / "sparse_topk" / "sparse_topk_select.so"
-        _sparse_topk_module = tvm_ffi.load_module(str(so_path))
+        lock_fd = _acquire_file_lock(CACHE_BASE / "sparse_topk.lock")
+        try:
+            _do_compile_sparse_topk()
+            import tvm_ffi
+            so_path = CACHE_BASE / "sparse_topk" / "sparse_topk_select.so"
+            _sparse_topk_module = tvm_ffi.load_module(str(so_path))
+        finally:
+            _release_file_lock(lock_fd)
         return _sparse_topk_module
 
 
@@ -612,8 +638,12 @@ def get_reduction_module():
     with _reduction_lock:
         if _reduction_module is not None:
             return _reduction_module
-        _do_compile_reduction()
-        import tvm_ffi
-        so_path = CACHE_BASE / "reduction" / "fmha_sm100_reduction.so"
-        _reduction_module = tvm_ffi.load_module(str(so_path))
+        lock_fd = _acquire_file_lock(CACHE_BASE / "reduction.lock")
+        try:
+            _do_compile_reduction()
+            import tvm_ffi
+            so_path = CACHE_BASE / "reduction" / "fmha_sm100_reduction.so"
+            _reduction_module = tvm_ffi.load_module(str(so_path))
+        finally:
+            _release_file_lock(lock_fd)
         return _reduction_module

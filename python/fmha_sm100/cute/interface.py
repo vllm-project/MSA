@@ -54,6 +54,10 @@ _SUPPORTED_FWD_MMA_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 _SUPPORTED_DECODE_QHEAD_PER_KV = 16
 
 
+def _to_cute_int32_metadata(t: torch.Tensor):
+    return to_cute_tensor_kvouter(t, assumed_align=4)
+
+
 def _normalize_partial_dtype(partial_dtype: torch.dtype) -> torch.dtype:
     supported = {torch.float32, torch.bfloat16, torch.float16, torch.float8_e4m3fn}
     if partial_dtype not in supported:
@@ -622,6 +626,7 @@ def sparse_atten_func(
     usable_SM_count: int = -1,
     qk_dtype: Optional[torch.dtype] = None,
     pv_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
 ):
     """Run SM100 CSR block-sparse varlen attention.
 
@@ -691,6 +696,9 @@ def sparse_atten_func(
     pv_dtype : torch.dtype, optional
         Compile-time MMA operand dtype for PV.  Defaults to V storage dtype,
         except supported FP8 K/V cache staging modes.
+    out : torch.Tensor, optional
+        Optional BF16 output buffer with shape ``[total_q, Hq, 128]``.  When
+        provided, the combine stage writes directly into this tensor.
 
     Returns
     -------
@@ -737,11 +745,11 @@ def sparse_atten_func(
     max_seqlen_k = int(max_seqlen_k)
 
     return _sparse_atten_csr_varlen_forward(
-        q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
-        k2q_row_ptr.contiguous(),
-        k2q_q_indices.contiguous(),
+        q,
+        k,
+        v,
+        k2q_row_ptr,
+        k2q_q_indices,
         int(topK),
         int(blk_kv),
         bool(causal),
@@ -750,10 +758,10 @@ def sparse_atten_func(
         return_temperature_lse,
         partial_dtype,
         bool(return_softmax_lse),
-        cu_seqlens_q.contiguous(),
-        cu_seqlens_k.contiguous(),
-        None if page_table is None else page_table.contiguous(),
-        None if seqused_k is None else seqused_k.contiguous(),
+        cu_seqlens_q,
+        cu_seqlens_k,
+        page_table,
+        seqused_k,
         schedule,
         int(usable_SM_count),
         int(batch),
@@ -762,6 +770,7 @@ def sparse_atten_func(
         int(max_seqlen_k),
         qk_dtype,
         pv_dtype,
+        out,
     )
 
 
@@ -791,6 +800,7 @@ def sparse_atten_nvfp4_kv_func(
     page_table: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     schedule: Optional[SparseAttentionSchedule] = None,
+    out: Optional[torch.Tensor] = None,
 ):
     """Run SM100 CSR sparse attention with packed NVFP4 K/V.
 
@@ -850,6 +860,9 @@ def sparse_atten_nvfp4_kv_func(
         Effective KV length per request for paged causal attention.
     schedule : SparseAttentionSchedule, optional
         Prebuilt sparse forward schedule.
+    out : torch.Tensor, optional
+        Optional BF16 output buffer with shape ``[total_q, Hq, 128]``.  When
+        provided, the combine stage writes directly into this tensor.
 
     Returns
     -------
@@ -917,7 +930,11 @@ def sparse_atten_nvfp4_kv_func(
         if kernel_return_temperature_lse
         else None
     )
-    O_out = torch.empty(total_q, head_q, dim, dtype=torch.bfloat16, device=q.device)
+    O_out = (
+        out
+        if out is not None
+        else torch.empty(total_q, head_q, dim, dtype=torch.bfloat16, device=q.device)
+    )
     LSE_out = torch.empty(total_q, head_q, dtype=torch.float32, device=q.device)
     LSE_temperature_out = (
         torch.empty_like(LSE_out) if kernel_return_temperature_lse else None
@@ -1449,6 +1466,7 @@ def _sparse_atten_csr_varlen_forward(
     max_seqlen_k: int,
     qk_dtype: torch.dtype,
     pv_dtype: torch.dtype,
+    out: Optional[torch.Tensor],
 ):
     total_q, head_q, dim = q.shape
     if head_q % head_kv != 0:
@@ -1478,7 +1496,11 @@ def _sparse_atten_csr_varlen_forward(
         if kernel_return_temperature_lse
         else None
     )
-    O_out = torch.empty(total_q, head_q, dim, dtype=torch.bfloat16, device=q.device)
+    O_out = (
+        out
+        if out is not None
+        else torch.empty(total_q, head_q, dim, dtype=torch.bfloat16, device=q.device)
+    )
     LSE_out = torch.empty(total_q, head_q, dtype=torch.float32, device=q.device)
     LSE_temperature_out = (
         torch.empty_like(LSE_out) if kernel_return_temperature_lse else None
@@ -1764,10 +1786,10 @@ def _call_sparse_forward_sm100_csr_varlen(
                 else to_cute_tensor_kvouter(LSE_temperature_partial),
                 to_cute_tensor_kvouter(Q_flat),
                 None if Q_gather4_desc is None else to_cute_tensor_kvouter(Q_gather4_desc),
-                None if page_table is None else to_cute_tensor_kvouter(page_table),
-                None if seqused_k is None else to_cute_tensor_kvouter(seqused_k),
-                to_cute_tensor_kvouter(cu_seqlens_q),
-                to_cute_tensor_kvouter(cu_seqlens_k),
+                None if page_table is None else _to_cute_int32_metadata(page_table),
+                None if seqused_k is None else _to_cute_int32_metadata(seqused_k),
+                _to_cute_int32_metadata(cu_seqlens_q),
+                _to_cute_int32_metadata(cu_seqlens_k),
                 Float32(softmax_scale),
                 Float32(lse_temperature_inv_scale),
                 Int32(max_num_kv_blocks),
@@ -1964,10 +1986,10 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
                 else to_cute_tensor_kvouter(LSE_temperature_partial),
                 to_cute_tensor_kvouter(Q_flat),
                 None if Q_gather4_desc is None else to_cute_tensor_kvouter(Q_gather4_desc),
-                None if page_table is None else to_cute_tensor_kvouter(page_table),
-                None if seqused_k is None else to_cute_tensor_kvouter(seqused_k),
-                to_cute_tensor_kvouter(cu_seqlens_q),
-                to_cute_tensor_kvouter(cu_seqlens_k),
+                None if page_table is None else _to_cute_int32_metadata(page_table),
+                None if seqused_k is None else _to_cute_int32_metadata(seqused_k),
+                _to_cute_int32_metadata(cu_seqlens_q),
+                _to_cute_int32_metadata(cu_seqlens_k),
                 Float32(softmax_scale),
                 Float32(lse_temperature_inv_scale),
                 Int32(max_num_kv_blocks),
