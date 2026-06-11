@@ -42,6 +42,10 @@ _ext = load(
 )
 
 
+def _current_stream_ptr(device: torch.device) -> int:
+    return int(torch.cuda.current_stream(device).cuda_stream)
+
+
 def run_build_k2q_csr(
     q2k: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
@@ -78,6 +82,7 @@ def run_build_k2q_csr(
         int(blk_kv),
         int(total_rows),
         int(max_kv_blocks),
+        _current_stream_ptr(q2k.device),
     )
 
 
@@ -117,6 +122,7 @@ def run_build_k2q_csr_with_schedule(
         int(target_q_per_cta),
         int(work_capacity),
         int(max_seqlen_q),
+        _current_stream_ptr(q2k.device),
     )
 
 

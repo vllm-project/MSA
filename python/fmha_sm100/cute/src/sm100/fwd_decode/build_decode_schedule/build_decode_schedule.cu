@@ -3,8 +3,6 @@
 
 #include <torch/extension.h>
 
-#include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/Exceptions.h>
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
 #include <pybind11/pybind11.h>
@@ -18,6 +16,13 @@
 namespace cg = cooperative_groups;
 
 namespace py = pybind11;
+
+#define CUDA_CHECK(expr)                                                     \
+  do {                                                                       \
+    cudaError_t err__ = (expr);                                              \
+    TORCH_CHECK(err__ == cudaSuccess, #expr " failed: ",                    \
+                cudaGetErrorString(err__));                                  \
+  } while (0)
 
 namespace {
 
@@ -471,9 +476,9 @@ std::tuple<int64_t, int64_t, int64_t> estimate_decode_grid_size(
     int64_t /*head_dim*/,
     int64_t max_grid_size_override) {
   int dev_id = 0;
-  AT_CUDA_CHECK(cudaGetDevice(&dev_id));
+  CUDA_CHECK(cudaGetDevice(&dev_id));
   int num_sms = 0;
-  AT_CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+  CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
   if (max_grid_size_override > 0) {
     int64_t active_blocks = std::max<int64_t>(
         1, ceil_div(max_grid_size_override, std::max<int64_t>(num_sms, 1)));
@@ -516,7 +521,8 @@ py::dict build_decode_schedule(
     bool enable_cuda_graph,
     int64_t max_grid_size_override,
     int64_t fixed_split_size,
-    bool disable_split_kv) {
+    bool disable_split_kv,
+    uintptr_t stream_ptr) {
   TORCH_CHECK(seqused_k.is_cuda(), "seqused_k must be a CUDA tensor");
   TORCH_CHECK(seqused_k.scalar_type() == at::kInt, "seqused_k must be int32");
   TORCH_CHECK(seqused_k.dim() == 1, "seqused_k must have shape [B]");
@@ -548,11 +554,11 @@ py::dict build_decode_schedule(
 
   // Host-side derived constants (no D2H needed for these).
   int dev_id = 0;
-  AT_CUDA_CHECK(cudaGetDevice(&dev_id));
+  CUDA_CHECK(cudaGetDevice(&dev_id));
   int compute_major = 0;
-  AT_CUDA_CHECK(cudaDeviceGetAttribute(&compute_major,
-                                       cudaDevAttrComputeCapabilityMajor,
-                                       dev_id));
+  CUDA_CHECK(cudaDeviceGetAttribute(&compute_major,
+                                    cudaDevAttrComputeCapabilityMajor,
+                                    dev_id));
   const int64_t qhead_per_kv = num_qo_heads / num_kv_heads;
   const int64_t packed_q_len = seqlen_q * qhead_per_kv;
   const int64_t cta_tile_q = determine_cta_tile_q(packed_q_len, head_dim, compute_major);
@@ -587,7 +593,7 @@ py::dict build_decode_schedule(
   auto o_indptr_tensor = torch::empty({batch + 1}, i32_options);
   auto info_tensor = torch::empty({5}, i32_options);
 
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream(seqused_k.get_device());
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
   // tpb: threads per CTA.  Use 128 (4 warps) so we have plenty of warps
   // for the per-CTA setup phase and for scatter work.  CTA 0's warp 0
@@ -625,7 +631,7 @@ py::dict build_decode_schedule(
       merge_indptr_tensor.data_ptr<int32_t>(),
       o_indptr_tensor.data_ptr<int32_t>(),
       info_tensor.data_ptr<int32_t>());
-  AT_CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaGetLastError());
 
   // Single D2H sync for the 5 summary scalars.  Payload = 20 bytes.
   auto info_cpu = info_tensor.cpu();

@@ -27,6 +27,10 @@ _extra_cuda_cflags = [
 _ext = None
 
 
+def _current_stream_ptr(device: torch.device) -> int:
+    return int(torch.cuda.current_stream(device).cuda_stream)
+
+
 def _load_ext():
     global _ext
     if _ext is None:
@@ -75,6 +79,7 @@ def build_decode_schedule(
         int(max_grid_size),
         int(fixed_split_size),
         bool(disable_split_kv),
+        _current_stream_ptr(seqused_k.device),
     )
     # The CUDA kernel writes into worst-case-padded buffers (size =
     # batch * num_q_tiles * max_pages_global) but only the first

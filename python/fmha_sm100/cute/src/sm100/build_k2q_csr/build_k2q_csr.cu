@@ -22,16 +22,22 @@
 // global q-sorted output.
 
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdint>
 
 #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be CUDA")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
 #define CHECK_INT(x) TORCH_CHECK((x).scalar_type() == at::kInt, #x " must be int32")
 #define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x); CHECK_INT(x)
+#define CUDA_CHECK(expr)                                                     \
+    do {                                                                     \
+        cudaError_t err__ = (expr);                                          \
+        TORCH_CHECK(err__ == cudaSuccess, #expr " failed: ",                 \
+                    cudaGetErrorString(err__));                              \
+    } while (0)
 
 namespace {
 
@@ -530,6 +536,7 @@ static void launch_pipeline(
     torch::Tensor q_idx,
     int total_rows,
     int max_kv_blocks,
+    uintptr_t stream_ptr,
     torch::Tensor scheduler_metadata = torch::Tensor(),
     torch::Tensor work_count = torch::Tensor(),
     torch::Tensor qsplit_idx = torch::Tensor(),
@@ -544,12 +551,12 @@ static void launch_pipeline(
     TORCH_CHECK(topK == kTopK, "topK runtime != template kTopK");
     int B = (int)cu_q.size(0) - 1;
     auto device = q2k.device();
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
-    AT_CUDA_CHECK(cudaMemsetAsync(
+    CUDA_CHECK(cudaMemsetAsync(
         row_ptr.data_ptr<int>(), 0,
         (size_t)H * (total_rows + 1) * sizeof(int), stream));
-    AT_CUDA_CHECK(cudaMemsetAsync(
+    CUDA_CHECK(cudaMemsetAsync(
         q_idx.data_ptr<int>(), 0xFF,
         (size_t)H * S_Q * kTopK * sizeof(int), stream));
 
@@ -564,15 +571,15 @@ static void launch_pipeline(
     int* split_counts_ptr = emit_schedule ? split_counts.data_ptr<int>() : nullptr;
     int* row_coords_ptr = emit_schedule ? row_coords.data_ptr<int>() : nullptr;
     if (emit_schedule) {
-        AT_CUDA_CHECK(cudaMemsetAsync(work_count_ptr, 0, sizeof(int), stream));
-        AT_CUDA_CHECK(cudaMemsetAsync(
+        CUDA_CHECK(cudaMemsetAsync(work_count_ptr, 0, sizeof(int), stream));
+        CUDA_CHECK(cudaMemsetAsync(
             scheduler_metadata_ptr, 0,
             (size_t)work_capacity * 6 * sizeof(int), stream));
     }
 
     int dev = q2k.get_device();
     int num_sms = 0;
-    AT_CUDA_CHECK(cudaDeviceGetAttribute(
+    CUDA_CHECK(cudaDeviceGetAttribute(
         &num_sms, cudaDevAttrMultiProcessorCount, dev));
 
     // -- Pick kWarps per CTA based on SMEM budget for cursor/hist ---------
@@ -630,9 +637,9 @@ static void launch_pipeline(
         size_t smem_bytes = (size_t)W * per_warp_smem;
         auto hist_fn = k2q_hist_kernel<kTopK, kBlockK, W>;
         auto scat_fn = k2q_scatter_kernel<kTopK, kBlockK, W>;
-        AT_CUDA_CHECK(cudaFuncSetAttribute(
+        CUDA_CHECK(cudaFuncSetAttribute(
             hist_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
-        AT_CUDA_CHECK(cudaFuncSetAttribute(
+        CUDA_CHECK(cudaFuncSetAttribute(
             scat_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
 
         hist_fn<<<G, W * kWarpSize, smem_bytes, stream>>>(
@@ -656,7 +663,7 @@ static void launch_pipeline(
         int pt_grid = H * blocks_per_h;
         if (pt_grid < 1) pt_grid = 1;
         size_t pt_smem = (size_t)kPtRowsPerBlock * G_total * sizeof(int);
-        AT_CUDA_CHECK(cudaFuncSetAttribute(
+        CUDA_CHECK(cudaFuncSetAttribute(
             tprefix_smem_fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
             (int)pt_smem));
         tprefix_smem_fn<<<pt_grid, kPtThreads, pt_smem, stream>>>(
@@ -689,7 +696,8 @@ void run_build_k2q_csr(
     int64_t topk,
     int64_t blk_kv,
     int64_t total_rows,
-    int64_t max_kv_blocks)
+    int64_t max_kv_blocks,
+    uintptr_t stream_ptr)
 {
     CHECK_INPUT(q2k);
     CHECK_INPUT(cu_q);
@@ -708,24 +716,28 @@ void run_build_k2q_csr(
     TORCH_CHECK(q_idx.size(0) == H && q_idx.size(1) == (int64_t)S_Q * (int)topk,
                 "q_idx shape mismatch");
     if (S_Q == 0 || tr == 0 || H == 0 || mkv == 0) {
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-        AT_CUDA_CHECK(cudaMemsetAsync(
+        cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+        CUDA_CHECK(cudaMemsetAsync(
             row_ptr.data_ptr<int>(), 0,
             (size_t)H * (tr + 1) * sizeof(int), stream));
-        AT_CUDA_CHECK(cudaMemsetAsync(
+        CUDA_CHECK(cudaMemsetAsync(
             q_idx.data_ptr<int>(), 0xFF,
             (size_t)H * S_Q * (int)topk * sizeof(int), stream));
         return;
     }
 
     if (topk == 16) {
-        launch_pipeline<16, 128>(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv);
+        launch_pipeline<16, 128>(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
+                                 stream_ptr);
     } else if (topk == 8) {
-        launch_pipeline<8, 128>(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv);
+        launch_pipeline<8, 128>(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
+                                stream_ptr);
     } else if (topk == 32) {
-        launch_pipeline<32, 128>(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv);
+        launch_pipeline<32, 128>(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
+                                 stream_ptr);
     } else if (topk == 4) {
-        launch_pipeline<4, 128>(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv);
+        launch_pipeline<4, 128>(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
+                                stream_ptr);
     } else {
         TORCH_CHECK(false, "unsupported topK ", topk, " (expected 4, 8, 16, or 32)");
     }
@@ -747,7 +759,8 @@ void run_build_k2q_csr_with_schedule(
     int64_t max_kv_blocks,
     int64_t target_q_per_cta,
     int64_t work_capacity,
-    int64_t max_seqlen_q)
+    int64_t max_seqlen_q,
+    uintptr_t stream_ptr)
 {
     CHECK_INPUT(q2k);
     CHECK_INPUT(cu_q);
@@ -780,16 +793,16 @@ void run_build_k2q_csr_with_schedule(
                 && split_counts.size(1) == H,
                 "split_counts shape mismatch");
     if (S_Q == 0 || tr == 0 || H == 0 || mkv == 0) {
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-        AT_CUDA_CHECK(cudaMemsetAsync(
+        cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+        CUDA_CHECK(cudaMemsetAsync(
             row_ptr.data_ptr<int>(), 0,
             (size_t)H * (tr + 1) * sizeof(int), stream));
-        AT_CUDA_CHECK(cudaMemsetAsync(
+        CUDA_CHECK(cudaMemsetAsync(
             q_idx.data_ptr<int>(), 0xFF,
             (size_t)H * S_Q * (int)topk * sizeof(int), stream));
-        AT_CUDA_CHECK(cudaMemsetAsync(work_count.data_ptr<int>(), 0, sizeof(int), stream));
+        CUDA_CHECK(cudaMemsetAsync(work_count.data_ptr<int>(), 0, sizeof(int), stream));
         if (split_counts.numel() > 0) {
-            AT_CUDA_CHECK(cudaMemsetAsync(
+            CUDA_CHECK(cudaMemsetAsync(
                 split_counts.data_ptr<int>(), 0,
                 (size_t)split_counts.numel() * sizeof(int), stream));
         }
@@ -798,22 +811,22 @@ void run_build_k2q_csr_with_schedule(
 
     if (topk == 16) {
         launch_pipeline<16, 128>(
-            q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
+            q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv, stream_ptr,
             scheduler_metadata, work_count, qsplit_idx, split_counts,
             target, capacity, max_sq);
     } else if (topk == 8) {
         launch_pipeline<8, 128>(
-            q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
+            q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv, stream_ptr,
             scheduler_metadata, work_count, qsplit_idx, split_counts,
             target, capacity, max_sq);
     } else if (topk == 32) {
         launch_pipeline<32, 128>(
-            q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
+            q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv, stream_ptr,
             scheduler_metadata, work_count, qsplit_idx, split_counts,
             target, capacity, max_sq);
     } else if (topk == 4) {
         launch_pipeline<4, 128>(
-            q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
+            q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv, stream_ptr,
             scheduler_metadata, work_count, qsplit_idx, split_counts,
             target, capacity, max_sq);
     } else {
@@ -832,7 +845,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("topk"),
           pybind11::arg("blk_kv"),
           pybind11::arg("total_rows"),
-          pybind11::arg("max_kv_blocks"));
+          pybind11::arg("max_kv_blocks"),
+          pybind11::arg("stream_ptr"));
     m.def("run_build_k2q_csr_with_schedule", &run_build_k2q_csr_with_schedule,
           "q2k -> k2q CSR build with fused attention schedule metadata",
           pybind11::arg("q2k"),
@@ -850,5 +864,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("max_kv_blocks"),
           pybind11::arg("target_q_per_cta"),
           pybind11::arg("work_capacity"),
-          pybind11::arg("max_seqlen_q"));
+          pybind11::arg("max_seqlen_q"),
+          pybind11::arg("stream_ptr"));
 }
