@@ -7,7 +7,13 @@ Provides fmha_sm100_plan() and fmha_sm100() interfaces
 with per-variant lazy JIT compilation.
 """
 
-from .api import fmha_sm100, fmha_sm100_plan, sparse_topk_select
+_DENSE_LAZY_EXPORTS = frozenset(
+    {
+        "fmha_sm100",
+        "fmha_sm100_plan",
+        "sparse_topk_select",
+    }
+)
 
 # Public symbols of the CuTe-DSL sparse stack (implemented in fmha_sm100.sparse).
 # Re-exported lazily so a bare ``import fmha_sm100`` does not pull in the
@@ -25,9 +31,7 @@ _SPARSE_LAZY_EXPORTS = frozenset(
 )
 
 __all__ = [
-    "fmha_sm100_plan",
-    "fmha_sm100",
-    "sparse_topk_select",
+    *sorted(_DENSE_LAZY_EXPORTS),
     *sorted(_SPARSE_LAZY_EXPORTS),
 ]
 
@@ -35,6 +39,10 @@ __all__ = [
 def __getattr__(name):
     # PEP 562 module-level hook: resolve sparse symbols on first access by
     # importing the fmha_sm100.sparse shim (which loads the CuTe-DSL stack).
+    if name in _DENSE_LAZY_EXPORTS:
+        from . import api as _api
+
+        return getattr(_api, name)
     if name in _SPARSE_LAZY_EXPORTS:
         from . import sparse as _sparse
 
@@ -43,12 +51,17 @@ def __getattr__(name):
 
 
 def __dir__():
-    return sorted({*globals(), *_SPARSE_LAZY_EXPORTS})
+    return sorted({*globals(), *_DENSE_LAZY_EXPORTS, *_SPARSE_LAZY_EXPORTS})
 
 try:
     import ctypes
     import tvm_ffi
     import torch
+    from .api import (
+        fmha_sm100 as _fmha_sm100_api,
+        fmha_sm100_plan as _fmha_sm100_plan_api,
+        sparse_topk_select as _sparse_topk_select_api,
+    )
 
     _FP8_DTYPE_MAP = {
         'float8_e4m3fn': torch.float8_e4m3fn,
@@ -88,16 +101,16 @@ try:
 
     def _fmha_sm100_plan_ffi(*args):
         args = [_tvm_to_torch(a) for a in args]
-        return fmha_sm100_plan(*args)
+        return _fmha_sm100_plan_api(*args)
 
     def _fmha_sm100_ffi(*args):
         args = [_tvm_to_torch(a) for a in args]
-        out, max_score = fmha_sm100(*args)
+        out, max_score = _fmha_sm100_api(*args)
         return out, max_score
 
     def _sparse_topk_select_ffi(*args):
         args = [_tvm_to_torch(a) for a in args]
-        return sparse_topk_select(*args)
+        return _sparse_topk_select_api(*args)
 
     tvm_ffi.register_global_func("minfer.ops.fmha_sm100_plan", _fmha_sm100_plan_ffi)
     tvm_ffi.register_global_func("minfer.ops.fmha_sm100", _fmha_sm100_ffi)
