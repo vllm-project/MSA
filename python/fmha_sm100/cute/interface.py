@@ -626,6 +626,7 @@ def sparse_atten_func(
     usable_SM_count: int = -1,
     qk_dtype: Optional[torch.dtype] = None,
     pv_dtype: Optional[torch.dtype] = None,
+    output_scale: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ):
     """Run SM100 CSR block-sparse varlen attention.
@@ -696,6 +697,9 @@ def sparse_atten_func(
     pv_dtype : torch.dtype, optional
         Compile-time MMA operand dtype for PV.  Defaults to V storage dtype,
         except supported FP8 K/V cache staging modes.
+    output_scale : torch.Tensor, optional
+        Optional FP32 device scalar applied in the combine stage before writing
+        the final output.
     out : torch.Tensor, optional
         Optional BF16 output buffer with shape ``[total_q, Hq, 128]``.  When
         provided, the combine stage writes directly into this tensor.
@@ -770,6 +774,7 @@ def sparse_atten_func(
         int(max_seqlen_k),
         qk_dtype,
         pv_dtype,
+        output_scale,
         out,
     )
 
@@ -1466,6 +1471,7 @@ def _sparse_atten_csr_varlen_forward(
     max_seqlen_k: int,
     qk_dtype: torch.dtype,
     pv_dtype: torch.dtype,
+    output_scale: Optional[torch.Tensor],
     out: Optional[torch.Tensor],
 ):
     total_q, head_q, dim = q.shape
@@ -1561,6 +1567,7 @@ def _sparse_atten_csr_varlen_forward(
         cu_seqlens=cu_seqlens_q,
         split_counts=split_counts,
         use_pdl=True,
+        output_scale=output_scale,
     )
     if temperature_lse_fast_path:
         LSE_temperature_out = LSE_out
