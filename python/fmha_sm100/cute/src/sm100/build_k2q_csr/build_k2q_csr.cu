@@ -32,6 +32,18 @@
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
 #define CHECK_INT(x) TORCH_CHECK((x).scalar_type() == at::kInt, #x " must be int32")
 #define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x); CHECK_INT(x)
+// q2k may be a strided outer view (e.g. transposed GQA); the int4 loads need
+// only topK contiguous, int4-aligned (mult-of-4) outer strides, and 16B base.
+#define CHECK_Q2K_LAYOUT(x)                                                   \
+    CHECK_CUDA(x); CHECK_INT(x);                                              \
+    TORCH_CHECK((x).dim() == 3,                                              \
+                #x " must be rank-3 [head_kv, total_q, topK]");              \
+    TORCH_CHECK((x).stride(2) == 1,                                          \
+                #x " innermost (topK) dim must be contiguous (stride 1)");   \
+    TORCH_CHECK((x).stride(0) % 4 == 0 && (x).stride(1) % 4 == 0,            \
+                #x " head/seq strides must be int4-aligned (multiple of 4)"); \
+    TORCH_CHECK((reinterpret_cast<uintptr_t>((x).data_ptr<int>()) % 16) == 0, \
+                #x " base pointer must be 16-byte aligned")
 #define CUDA_CHECK(expr)                                                     \
     do {                                                                     \
         cudaError_t err__ = (expr);                                          \
@@ -123,7 +135,8 @@ __global__ void k2q_hist_kernel(
     int* __restrict__ tile_counts,
     int H, int B, int S_Q,
     int total_rows, int max_kv_blocks,
-    int q_per_cta, int q_per_warp)
+    int q_per_cta, int q_per_warp,
+    int q2k_head_stride, int q2k_q_stride)
 {
     constexpr int kThreads = kWarps * kWarpSize;
     extern __shared__ int smem_hist_int[];
@@ -150,8 +163,10 @@ __global__ void k2q_hist_kernel(
             int qi = q_start_warp + lane;
             advance_batch_only(cu_q, B, qi, bi);
 
+            // Strided q2k base (contiguous => h*S_Q*kTopK, q_stride_i4 = kTopK/4).
             int4 const* head_topk4 =
-                reinterpret_cast<int4 const*>(q2k + (size_t)h * S_Q * kTopK);
+                reinterpret_cast<int4 const*>(q2k + (size_t)h * q2k_head_stride);
+            int const q_stride_i4 = q2k_q_stride >> 2;
 
             for (; qi < q_end_warp; qi += kWarpSize) {
                 advance_batch_only(cu_q, B, qi, bi);
@@ -160,7 +175,7 @@ __global__ void k2q_hist_kernel(
                 int4 buf[kInt4PerToken];
                 #pragma unroll
                 for (int v = 0; v < kInt4PerToken; ++v) {
-                    buf[v] = head_topk4[(size_t)qi * kInt4PerToken + v];
+                    buf[v] = head_topk4[(size_t)qi * q_stride_i4 + v];
                 }
                 #pragma unroll
                 for (int t = 0; t < kTopK; ++t) {
@@ -370,7 +385,8 @@ __global__ void k2q_scatter_kernel(
     int H, int B, int S_Q,
     int total_rows, int max_kv_blocks,
     int q_per_cta, int q_per_warp,
-    int max_seqlen_q)
+    int max_seqlen_q,
+    int q2k_head_stride, int q2k_q_stride)
 {
     constexpr int kQPerIter = kWarpSize / kTopK > 0 ? kWarpSize / kTopK : 1;
     extern __shared__ int smem_cursor_int[];
@@ -400,7 +416,8 @@ __global__ void k2q_scatter_kernel(
             int bi = 0;
             advance_batch_only(cu_q, B, q_start_warp, bi);
 
-            int const* head_q2k = q2k + (size_t)h * S_Q * kTopK;
+            // Strided q2k base; head_qidx keeps h*S_Q*kTopK (q_idx is contiguous).
+            int const* head_q2k = q2k + (size_t)h * q2k_head_stride;
             int const* my_abs_base =
                 abs_base + ((size_t)(c * kWarps + warp_id) * H + h) * total_rows;
             int* head_qidx = q_idx + (size_t)h * S_Q * kTopK;
@@ -428,7 +445,7 @@ __global__ void k2q_scatter_kernel(
                         advance_batch_only(cu_q, B, qi_u, bi);
                         qloc[u] = qi_u - cu_q[bi];
                         batch[u] = bi;
-                        kvb[u] = head_q2k[(size_t)qi_u * kTopK + slot_in_q];
+                        kvb[u] = head_q2k[(size_t)qi_u * q2k_q_stride + slot_in_q];
                     }
                     rmap[u] = row_map + (size_t)bi * max_kv_blocks;
                 }
@@ -488,7 +505,7 @@ __global__ void k2q_scatter_kernel(
                     advance_batch_only(cu_q, B, my_qi, bi);
                     batch_local = bi;
                     q_local = my_qi - cu_q[bi];
-                    kvb_local = head_q2k[(size_t)my_qi * kTopK + slot_in_q];
+                    kvb_local = head_q2k[(size_t)my_qi * q2k_q_stride + slot_in_q];
                 }
                 int const* my_row_map = row_map + (size_t)bi * max_kv_blocks;
                 int row = -1;
@@ -549,6 +566,9 @@ static void launch_pipeline(
     int S_Q = (int)q2k.size(1);
     int topK = (int)q2k.size(2);
     TORCH_CHECK(topK == kTopK, "topK runtime != template kTopK");
+    // Head/seq strides for strided q2k (contiguous => S_Q*kTopK, kTopK).
+    int q2k_head_stride = (int)q2k.stride(0);
+    int q2k_q_stride = (int)q2k.stride(1);
     int B = (int)cu_q.size(0) - 1;
     auto device = q2k.device();
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
@@ -645,7 +665,8 @@ static void launch_pipeline(
         hist_fn<<<G, W * kWarpSize, smem_bytes, stream>>>(
             q2k.data_ptr<int>(), cu_q.data_ptr<int>(), row_map.data_ptr<int>(),
             row_counts.data_ptr<int>(), tile_counts.data_ptr<int>(),
-            H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp);
+            H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp,
+            q2k_head_stride, q2k_q_stride);
 
         rprefix_fn<<<H, 1024, 0, stream>>>(
             row_counts.data_ptr<int>(), row_ptr.data_ptr<int>(),
@@ -675,7 +696,8 @@ static void launch_pipeline(
             tile_counts.data_ptr<int>(), q_idx.data_ptr<int>(),
             qsplit_idx_ptr, split_counts_ptr,
             H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp,
-            max_seqlen_q);
+            max_seqlen_q,
+            q2k_head_stride, q2k_q_stride);
     };
 
     if (kWarps_pick == 4) {
@@ -699,7 +721,7 @@ void run_build_k2q_csr(
     int64_t max_kv_blocks,
     uintptr_t stream_ptr)
 {
-    CHECK_INPUT(q2k);
+    CHECK_Q2K_LAYOUT(q2k);
     CHECK_INPUT(cu_q);
     CHECK_INPUT(cu_k);
     CHECK_INPUT(row_ptr);
@@ -762,7 +784,7 @@ void run_build_k2q_csr_with_schedule(
     int64_t max_seqlen_q,
     uintptr_t stream_ptr)
 {
-    CHECK_INPUT(q2k);
+    CHECK_Q2K_LAYOUT(q2k);
     CHECK_INPUT(cu_q);
     CHECK_INPUT(cu_k);
     CHECK_INPUT(row_ptr);

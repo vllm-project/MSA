@@ -1471,6 +1471,96 @@ def test_k2q_csr_builder_matches_torch_reference(
     torch.testing.assert_close(inputs["k2q_q_indices"], ref_q_indices, atol=0, rtol=0)
 
 
+def test_build_k2q_csr_accepts_non_contiguous_q2k() -> None:
+    """build_k2q_csr must accept a non-contiguous q2k view.
+
+    The SM100 kernel needs a contiguous ``[head_kv, total_q, topK]`` buffer, but
+    callers (e.g. GQA layouts that transpose ``[total_q, head_kv, topK]``) may
+    pass a non-contiguous view. The builder must normalise it internally and
+    produce CSR output identical to the already-contiguous case.
+    """
+    seqlen_q = 256
+    seqlen_k = 512
+    blk_kv = 128
+    topk = 4
+    head_kv = 2
+
+    # Contiguous reference: every q token selects KV blocks [0, topk).
+    q2k_ref = (
+        torch.arange(topk, device="cuda", dtype=torch.int32)
+        .view(1, 1, topk)
+        .expand(head_kv, seqlen_q, topk)
+        .contiguous()
+    )
+    # Same values, non-contiguous: allocate [total_q, head_kv, topK] then
+    # transpose the leading dims (mirrors a common caller layout).
+    q2k_t = torch.empty(seqlen_q, head_kv, topk, device="cuda", dtype=torch.int32)
+    q2k_t.copy_(q2k_ref.transpose(0, 1))
+    q2k_noncontig = q2k_t.transpose(0, 1)
+    assert not q2k_noncontig.is_contiguous()
+    assert torch.equal(q2k_noncontig, q2k_ref)
+
+    cu_seqlens_q = torch.tensor([0, seqlen_q], device="cuda", dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, seqlen_k], device="cuda", dtype=torch.int32)
+    build_kwargs = dict(
+        total_k=seqlen_k,
+        max_seqlen_k=seqlen_k,
+        total_rows=seqlen_k // blk_kv,
+    )
+    ref_row_ptr, ref_q_indices = build_k2q_csr(
+        q2k_ref, cu_seqlens_q, cu_seqlens_k, blk_kv, **build_kwargs
+    )
+    got_row_ptr, got_q_indices = build_k2q_csr(
+        q2k_noncontig, cu_seqlens_q, cu_seqlens_k, blk_kv, **build_kwargs
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(got_row_ptr, ref_row_ptr, atol=0, rtol=0)
+    torch.testing.assert_close(got_q_indices, ref_q_indices, atol=0, rtol=0)
+
+    # Also exercise the fused-schedule entry point (the path taken by the
+    # forward kernel) on the same non-contiguous view.
+    sched_kwargs = dict(
+        **build_kwargs, max_seqlen_q=seqlen_q, return_schedule=True
+    )
+    ref_sched = build_k2q_csr(
+        q2k_ref, cu_seqlens_q, cu_seqlens_k, blk_kv, **sched_kwargs
+    )
+    got_sched = build_k2q_csr(
+        q2k_noncontig, cu_seqlens_q, cu_seqlens_k, blk_kv, **sched_kwargs
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(got_sched[0], ref_sched[0], atol=0, rtol=0)
+    torch.testing.assert_close(got_sched[1], ref_sched[1], atol=0, rtol=0)
+    assert int(got_sched[2].work_count.item()) == int(ref_sched[2].work_count.item())
+
+
+def test_build_k2q_csr_rejects_misaligned_q2k() -> None:
+    """A non-int4-aligned q2k layout must fail loudly, not be silently copied.
+
+    A view whose innermost topK dim is not contiguous (stride(2) != 1) cannot
+    feed the kernel's vectorised int4 loads, so build_k2q_csr must raise.
+    """
+    seqlen_q = 256
+    seqlen_k = 512
+    topk = 4
+    head_kv = 2
+    # [head_kv, topK, total_q] -> transpose last two dims gives the required
+    # [head_kv, total_q, topK] shape but with stride(2) == seqlen_q != 1.
+    q2k_bad = (
+        torch.zeros(head_kv, topk, seqlen_q, device="cuda", dtype=torch.int32)
+        .transpose(1, 2)
+    )
+    assert q2k_bad.shape == (head_kv, seqlen_q, topk)
+    assert q2k_bad.stride(2) != 1
+    cu_seqlens_q = torch.tensor([0, seqlen_q], device="cuda", dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, seqlen_k], device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError):
+        build_k2q_csr(
+            q2k_bad, cu_seqlens_q, cu_seqlens_k, 128,
+            total_k=seqlen_k, max_seqlen_k=seqlen_k, total_rows=seqlen_k // 128,
+        )
+
+
 @pytest.mark.parametrize("check_empty", [False, True])
 @pytest.mark.parametrize("lse_temperature_scale", [None, 2.0])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])

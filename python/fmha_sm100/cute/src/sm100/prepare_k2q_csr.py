@@ -80,8 +80,22 @@ class SparseK2qCsrBuilderSm100:
                 f"q2k_indices must be rank-3 [head_kv, total_q, topK], "
                 f"got shape {tuple(q2k_indices.shape)}"
             )
-        if not q2k_indices.is_contiguous():
-            raise ValueError("q2k_indices must be contiguous")
+        # Kernel int4 loads require a contiguous topK dim, int4-aligned
+        # (multiple-of-4) head/seq strides, and a 16B-aligned base. Enforce
+        # strictly so a misaligned caller fails loudly instead of paying a
+        # silent contiguous-copy on the hot path.
+        if (
+            q2k_indices.stride(2) != 1
+            or q2k_indices.stride(0) % 4 != 0
+            or q2k_indices.stride(1) % 4 != 0
+            or q2k_indices.data_ptr() % 16 != 0
+        ):
+            raise ValueError(
+                "q2k_indices must have a contiguous topK dim, int4-aligned "
+                "(multiple-of-4) head/seq strides, and a 16-byte-aligned base; "
+                f"got strides {tuple(q2k_indices.stride())} and "
+                f"data_ptr % 16 == {q2k_indices.data_ptr() % 16}"
+            )
         if cu_seqlens_q.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32:
             raise TypeError("cu_seqlens_q and cu_seqlens_k must be torch.int32")
         if cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1:
