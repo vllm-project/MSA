@@ -60,7 +60,9 @@ def run_build_k2q_csr(
     """In-place fill of ``row_ptr`` and ``q_idx``.
 
     Args:
-      q2k:           int32 [H, total_q, topK] contiguous (CUDA).
+      q2k:           int32 [H, total_q, topK] (CUDA). The topK dim must be
+                     contiguous; outer (head, seq) strides must be int4-aligned
+                     (multiples of 4), so transposed GQA views are accepted.
       cu_seqlens_q:  int32 [B+1] contiguous (CUDA).
       cu_seqlens_k:  int32 [B+1] contiguous (CUDA).
       row_ptr:       int32 [H, total_rows + 1] CUDA, written in place.

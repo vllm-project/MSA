@@ -350,8 +350,11 @@ def build_k2q_csr(
     Parameters
     ----------
     q2k_indices : torch.Tensor
-        Shape ``[head_kv, total_q, topK]``, dtype int32, contiguous.  Values are
-        batch-local KV block indices with trailing ``-1`` padding.
+        Shape ``[head_kv, total_q, topK]``, dtype int32.  The innermost ``topK``
+        dim must be contiguous and the head/seq strides int4-aligned (multiples
+        of 4) with a 16-byte-aligned base, so a transposed GQA view is consumed
+        directly; other layouts raise ``ValueError``.  Values are batch-local KV
+        block indices with trailing ``-1`` padding.
     cu_seqlens_q : torch.Tensor
         Shape ``[batch_size + 1]``, dtype int32.  Prefix sums of Q lengths.
     cu_seqlens_k : torch.Tensor
@@ -389,8 +392,8 @@ def build_k2q_csr(
         raise TypeError(f"q2k_indices must be torch.int32, got {q2k_indices.dtype}")
     if q2k_indices.ndim != 3:
         raise ValueError(f"q2k_indices must be rank-3, got shape {tuple(q2k_indices.shape)}")
-    if not q2k_indices.is_contiguous():
-        raise ValueError("q2k_indices must be contiguous with layout [head_kv, total_q, topK]")
+    # Full contiguity not required: the builder takes int4-aligned strided
+    # views directly (and raises on layouts it cannot consume).
     _validate_cu_seqlens(cu_seqlens_q, name="cu_seqlens_q")
     _validate_cu_seqlens(cu_seqlens_k, name="cu_seqlens_k")
     if cu_seqlens_q.shape != cu_seqlens_k.shape:
