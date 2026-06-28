@@ -222,6 +222,7 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
   __syncthreads();
 
   // Update pattern.
+  const int prevThresholdBinIdx = thresholdBinIdx;
   constexpr auto patternShift = step < 2 ? 0 : step == 2 ? 22 : 12;
   if constexpr (step == 2) {
     logitPattern = static_cast<uint32_t>(thresholdBinIdx & 0x3ff) << patternShift;
@@ -234,9 +235,17 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
     return IsForcedBlock(k, force_begin, force_end_start, row_num_valid_pages) ? FLT_MAX : logit;
   };
 
+  auto matchesCurrentRefinement = [&](float logit) {
+    if constexpr (step == 1) {
+      return extractBinIdx<0>(logit) == static_cast<uint32_t>(prevThresholdBinIdx);
+    } else {
+      return isPartialMatch<patternShift>(logit, logitPattern);
+    }
+  };
+
   auto distributeToBins = [&](float logit, int idx = 0) {
     logit = effective_logit(logit, idx);
-    if (isPartialMatch<patternShift>(logit, logitPattern)) {
+    if (matchesCurrentRefinement(logit)) {
       uint32_t binIdx = extractBinIdx<step>(logit);
       atomicAdd(&smemFinal.histo.data[binIdx], 1);
     }
@@ -290,7 +299,7 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
 
   auto processBins = [&](float logit, int idx) {
     logit = effective_logit(logit, idx);
-    if (isPartialMatch<patternShift>(logit, logitPattern)) {
+    if (matchesCurrentRefinement(logit)) {
       uint32_t binIdx = extractBinIdx<step>(logit);
       if (binIdx < thresholdBinIdx) {
         // The element is part of the top-k selection.
@@ -670,6 +679,24 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
       LoadRowNumValidPages(num_valid_pages_per_token, t, num_valid_pages);
   const uint32_t force_end_start =
       (force_end <= row_num_valid_pages) ? row_num_valid_pages - force_end : 0;
+
+  // If the actual valid page count fits in top-k, every valid page must be
+  // emitted exactly once and the rest of the row is invalid padding.  Bypass the
+  // histogram path so large -inf padding ties cannot manufacture arbitrary
+  // duplicate/OOB selections.
+  if (row_num_valid_pages <= static_cast<uint32_t>(topK)) {
+    int32_t* row_out = out + row_offset_out;
+    const int valid_count = (row_num_valid_pages < static_cast<uint32_t>(rowLen))
+                                ? static_cast<int>(row_num_valid_pages)
+                                : rowLen;
+    for (int rowIt = threadIdx.x; rowIt < valid_count; rowIt += kNumThreadsPerBlock) {
+      row_out[static_cast<size_t>(rowIt) * out_stride_k] = rowIt;
+    }
+    for (int rowIt = valid_count + threadIdx.x; rowIt < topK; rowIt += kNumThreadsPerBlock) {
+      row_out[static_cast<size_t>(rowIt) * out_stride_k] = -1;
+    }
+    return;
+  }
 
   // ---- Trivial path: rowLen <= topK (defensive — host dispatcher already
   //      catches max_k_tiles <= topk via SparseTopKIdentityFillKernel).
