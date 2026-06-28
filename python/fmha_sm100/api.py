@@ -1320,12 +1320,26 @@ def sparse_topk_select(
         f"= {force_begin_blocks + force_end_blocks} exceeds topk={topk}"
     )
 
-    # HKT needs a transpose buffer; THK is already row-contiguous over K.
+    # HKT needs a transpose buffer; THK is already row-contiguous over K and
+    # should not allocate or pass a dummy workspace, especially under CUDA graph
+    # capture.
     workspace_size = 0 if layout == "THK" else num_qo_heads * max_k_tiles * total_qo_len
-
-    workspace_buffer = _alloc_workspace_buf(_BuffTag.sparse_topk_workspace, workspace_size, max_score.device, torch.int32)
+    workspace_buffer = None
+    if workspace_size:
+        workspace_buffer = _alloc_workspace_buf(
+            _BuffTag.sparse_topk_workspace, workspace_size, max_score.device, torch.int32
+        )
     
     if output is not None:
+        assert output.dtype == torch.int32, f"output must be int32, got {output.dtype}"
+        assert output.device == max_score.device, (
+            f"output must be on {max_score.device}, got {output.device}"
+        )
+        assert output.dim() == 3, f"output must be 3D, got {tuple(output.shape)}"
+        assert tuple(output.shape) == (total_qo_len, num_qo_heads, topk), (
+            f"output shape must be {(total_qo_len, num_qo_heads, topk)}, "
+            f"got {tuple(output.shape)}"
+        )
         output_indices = output
     else:
         output_indices = torch.empty(

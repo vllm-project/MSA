@@ -459,26 +459,33 @@ __global__ void __launch_bounds__(TILE * TILE / 4) SparseTopKTransposeXorF4Kerne
 // [num_valid_pages, max_k_tiles) become -1 (already sorted to tail by
 // construction since the trivial fill is ascending). Pass num_valid_pages =
 // max_k_tiles (or any value >= max_k_tiles) to disable clamping.
-__global__ void SparseTopKIdentityFillKernel(int32_t* __restrict__ out, uint32_t total_qo_len,
+__global__ void SparseTopKIdentityFillKernel(int32_t* __restrict__ out,
+                                             uint64_t out_stride_t,
+                                             uint64_t out_stride_h,
+                                             uint64_t out_stride_k,
+                                             uint32_t total_qo_len,
                                              uint32_t num_qo_heads, uint32_t max_k_tiles,
                                              uint32_t topk, uint32_t num_valid_pages,
                                              const int32_t* __restrict__ num_valid_pages_per_token) {
   // grid = (num_rows = total_qo_len * num_qo_heads,), block = (min(topk, 256),)
   // bid encodes (qo_head_idx, t) with t innermost: bid = qo_head_idx * total_qo_len + t
-  // out physical layout: (total_qo_len, num_qo_heads, topk) row-major contiguous
-  //   element (t, qo_head_idx, k) at offset = (t * num_qo_heads + qo_head_idx) * topk + k
+  // out logical layout: (total_qo_len, num_qo_heads, topk)
+  //   element (t, qo_head_idx, k) at offset = t*out_stride_t + h*out_stride_h + k*out_stride_k
   const uint32_t bid = blockIdx.x;
   const uint32_t tx = threadIdx.x;
   const uint32_t qo_head_idx = bid / total_qo_len;
   const uint32_t t = bid % total_qo_len;
-  int32_t* row = out + (static_cast<size_t>(t) * num_qo_heads + qo_head_idx) * topk;
+  int32_t* row =
+      out + static_cast<size_t>(t) * out_stride_t +
+      static_cast<size_t>(qo_head_idx) * out_stride_h;
   // valid_count = min(max_k_tiles, num_valid_pages); positions [valid_count, topk) → -1
   const uint32_t row_num_valid_pages =
       LoadRowNumValidPages(num_valid_pages_per_token, t, num_valid_pages);
   const uint32_t valid_count =
       (row_num_valid_pages < max_k_tiles) ? row_num_valid_pages : max_k_tiles;
   for (uint32_t i = tx; i < topk; i += blockDim.x) {
-    row[i] = (i < valid_count) ? static_cast<int32_t>(i) : static_cast<int32_t>(-1);
+    row[static_cast<size_t>(i) * out_stride_k] =
+        (i < valid_count) ? static_cast<int32_t>(i) : static_cast<int32_t>(-1);
   }
 }
 
@@ -578,8 +585,8 @@ __device__ __forceinline__ void WarpBitonicSortAsc64(uint32_t* keys, uint32_t la
 //      smemOutput.
 //   4. NEW (v2.0 fused sort): cub::BlockRadixSort<uint32_t, 512, 1> over
 //      smemOutput[0..topk-1] → ascending by index.
-//   5. Write to gmem with qo_outermost offset:
-//        out[t][qo_head_idx][k] at (t*num_qo_heads + qo_head_idx) * topk + k
+//   5. Write to gmem with qo_outermost strides:
+//        out[t][qo_head_idx][k] at t*out_stride_t + qo_head_idx*out_stride_h + k*out_stride_k
 //
 // Template params:
 //   MAX_TOPK            — round-up template bin (16/32/64), runtime topk ≤ MAX_TOPK
@@ -597,7 +604,8 @@ constexpr int kIndexerNumFinalItems = 2048;
 template <uint32_t MAX_TOPK>
 __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSortKernel(
     const float* __restrict__ in,        // row-contig fp32: (H, T, K) or (T, H, K)
-    int32_t* __restrict__ out,           // (qo, num_qo_heads, topk) row-major contig int32
+    int32_t* __restrict__ out,           // (qo, num_qo_heads, topk) logical int32
+    uint64_t out_stride_t, uint64_t out_stride_h, uint64_t out_stride_k,
     uint32_t total_qo_len, uint32_t num_qo_heads, uint32_t max_k_tiles,
     uint32_t topk,
     // v2.5_oob_clamp_in_kernel: indices >= num_valid_pages get rewritten to -1
@@ -647,9 +655,10 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   const uint32_t t = input_qo_outermost ? (bid / num_qo_heads) : (bid % total_qo_len);
   const uint32_t qo_head_idx = input_qo_outermost ? (bid % num_qo_heads) : (bid / total_qo_len);
   // qo_outermost output offset:
-  //   out (t, qo_head_idx, k) at offset (t*num_qo_heads + qo_head_idx) * topk + k
+  //   out (t, qo_head_idx, k) at offset t*out_stride_t + qo_head_idx*out_stride_h + k*out_stride_k
   const size_t row_offset_out =
-      (static_cast<size_t>(t) * num_qo_heads + qo_head_idx) * topk;
+      static_cast<size_t>(t) * out_stride_t +
+      static_cast<size_t>(qo_head_idx) * out_stride_h;
 
   // Per-row input pointer (row stride = max_k_tiles).
   const float* logits = in + static_cast<size_t>(bid) * max_k_tiles;
@@ -671,10 +680,10 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
                                 ? static_cast<int>(row_num_valid_pages)
                                 : rowLen;
     for (int rowIt = threadIdx.x; rowIt < valid_count; rowIt += kNumThreadsPerBlock) {
-      row_out[rowIt] = rowIt;
+      row_out[static_cast<size_t>(rowIt) * out_stride_k] = rowIt;
     }
     for (int rowIt = valid_count + threadIdx.x; rowIt < topK; rowIt += kNumThreadsPerBlock) {
-      row_out[rowIt] = -1;
+      row_out[static_cast<size_t>(rowIt) * out_stride_k] = -1;
     }
     return;
   }
@@ -774,7 +783,8 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     }
     WarpBitonicSortAsc32(key, lane);
     if (lane < topK) {
-      row_out[lane] = (key == ~0u) ? -1 : static_cast<int32_t>(key);
+      row_out[static_cast<size_t>(lane) * out_stride_k] =
+          (key == ~0u) ? -1 : static_cast<int32_t>(key);
     }
   } else {
     // MAX_TOPK == 64: 32 lanes × 2 keys, BLOCKED layout (lane L holds 2L, 2L+1).
@@ -796,7 +806,8 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
       const int pos = static_cast<int>(lane) * 2 + s;
       if (pos < topK) {
         const uint32_t k = keys[s];
-        row_out[pos] = (k == ~0u) ? -1 : static_cast<int32_t>(k);
+        row_out[static_cast<size_t>(pos) * out_stride_k] =
+            (k == ~0u) ? -1 : static_cast<int32_t>(k);
       }
     }
   }
@@ -814,6 +825,8 @@ inline cudaError_t ConfigureSparseTopKSelect() {
 }
 
 cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
+                              uint64_t out_stride_t, uint64_t out_stride_h,
+                              uint64_t out_stride_k,
                               uint32_t total_qo_len, uint32_t num_qo_heads,
                               uint32_t max_k_tiles, uint32_t topk,
                               uint32_t num_valid_pages,
@@ -827,7 +840,9 @@ cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
   auto kernel = IndexerTopKWithSortKernel<16>;
   const size_t dyn_smem_bytes = static_cast<size_t>(topk) * sizeof(int32_t);
   const uint32_t input_qo_outermost_u32 = input_qo_outermost ? 1u : 0u;
-  void* args[] = {(void*)&in_row_contig, (void*)&out, (void*)&total_qo_len,
+  void* args[] = {(void*)&in_row_contig, (void*)&out,
+                  (void*)&out_stride_t, (void*)&out_stride_h, (void*)&out_stride_k,
+                  (void*)&total_qo_len,
                   (void*)&num_qo_heads, (void*)&max_k_tiles, (void*)&topk,
                   (void*)&num_valid_pages, (void*)&num_valid_pages_per_token,
                   (void*)&force_begin, (void*)&force_end, (void*)&input_qo_outermost_u32};
@@ -837,6 +852,8 @@ cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
 }
 
 cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transposed, int32_t* out,
+                                          uint64_t out_stride_t, uint64_t out_stride_h,
+                                          uint64_t out_stride_k,
                                           uint32_t total_qo_len, uint32_t num_qo_heads,
                                           uint32_t max_k_tiles, uint32_t topk,
                                           uint32_t num_valid_pages,
@@ -876,7 +893,8 @@ cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transp
   }
 
   // ---- (2) IndexerTopK + fused sort + write to qo_outermost layout -------
-  return LaunchIndexerTopK(transposed, out, total_qo_len, num_qo_heads, max_k_tiles, topk,
+  return LaunchIndexerTopK(transposed, out, out_stride_t, out_stride_h, out_stride_k,
+                           total_qo_len, num_qo_heads, max_k_tiles, topk,
                            num_valid_pages, num_valid_pages_per_token,
                            force_begin, force_end,
                            /*input_qo_outermost=*/false, stream);
@@ -896,7 +914,7 @@ inline size_t SparseTopKWorkspaceSize(uint32_t total_qo_len, uint32_t num_qo_hea
 // =============================================================================
 //   in        : (num_qo_heads, max_k_tiles, total_qo_len) contiguous fp32 for kHKT,
 //               or (total_qo_len, num_qo_heads, max_k_tiles) contiguous fp32 for kTHK
-//   out       : (total_qo_len, num_qo_heads, topk=16) contiguous int32 asc by k_tile index
+//   out       : (total_qo_len, num_qo_heads, topk=16) logical int32 asc by k_tile index
 //   workspace : int32, at least SparseTopKWorkspaceSize(...) elements
 //   num_valid_pages : indices >= num_valid_pages are emitted as -1 (sorted to
 //                     tail).  Pass max_k_tiles (or any value >= max_k_tiles)
@@ -907,6 +925,8 @@ inline size_t SparseTopKWorkspaceSize(uint32_t total_qo_len, uint32_t num_qo_hea
 //   * 16 < max_k_tiles < 12288 and kTHK → IndexerTopKWithSortKernel<16> directly
 //   * max_k_tiles >= 12288   → cudaErrorNotSupported
 inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* workspace,
+                                    uint64_t out_stride_t, uint64_t out_stride_h,
+                                    uint64_t out_stride_k,
                                     uint32_t total_qo_len, uint32_t num_qo_heads,
                                     uint32_t max_k_tiles, uint32_t num_valid_pages,
                                     const int32_t* num_valid_pages_per_token,
@@ -921,7 +941,8 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
   if (max_k_tiles <= topk) {
     dim3 grid(num_rows);
     dim3 block(topk);
-    void* args[] = {(void*)&out, (void*)&total_qo_len, (void*)&num_qo_heads,
+    void* args[] = {(void*)&out, (void*)&out_stride_t, (void*)&out_stride_h,
+                    (void*)&out_stride_k, (void*)&total_qo_len, (void*)&num_qo_heads,
                     (void*)&max_k_tiles, (void*)&topk, (void*)&num_valid_pages,
                     (void*)&num_valid_pages_per_token};
     return cudaLaunchKernel((const void*)SparseTopKIdentityFillKernel, grid, block, args, 0,
@@ -932,14 +953,17 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
   if (max_k_tiles >= 12288) return cudaErrorNotSupported;
 
   if (input_layout == SparseTopKInputLayout::kTHK) {
-    return LaunchIndexerTopK(in, out, total_qo_len, num_qo_heads, max_k_tiles, topk,
+    return LaunchIndexerTopK(in, out, out_stride_t, out_stride_h, out_stride_k,
+                             total_qo_len, num_qo_heads, max_k_tiles, topk,
                              num_valid_pages, num_valid_pages_per_token,
                              force_begin, force_end,
                              /*input_qo_outermost=*/true, stream);
   }
 
   float* transpose_buf = reinterpret_cast<float*>(workspace);
-  return LaunchTransposeAndIndexerTopK(in, transpose_buf, out, total_qo_len, num_qo_heads,
+  return LaunchTransposeAndIndexerTopK(in, transpose_buf, out,
+                                       out_stride_t, out_stride_h, out_stride_k,
+                                       total_qo_len, num_qo_heads,
                                        max_k_tiles, topk, num_valid_pages,
                                        num_valid_pages_per_token,
                                        force_begin, force_end, stream);
