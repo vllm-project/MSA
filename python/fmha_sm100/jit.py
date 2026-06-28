@@ -567,6 +567,7 @@ def get_sparse_topk_module():
             import tvm_ffi
             so_path = CACHE_BASE / "sparse_topk" / "sparse_topk_select.so"
             _sparse_topk_module = tvm_ffi.load_module(str(so_path))
+            _sparse_topk_module.sparse_topk_select_init()
         finally:
             _release_file_lock(lock_fd)
         return _sparse_topk_module

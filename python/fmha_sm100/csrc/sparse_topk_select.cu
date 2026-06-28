@@ -7,6 +7,12 @@
 using namespace flashinfer;
 using tvm::ffi::Optional;
 
+void sparse_topk_select_init() {
+  cudaError_t status = sparse_topk::ConfigureSparseTopKSelect();
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "sparse_topk_select init failed: " << cudaGetErrorString(status);
+}
+
 // v2.5_oob_clamp_in_kernel:
 //   Adds num_valid_pages parameter (between topk and stream_ptr).  When
 //   num_valid_pages < max_k_tiles, indices >= num_valid_pages are emitted as
@@ -88,4 +94,5 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
       << "sparse_topk_select failed: " << cudaGetErrorString(status);
 }
 
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_topk_select_init, sparse_topk_select_init);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_topk_select, sparse_topk_select);

@@ -587,8 +587,8 @@ __device__ __forceinline__ void WarpBitonicSortAsc64(uint32_t* keys, uint32_t la
 //   kNumBins            — fixed at 2048 (11-bit fp16 / fp32 hist)
 //   kNumFinalItems      — fixed at 2048 (insertion sort staging capacity)
 //
-// Dynamic SMEM = topk * sizeof(int32_t) — host MUST cudaFuncSetAttribute the
-// max value (kSparseTopkMaxK * sizeof(int32_t) = 256 B).
+// Dynamic SMEM = topk * sizeof(int32_t).  The module configures the kernel's
+// dynamic-SMEM attribute once at load time so graph capture only sees launches.
 constexpr uint32_t kSparseTopkMaxK = 64;
 constexpr int kIndexerNumThreadsPerBlock = 512;
 constexpr int kIndexerNumBins = 1024;  // 10-bit hist (was 2048 / 11-bit)
@@ -806,6 +806,13 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
 // Host-side dispatcher
 // =============================================================================
 
+inline cudaError_t ConfigureSparseTopKSelect() {
+  auto kernel = IndexerTopKWithSortKernel<16>;
+  constexpr size_t dyn_smem_bytes = 16 * sizeof(int32_t);
+  return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                              static_cast<int>(dyn_smem_bytes));
+}
+
 cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
                               uint32_t total_qo_len, uint32_t num_qo_heads,
                               uint32_t max_k_tiles, uint32_t topk,
@@ -819,9 +826,6 @@ cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
 
   auto kernel = IndexerTopKWithSortKernel<16>;
   const size_t dyn_smem_bytes = static_cast<size_t>(topk) * sizeof(int32_t);
-  cudaError_t err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                         static_cast<int>(dyn_smem_bytes));
-  if (err != cudaSuccess) return err;
   const uint32_t input_qo_outermost_u32 = input_qo_outermost ? 1u : 0u;
   void* args[] = {(void*)&in_row_contig, (void*)&out, (void*)&total_qo_len,
                   (void*)&num_qo_heads, (void*)&max_k_tiles, (void*)&topk,
