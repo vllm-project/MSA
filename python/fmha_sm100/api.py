@@ -1210,10 +1210,11 @@ def fmha_sm100(
 def sparse_topk_select(
     max_score: torch.Tensor,
     topk: int,
-    num_valid_pages: Optional[int] = None,
+    num_valid_pages: Optional[Union[int, torch.Tensor]] = None,
     output: Optional[torch.Tensor] = None,
     force_begin_blocks: int = 0,
     force_end_blocks: int = 0,
+    max_score_layout: str = "HKT",
 ) -> torch.Tensor:
     r"""Select top-k KV-tile indices per (qo_head, token) row from the FMHA max-score tensor.
 
@@ -1224,18 +1225,23 @@ def sparse_topk_select(
     Parameters
     ----------
     max_score : torch.Tensor
-        Shape ``(num_qo_heads, max_k_tiles, total_qo_len)``, contiguous, float32.
-        Slots beyond the actual KV tile count must be pre-filled with ``-inf``
-        (fmha_sm100 does this automatically via ``torch.full``).
+        Contiguous float32 max-score tensor.  ``max_score_layout="HKT"`` expects
+        shape ``(num_qo_heads, max_k_tiles, total_qo_len)``.  ``"THK"`` expects
+        shape ``(total_qo_len, num_qo_heads, max_k_tiles)`` and skips the
+        internal transpose before top-k.  Slots beyond the actual KV tile count
+        must be pre-filled with ``-inf`` (fmha_sm100 does this automatically via
+        ``torch.full``).
     topk : int
         Must be exactly 16.
-    num_valid_pages : int, optional
+    num_valid_pages : int or torch.Tensor, optional
         Actual number of KV pages in the page table, i.e. ``ceil(kv_len / page_size)``.
         ``max_k_tiles`` is round-up-aligned and always >= ``num_valid_pages``.
         The kernel may select tile indices in ``[num_valid_pages, max_k_tiles-1]``
         (all-``-inf`` padding tiles). Passing ``num_valid_pages`` replaces those
         out-of-range indices with ``-1`` and sorts them to the tail, matching the
         sparse FMHA kernel's kv_block_indexes contract.
+        Tensor form must be CUDA int32/int64 with shape ``[total_qo_len]`` and
+        provides a per-query-token page count for mixed-length batches.
         **Strongly recommended**: omitting this allows OOB page-table accesses in
         the sparse attention pass.
     force_begin_blocks : int
@@ -1259,7 +1265,16 @@ def sparse_topk_select(
     assert max_score.is_contiguous(), "max_score must be contiguous"
     assert topk == 16, f"topk must be 16, got {topk}"
 
-    num_qo_heads, max_k_tiles, total_qo_len = max_score.shape
+    layout = max_score_layout.upper()
+    assert layout in {"HKT", "THK"}, (
+        f"max_score_layout must be 'HKT' or 'THK', got {max_score_layout!r}"
+    )
+    if layout == "HKT":
+        num_qo_heads, max_k_tiles, total_qo_len = max_score.shape
+        layout_arg = 0
+    else:
+        total_qo_len, num_qo_heads, max_k_tiles = max_score.shape
+        layout_arg = 1
 
     # v2.3 kernel only supports the insertion-sort path (K < 12288).
     assert max_k_tiles < 12288, (
@@ -1267,11 +1282,28 @@ def sparse_topk_select(
         f"(radix-sort path not yet implemented). kv_len must be < {12288 * 128} tokens."
     )
 
-    if num_valid_pages is not None:
-        assert 0 < num_valid_pages <= max_k_tiles, (
-            f"num_valid_pages={num_valid_pages} must be in (0, max_k_tiles={max_k_tiles}]"
+    nvp_tensor = None
+    if isinstance(num_valid_pages, torch.Tensor):
+        assert num_valid_pages.dim() == 1, (
+            f"num_valid_pages tensor must be 1D [total_qo_len], got {tuple(num_valid_pages.shape)}"
         )
+        assert num_valid_pages.shape[0] == total_qo_len, (
+            f"num_valid_pages tensor length {num_valid_pages.shape[0]} must match "
+            f"total_qo_len={total_qo_len}"
+        )
+        assert num_valid_pages.device == max_score.device, (
+            f"num_valid_pages tensor must be on {max_score.device}, got {num_valid_pages.device}"
+        )
+        assert num_valid_pages.dtype in (torch.int32, torch.int64), (
+            f"num_valid_pages tensor must be int32 or int64, got {num_valid_pages.dtype}"
+        )
+        nvp_tensor = num_valid_pages.to(dtype=torch.int32).contiguous()
+        nvp_arg = int(max_k_tiles)
+    elif num_valid_pages is not None:
         nvp_arg = int(num_valid_pages)
+        assert 0 < nvp_arg <= max_k_tiles, (
+            f"num_valid_pages={nvp_arg} must be in (0, max_k_tiles={max_k_tiles}]"
+        )
     else:
         # v2.5_oob_clamp_in_kernel: kernel takes a unified num_valid_pages arg.
         # When the caller doesn't supply one, pass max_k_tiles so the in-kernel
@@ -1288,8 +1320,8 @@ def sparse_topk_select(
         f"= {force_begin_blocks + force_end_blocks} exceeds topk={topk}"
     )
 
-    # Workspace = transpose_buf only: (num_qo_heads, max_k_tiles, total_qo_len) fp32.
-    workspace_size = num_qo_heads * max_k_tiles * total_qo_len  # int32 elements
+    # HKT needs a transpose buffer; THK is already row-contiguous over K.
+    workspace_size = 0 if layout == "THK" else num_qo_heads * max_k_tiles * total_qo_len
 
     workspace_buffer = _alloc_workspace_buf(_BuffTag.sparse_topk_workspace, workspace_size, max_score.device, torch.int32)
     
@@ -1313,8 +1345,10 @@ def sparse_topk_select(
         max_score, output_indices, workspace_buffer,
         topk,
         nvp_arg,
+        nvp_tensor,
         int(force_begin_blocks),
         int(force_end_blocks),
+        layout_arg,
         torch.cuda.current_stream().cuda_stream,
     )
 
