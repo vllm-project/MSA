@@ -845,10 +845,15 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
 // =============================================================================
 
 inline cudaError_t ConfigureSparseTopKSelect() {
+  static bool s_attr_set = false;
+  if (s_attr_set) return cudaSuccess;
   auto kernel = IndexerTopKWithSortKernel<16>;
   constexpr size_t dyn_smem_bytes = 16 * sizeof(int32_t);
-  return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(dyn_smem_bytes));
+  cudaError_t err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         static_cast<int>(dyn_smem_bytes));
+  if (err != cudaSuccess) return err;
+  s_attr_set = true;
+  return cudaSuccess;
 }
 
 cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
