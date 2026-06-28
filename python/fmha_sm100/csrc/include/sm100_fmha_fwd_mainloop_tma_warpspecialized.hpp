@@ -1293,16 +1293,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
             int h_r_orig = rem_hr * kPackFactor;
             int kv_head = qo_head_idx / rem_hr;
             int rem_hr_idx = qo_head_idx % rem_hr;
-            int max_k = cute::size<2>(epilogue.params.layout_MaxScore);
-            int tql_orig = epilogue.params.total_qo_len_orig;
             int seg_off_orig = segment_offset / kPackFactor;
-            ms_stride_k = tql_orig;
+            ms_stride_k = epilogue.params.max_score_stride_k;
             int actual_tok = abs_row / kPackFactor;
             int pf_idx = abs_row % kPackFactor;
             int unpacked_head = kv_head * h_r_orig + rem_hr_idx * kPackFactor + pf_idx;
             ms_base = epilogue.params.ptr_MaxScore_direct
-                    + unpacked_head * (max_k * tql_orig)
-                    + seg_off_orig + actual_tok;
+                    + unpacked_head * epilogue.params.max_score_stride_h
+                    + (seg_off_orig + actual_tok) * epilogue.params.max_score_stride_t;
           } else {
             packed_maxscore_path();
           }
@@ -1845,11 +1843,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
           int h_r_orig = rem_hr * kPackFactor;
           int kv_head = qo_head_idx / rem_hr;
           int rem_hr_idx = qo_head_idx % rem_hr;
-          int max_k = cute::size<2>(epilogue.params.layout_MaxScore);
-          int tql_orig = epilogue.params.total_qo_len_orig;
           int seg_off_orig = segment_offset / kPackFactor;
 
-          ms_stride_k = tql_orig;
+          ms_stride_k = epilogue.params.max_score_stride_k;
 
           auto compute_ms_base = [&](int row) -> float* {
             if (uint(row) >= qo_len) return nullptr;
@@ -1857,8 +1853,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
             int pf_idx = row % kPackFactor;
             int unpacked_head = kv_head * h_r_orig + rem_hr_idx * kPackFactor + pf_idx;
             return epilogue.params.ptr_MaxScore_direct
-                   + unpacked_head * (max_k * tql_orig)
-                   + seg_off_orig + actual_tok;
+                   + unpacked_head * epilogue.params.max_score_stride_h
+                   + (seg_off_orig + actual_tok) * epilogue.params.max_score_stride_t;
           };
 
           if (!is_padding_corr) {

@@ -120,6 +120,59 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
   params.total_page_num = is_paged ? k.size(0) : 0;
   params.max_score_ptr = max_score_ptr;
   params.max_k_tiles = static_cast<int>(max_k_tiles);
+  int max_score_logical_heads = 0;
+  if (maybe_max_score.has_value()) {
+    const auto& ms = maybe_max_score.value();
+    TVM_FFI_ICHECK(ms.ndim() == 3) << "max_score must be 3D";
+    TVM_FFI_ICHECK(encode_dlpack_dtype(ms.dtype()) == float32_code)
+        << "max_score must be float32";
+
+    const int64_t ms0 = ms.size(0);
+    const int64_t ms1 = ms.size(1);
+    const int64_t ms2 = ms.size(2);
+    const int64_t max_k = max_k_tiles;
+    const int64_t unpacked_t = q.size(0);
+    const int64_t unpacked_h = q.size(1);
+    const int64_t packed_t = q.size(0) * static_cast<int64_t>(pack_factor);
+    const int64_t packed_h = q.size(1) / static_cast<int64_t>(pack_factor);
+
+    const bool thk_unpacked = (ms0 == unpacked_t && ms1 == unpacked_h && ms2 == max_k);
+    const bool hkt_unpacked = (ms0 == unpacked_h && ms1 == max_k && ms2 == unpacked_t);
+    const bool thk_packed = (ms0 == packed_t && ms1 == packed_h && ms2 == max_k);
+    const bool hkt_packed = (ms0 == packed_h && ms1 == max_k && ms2 == packed_t);
+
+    if (thk_unpacked) {
+      params.max_score_stride_t = static_cast<int>(ms.stride(0));
+      params.max_score_stride_h = static_cast<int>(ms.stride(1));
+      params.max_score_stride_k = static_cast<int>(ms.stride(2));
+      params.total_qo_len_orig = static_cast<int>(unpacked_t);
+      max_score_logical_heads = static_cast<int>(unpacked_h);
+    } else if (hkt_unpacked) {
+      params.max_score_stride_t = static_cast<int>(ms.stride(2));
+      params.max_score_stride_h = static_cast<int>(ms.stride(0));
+      params.max_score_stride_k = static_cast<int>(ms.stride(1));
+      params.total_qo_len_orig = static_cast<int>(unpacked_t);
+      max_score_logical_heads = static_cast<int>(unpacked_h);
+    } else if (thk_packed) {
+      params.max_score_stride_t = static_cast<int>(ms.stride(0));
+      params.max_score_stride_h = static_cast<int>(ms.stride(1));
+      params.max_score_stride_k = static_cast<int>(ms.stride(2));
+      params.total_qo_len_orig = static_cast<int>(packed_t);
+      max_score_logical_heads = static_cast<int>(packed_h);
+    } else if (hkt_packed) {
+      params.max_score_stride_t = static_cast<int>(ms.stride(2));
+      params.max_score_stride_h = static_cast<int>(ms.stride(0));
+      params.max_score_stride_k = static_cast<int>(ms.stride(1));
+      params.total_qo_len_orig = static_cast<int>(packed_t);
+      max_score_logical_heads = static_cast<int>(packed_h);
+    } else {
+      TVM_FFI_ICHECK(false)
+          << "max_score must have shape [T,H,K] or [H,K,T]; got ["
+          << ms0 << ", " << ms1 << ", " << ms2 << "], expected unpacked ["
+          << unpacked_t << ", " << unpacked_h << ", " << max_k << "] or ["
+          << unpacked_h << ", " << max_k << ", " << unpacked_t << "]";
+    }
+  }
   params.kv_block_indexes_ptr = kv_block_indexes_ptr;
   params.kv_block_num = maybe_kv_block_indexes.has_value()
                             ? static_cast<int>(maybe_kv_block_indexes.value().size(2))
@@ -140,9 +193,8 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
     // Pack GQA: direct max_score unpack
     // Activate when max_score is in unpacked shape (size(0) > packed num_qo_heads).
     if (maybe_max_score.has_value()
-        && static_cast<int>(maybe_max_score.value().size(0)) > packed_num_qo_heads) {
+        && max_score_logical_heads > packed_num_qo_heads) {
       params.max_score_direct_ptr = max_score_ptr;
-      params.total_qo_len_orig = static_cast<int>(maybe_max_score.value().size(2));
     }
 
     // Pack GQA: direct O unpack

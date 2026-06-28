@@ -124,6 +124,9 @@ struct FwdRunner {
                          int total_page_num = 0,
                          float* maybe_max_score = nullptr,
                          int max_k_tiles = 0,
+                         int max_score_stride_t = 0,
+                         int max_score_stride_h = 0,
+                         int max_score_stride_k = 0,
                          int* kv_block_indexes = nullptr,
                          int kv_block_num = 0,
                          int pack_factor = 1,
@@ -185,9 +188,9 @@ struct FwdRunner {
 
       auto shape_MaxScore = make_shape(total_qo_len, make_shape(h_r, num_kv_heads), max_k_tiles);
       auto stride_MaxScore = make_stride(
-          _1{},
-          make_stride(total_qo_len * max_k_tiles, h_r * total_qo_len * max_k_tiles),
-          total_qo_len);
+          max_score_stride_t,
+          make_stride(max_score_stride_h, h_r * max_score_stride_h),
+          max_score_stride_k);
       typename Epilogue::LayoutMaxScore layout_MaxScore = make_layout(shape_MaxScore, stride_MaxScore);
 
       typename Epilogue::Arguments epi_args;
@@ -198,6 +201,9 @@ struct FwdRunner {
       epi_args.layout_MaxScore = layout_MaxScore;
       epi_args.ptr_MaxScore_direct = pack_gqa.max_score_direct;
       epi_args.total_qo_len_orig = pack_gqa.total_qo_len_orig;
+      epi_args.max_score_stride_t = max_score_stride_t;
+      epi_args.max_score_stride_h = max_score_stride_h;
+      epi_args.max_score_stride_k = max_score_stride_k;
 #ifdef FMHA_GMEM_BOUNDS_CHECK
       epi_args.max_score_numel = pack_gqa.gmem_bounds.max_score_numel;
 #endif
@@ -305,9 +311,9 @@ struct FwdRunner {
 
       auto shape_MaxScore = make_shape(total_qo_len, make_shape(h_r, num_kv_heads), max_k_tiles);
       auto stride_MaxScore = make_stride(
-          _1{},
-          make_stride(total_qo_len * max_k_tiles, h_r * total_qo_len * max_k_tiles),
-          total_qo_len);
+          max_score_stride_t,
+          make_stride(max_score_stride_h, h_r * max_score_stride_h),
+          max_score_stride_k);
       typename Epilogue::LayoutMaxScore layout_MaxScore = make_layout(shape_MaxScore, stride_MaxScore);
 
       typename Epilogue::Arguments epi_args;
@@ -318,6 +324,9 @@ struct FwdRunner {
       epi_args.layout_MaxScore = layout_MaxScore;
       epi_args.ptr_MaxScore_direct = pack_gqa.max_score_direct;
       epi_args.total_qo_len_orig = pack_gqa.total_qo_len_orig;
+      epi_args.max_score_stride_t = max_score_stride_t;
+      epi_args.max_score_stride_h = max_score_stride_h;
+      epi_args.max_score_stride_k = max_score_stride_k;
 #ifdef FMHA_GMEM_BOUNDS_CHECK
       epi_args.max_score_numel = pack_gqa.gmem_bounds.max_score_numel;
 #endif
@@ -434,6 +443,9 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
                          int total_page_num = 0,
                          float* maybe_max_score = nullptr,
                          int max_k_tiles = 0,
+                         int max_score_stride_t = 0,
+                         int max_score_stride_h = 0,
+                         int max_score_stride_k = 0,
                          int* kv_block_indexes = nullptr,
                          int kv_block_num = 0,
                          int pack_factor = 1,
@@ -454,6 +466,7 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
       ptr_lse_accum,
       kv_indices, kv_page_indptr, total_page_num,
       maybe_max_score, max_k_tiles,
+      max_score_stride_t, max_score_stride_h, max_score_stride_k,
       kv_block_indexes, kv_block_num,
       pack_factor, q_stride_n_original, q_stride_h_original, h_r_original,
       pack_gqa, num_ctas);

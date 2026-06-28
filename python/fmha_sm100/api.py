@@ -860,6 +860,28 @@ def _fmha_sm100(
         max_score = torch.full(
             (orig_num_qo_heads, max_k_tiles, nnz_qo),
             -float("inf"), dtype=torch.float32, device=q.device)
+    elif max_score is not None and max_k_tiles > 0:
+        unpacked_t = nnz_qo
+        unpacked_h = orig_num_qo_heads
+        packed_t = qo_total_len
+        packed_h = num_qo_heads
+        valid_max_score_shapes = {
+            (unpacked_h, max_k_tiles, unpacked_t),  # legacy [H, K, T]
+            (unpacked_t, unpacked_h, max_k_tiles),  # row-contiguous [T, H, K]
+            (packed_h, max_k_tiles, packed_t),
+            (packed_t, packed_h, max_k_tiles),
+        }
+        assert max_score.dtype == torch.float32, (
+            f"max_score must be float32, got {max_score.dtype}"
+        )
+        assert max_score.device == q.device, (
+            f"max_score must be on {q.device}, got {max_score.device}"
+        )
+        assert tuple(max_score.shape) in valid_max_score_shapes, (
+            "max_score must have shape [H,K,T] or [T,H,K]; "
+            f"got {tuple(max_score.shape)}, expected one of "
+            f"{sorted(valid_max_score_shapes)}"
+        )
 
     if not output_o:
         out = None
@@ -1070,8 +1092,9 @@ def fmha_sm100(
         Preallocated output buffer with shape
         ``[total_qo_len, num_qo_heads, head_dim_v]``.
     max_score : torch.Tensor, optional
-        Preallocated per-KV-tile score buffer with shape
-        ``[num_qo_heads, max_k_tiles, total_qo_len]`` and dtype float32.
+        Preallocated per-KV-tile score buffer with dtype float32.  Accepted
+        layouts are legacy ``[num_qo_heads, max_k_tiles, total_qo_len]`` and
+        row-contiguous ``[total_qo_len, num_qo_heads, max_k_tiles]``.
     **kwargs
         Runtime options forwarded to the kernel runner.  Common options are
         ``sm_scale``, ``q_scale``, ``k_scale``, ``v_scale``, ``o_scale``,
@@ -1165,7 +1188,15 @@ def fmha_sm100(
             combined_ms = decode_ms if decode_ms is not None else prefill_ms
 
         if max_score is not None and combined_ms is not None:
-            max_score.copy_(combined_ms)
+            if max_score.shape == combined_ms.shape:
+                max_score.copy_(combined_ms)
+            elif max_score.shape == (nnz_qo, num_qo_heads, combined_ms.shape[1]):
+                max_score.copy_(combined_ms.permute(2, 0, 1).contiguous())
+            else:
+                raise ValueError(
+                    f"max_score shape {tuple(max_score.shape)} is incompatible "
+                    f"with combined max_score shape {tuple(combined_ms.shape)}"
+                )
 
         return (out if out is not None else combined_out,
                 max_score if max_score is not None else combined_ms)

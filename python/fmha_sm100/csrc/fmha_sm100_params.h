@@ -52,6 +52,9 @@ struct FMHACutlassSM100Params {
   int total_page_num;
   float* max_score_ptr;
   int max_k_tiles;
+  int max_score_stride_t = 0;
+  int max_score_stride_h = 0;
+  int max_score_stride_k = 0;
   int* kv_block_indexes_ptr;
   int kv_block_num;
   int pack_factor = 1;
