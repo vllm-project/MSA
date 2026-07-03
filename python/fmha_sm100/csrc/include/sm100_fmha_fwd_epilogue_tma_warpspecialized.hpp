@@ -105,7 +105,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
   using LayoutLSE = cute::Layout<ShapeLSE, StrideLSE>;
 
   using ShapeMaxScore = cute::Shape<int32_t, cute::Shape<int32_t, int32_t>, int32_t>;
-  using StrideMaxScore = cute::Shape<_1, cute::Shape<int32_t, int32_t>, int32_t>;
+  using StrideMaxScore = cute::Shape<int32_t, cute::Shape<int32_t, int32_t>, int32_t>;
   using LayoutMaxScore = cute::Layout<ShapeMaxScore, StrideMaxScore>;
 
   //  using SmemLayoutO = decltypa(make_layout(append<3>(select<0,1>(TileShape_WG{}), _2{})));
@@ -154,6 +154,9 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
 
     ElementAcc* ptr_MaxScore_direct = nullptr;
     int total_qo_len_orig = 0;
+    int max_score_stride_t = 0;
+    int max_score_stride_h = 0;
+    int max_score_stride_k = 0;
 #ifdef FMHA_GMEM_BOUNDS_CHECK
     int max_score_numel = 0;
 #endif
@@ -225,6 +228,9 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
 
     ElementAcc* ptr_MaxScore_direct = nullptr;
     int total_qo_len_orig = 0;
+    int max_score_stride_t = 0;
+    int max_score_stride_h = 0;
+    int max_score_stride_k = 0;
 #ifdef FMHA_GMEM_BOUNDS_CHECK
     int max_score_numel = 0;
 #endif
@@ -327,6 +333,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     Params p = {tma_store_o, layout_O, nullptr, {}, args.max_qo_len,
             args.ptr_MaxScore, args.layout_MaxScore,
             args.ptr_MaxScore_direct, args.total_qo_len_orig,
+            args.max_score_stride_t, args.max_score_stride_h, args.max_score_stride_k,
 #ifdef FMHA_GMEM_BOUNDS_CHECK
             args.max_score_numel,
 #endif

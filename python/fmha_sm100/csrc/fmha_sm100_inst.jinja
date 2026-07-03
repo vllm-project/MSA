@@ -57,6 +57,7 @@ cudaError_t {{ func_name }}(const FMHACutlassSM100Params& p) {
       p.workspace_lse_ptr,
       p.kv_indices_ptr, p.kv_page_indptr_ptr, p.total_page_num,
       p.max_score_ptr, p.max_k_tiles,
+      p.max_score_stride_t, p.max_score_stride_h, p.max_score_stride_k,
       p.kv_block_indexes_ptr, p.kv_block_num,
       p.pack_factor, p.q_stride_n_original, p.q_stride_h_original, p.h_r_original,
       flashinfer::PackGQAUnpackParams{p.max_score_direct_ptr, p.total_qo_len_orig,

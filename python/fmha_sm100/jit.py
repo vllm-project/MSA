@@ -490,7 +490,18 @@ def _do_compile_sparse_topk():
     cache_dir = CACHE_BASE / "sparse_topk"
     so_path = cache_dir / "sparse_topk_select.so"
 
-    if so_path.exists():
+    tracked_sources = [
+        _FMHA_VARLEN_DIR / "sparse_topk_select.cu",
+        _FMHA_VARLEN_DIR / "include" / "sparse_topk_select.cuh",
+        _FMHA_VARLEN_DIR / "tvm_ffi_utils.h",
+    ]
+    needs_rebuild = not so_path.exists()
+    for src in tracked_sources:
+        dst = cache_dir / src.name
+        if not dst.exists() or dst.read_text() != src.read_text():
+            needs_rebuild = True
+
+    if not needs_rebuild:
         return
 
     logger.info("JIT compiling sparse_topk_select module")
@@ -498,12 +509,9 @@ def _do_compile_sparse_topk():
 
     src_cu = _FMHA_VARLEN_DIR / "sparse_topk_select.cu"
     shutil.copy2(src_cu, cache_dir / "sparse_topk_select.cu")
-
-    for name in ["tvm_ffi_utils.h"]:
-        src = _FMHA_VARLEN_DIR / name
-        dst = cache_dir / name
-        if not dst.exists() or dst.read_text() != src.read_text():
-            shutil.copy2(src, dst)
+    shutil.copy2(_FMHA_VARLEN_DIR / "include" / "sparse_topk_select.cuh",
+                 cache_dir / "sparse_topk_select.cuh")
+    shutil.copy2(_FMHA_VARLEN_DIR / "tvm_ffi_utils.h", cache_dir / "tvm_ffi_utils.h")
 
     cuda_home = _get_cuda_home()
     nvcc = os.path.join(cuda_home, "bin", "nvcc")
@@ -559,6 +567,7 @@ def get_sparse_topk_module():
             import tvm_ffi
             so_path = CACHE_BASE / "sparse_topk" / "sparse_topk_select.so"
             _sparse_topk_module = tvm_ffi.load_module(str(so_path))
+            _sparse_topk_module.sparse_topk_select_init()
         finally:
             _release_file_lock(lock_fd)
         return _sparse_topk_module
