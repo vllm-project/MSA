@@ -15,6 +15,80 @@ import torch
 from fmha_sm100 import sparse_topk_select
 
 
+def _gather_expected_from_block_table(logical_indices, block_table):
+    safe_indices = logical_indices.clamp_min(0).to(torch.long)
+    gathered = torch.gather(block_table, 2, safe_indices)
+    return torch.where(logical_indices >= 0, gathered, torch.full_like(gathered, -1))
+
+
+def test_block_table_gather_after_sort(
+    num_qo_heads=3, max_k_tiles=96, total_qo_len=7,
+    topk=16, num_valid_pages=73, seed=202,
+):
+    """Optional block_table gathers after logical top-k indices are sorted."""
+    torch.manual_seed(seed)
+    dev = torch.device("cuda")
+
+    max_score_thk = torch.randn(
+        total_qo_len, num_qo_heads, max_k_tiles, device=dev, dtype=torch.float32
+    )
+    max_score_thk[:, :, num_valid_pages:] = float("-inf")
+
+    t = torch.arange(total_qo_len, device=dev, dtype=torch.int32).view(-1, 1, 1)
+    h = torch.arange(num_qo_heads, device=dev, dtype=torch.int32).view(1, -1, 1)
+    k = torch.arange(max_k_tiles, device=dev, dtype=torch.int32).view(1, 1, -1)
+    # Deliberately not monotonic in k, proving that the final order follows the
+    # sorted logical indices and then gathers values from the table.
+    block_table = (100_000 * t + 1_000 * h + (max_k_tiles - 1 - k) * 7).contiguous()
+
+    logical_thk = sparse_topk_select(
+        max_score_thk, topk, num_valid_pages=num_valid_pages, max_score_layout="THK"
+    )
+    physical_thk = sparse_topk_select(
+        max_score_thk, topk, num_valid_pages=num_valid_pages,
+        max_score_layout="THK", block_table=block_table,
+    )
+    assert torch.equal(physical_thk, _gather_expected_from_block_table(logical_thk, block_table))
+    assert not torch.equal(physical_thk, logical_thk), (
+        "block_table path should emit gathered physical block IDs, not logical indices"
+    )
+
+    max_score_hkt = max_score_thk.permute(1, 2, 0).contiguous()
+    logical_hkt = sparse_topk_select(max_score_hkt, topk, num_valid_pages=num_valid_pages)
+    physical_hkt = sparse_topk_select(
+        max_score_hkt, topk, num_valid_pages=num_valid_pages, block_table=block_table,
+    )
+    assert torch.equal(logical_hkt, logical_thk)
+    assert torch.equal(physical_hkt, physical_thk)
+    print("  [PASS] block_table gather after logical sort for THK and HKT layouts")
+
+
+def test_block_table_gather_identity_path(
+    num_qo_heads=2, max_k_tiles=8, total_qo_len=4,
+    topk=16, num_valid_pages=5, seed=303,
+):
+    """Trivial max_k_tiles <= topk path must also gather through block_table."""
+    torch.manual_seed(seed)
+    dev = torch.device("cuda")
+
+    max_score = torch.randn(num_qo_heads, max_k_tiles, total_qo_len,
+                            device=dev, dtype=torch.float32)
+    t = torch.arange(total_qo_len, device=dev, dtype=torch.int32).view(-1, 1, 1)
+    h = torch.arange(num_qo_heads, device=dev, dtype=torch.int32).view(1, -1, 1)
+    k = torch.arange(max_k_tiles, device=dev, dtype=torch.int32).view(1, 1, -1)
+    block_table = (10_000 * t + 100 * h + 3 * k + 1).contiguous()
+
+    result = sparse_topk_select(
+        max_score, topk, num_valid_pages=num_valid_pages, block_table=block_table,
+    )
+    expected = torch.full(
+        (total_qo_len, num_qo_heads, topk), -1, device=dev, dtype=torch.int32
+    )
+    expected[:, :, :num_valid_pages] = block_table[:, :, :num_valid_pages]
+    assert torch.equal(result, expected)
+    print("  [PASS] block_table gather works on identity-fill path")
+
+
 def test_forced_blocks(
     num_qo_heads=4, max_k_tiles=256, total_qo_len=8,
     topk=16, num_valid_pages=200,
@@ -183,6 +257,8 @@ if __name__ == "__main__":
         sys.exit(0)
 
     print("=== Testing forced block selection ===")
+    test_block_table_gather_after_sort()
+    test_block_table_gather_identity_path()
     test_forced_zero_is_noop()
     test_forced_blocks()
     test_forced_blocks(force_begin=1, force_end=0, seed=10)
