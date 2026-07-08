@@ -44,6 +44,7 @@
 
 #include <cuda.h>
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
 
 #include <cfloat>
 #include <cstdint>
@@ -59,6 +60,26 @@ enum class SparseTopKInputLayout : uint32_t {
   kHKT = 0,  // input is (num_qo_heads, max_k_tiles, total_qo_len)
   kTHK = 1,  // input is (total_qo_len, num_qo_heads, max_k_tiles)
 };
+
+__device__ __forceinline__ void SparseTopKWaitOnDependentGrids(uint32_t use_pdl) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  if (use_pdl) {
+    cudaGridDependencySynchronize();
+  }
+#else
+  (void)use_pdl;
+#endif
+}
+
+__device__ __forceinline__ void SparseTopKLaunchDependentGrids(uint32_t use_pdl) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  if (use_pdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#else
+  (void)use_pdl;
+#endif
+}
 
 __device__ __forceinline__ uint32_t LoadRowNumValidPages(
     const int32_t* __restrict__ num_valid_pages_per_token,
@@ -353,7 +374,7 @@ constexpr int kTransposeBlockRows = 8;
 
 __global__ void __launch_bounds__(kTransposeTile* kTransposeBlockRows)
     SparseTopKTransposeKernel(const float* __restrict__ in, float* __restrict__ out, uint32_t K,
-                              uint32_t qo) {
+                              uint32_t qo, uint32_t use_pdl) {
   __shared__ float tile[kTransposeTile][kTransposeTile + 1];
 
   const uint32_t q_base = blockIdx.x * kTransposeTile;
@@ -364,6 +385,8 @@ __global__ void __launch_bounds__(kTransposeTile* kTransposeBlockRows)
 
   const float* in_head = in + static_cast<size_t>(head) * K * qo;
   float* out_head = out + static_cast<size_t>(head) * qo * K;
+
+  SparseTopKWaitOnDependentGrids(use_pdl);
 
   const uint32_t q_load = q_base + tx;
 #pragma unroll
@@ -382,6 +405,10 @@ __global__ void __launch_bounds__(kTransposeTile* kTransposeBlockRows)
     if (q_store < qo && k_store < K) {
       out_head[static_cast<size_t>(q_store) * K + k_store] = tile[tx][ty + dq];
     }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0 && threadIdx.y == 0) {
+    SparseTopKLaunchDependentGrids(use_pdl);
   }
 }
 
@@ -411,7 +438,8 @@ __global__ void __launch_bounds__(kTransposeTile* kTransposeBlockRows)
 // Grid: (qo / TILE, K / TILE, num_qo_heads), Block: TILE * TILE / 4 threads.
 template <int TILE>
 __global__ void __launch_bounds__(TILE * TILE / 4) SparseTopKTransposeXorF4Kernel(
-    const float* __restrict__ in, float* __restrict__ out, uint32_t K, uint32_t qo) {
+    const float* __restrict__ in, float* __restrict__ out, uint32_t K, uint32_t qo,
+    uint32_t use_pdl) {
   constexpr int N_THR = TILE / 4;  // threads along N (qo) direction
 
   __shared__ float S[TILE * TILE];
@@ -426,6 +454,8 @@ __global__ void __launch_bounds__(TILE * TILE / 4) SparseTopKTransposeXorF4Kerne
 
   const float* in_head  = in  + static_cast<size_t>(h) * K * qo;
   float*       out_head = out + static_cast<size_t>(h) * qo * K;
+
+  SparseTopKWaitOnDependentGrids(use_pdl);
 
   // ---- LOAD: float4 GMEM → XOR-swizzled SMEM ---------------------------
   {
@@ -456,6 +486,10 @@ __global__ void __launch_bounds__(TILE * TILE / 4) SparseTopKTransposeXorF4Kerne
         out_head + static_cast<size_t>(q_out) * K + k0);
     *out4 = out_v;
   }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    SparseTopKLaunchDependentGrids(use_pdl);
+  }
 }
 
 // =============================================================================
@@ -475,7 +509,8 @@ __global__ void SparseTopKIdentityFillKernel(int32_t* __restrict__ out,
                                              uint32_t total_qo_len,
                                              uint32_t num_qo_heads, uint32_t max_k_tiles,
                                              uint32_t topk, uint32_t num_valid_pages,
-                                             const int32_t* __restrict__ num_valid_pages_per_token) {
+                                             const int32_t* __restrict__ num_valid_pages_per_token,
+                                             uint32_t use_pdl) {
   // grid = (num_rows = total_qo_len * num_qo_heads,), block = (min(topk, 256),)
   // bid encodes (qo_head_idx, t) with t innermost: bid = qo_head_idx * total_qo_len + t
   // out logical layout: (total_qo_len, num_qo_heads, topk)
@@ -487,6 +522,7 @@ __global__ void SparseTopKIdentityFillKernel(int32_t* __restrict__ out,
   int32_t* row =
       out + static_cast<size_t>(t) * out_stride_t +
       static_cast<size_t>(qo_head_idx) * out_stride_h;
+  SparseTopKWaitOnDependentGrids(use_pdl);
   // valid_count = min(max_k_tiles, num_valid_pages); positions [valid_count, topk) → -1
   const uint32_t row_num_valid_pages =
       LoadRowNumValidPages(num_valid_pages_per_token, t, num_valid_pages);
@@ -495,6 +531,10 @@ __global__ void SparseTopKIdentityFillKernel(int32_t* __restrict__ out,
   for (uint32_t i = tx; i < topk; i += blockDim.x) {
     row[static_cast<size_t>(i) * out_stride_k] =
         (i < valid_count) ? static_cast<int32_t>(i) : static_cast<int32_t>(-1);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    SparseTopKLaunchDependentGrids(use_pdl);
   }
 }
 
@@ -624,7 +664,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     uint32_t num_valid_pages,
     const int32_t* __restrict__ num_valid_pages_per_token,
     uint32_t force_begin, uint32_t force_end,
-    uint32_t input_qo_outermost) {
+    uint32_t input_qo_outermost, uint32_t use_pdl) {
   static_assert(MAX_TOPK <= kSparseTopkMaxK, "MAX_TOPK exceeds supported max");
 
   constexpr int kNumThreadsPerBlock = kIndexerNumThreadsPerBlock;
@@ -675,6 +715,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   const int rowEnd = static_cast<int>(max_k_tiles);
   const int rowLen = rowEnd - rowStart;
   const int topK = static_cast<int>(topk);
+  SparseTopKWaitOnDependentGrids(use_pdl);
   const uint32_t row_num_valid_pages =
       LoadRowNumValidPages(num_valid_pages_per_token, t, num_valid_pages);
   const uint32_t force_end_start =
@@ -695,6 +736,10 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     for (int rowIt = valid_count + threadIdx.x; rowIt < topK; rowIt += kNumThreadsPerBlock) {
       row_out[static_cast<size_t>(rowIt) * out_stride_k] = -1;
     }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      SparseTopKLaunchDependentGrids(use_pdl);
+    }
     return;
   }
 
@@ -711,6 +756,10 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     }
     for (int rowIt = valid_count + threadIdx.x; rowIt < topK; rowIt += kNumThreadsPerBlock) {
       row_out[static_cast<size_t>(rowIt) * out_stride_k] = -1;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      SparseTopKLaunchDependentGrids(use_pdl);
     }
     return;
   }
@@ -790,6 +839,9 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   //     cost: < 1 us per kernel.  Savings: ~12 us per call = ~50% of the
   //     v2.0 IndexerTopKWithSortKernel runtime on n1024_K8192.
   __syncthreads();  // ensure all threads' writes to smemOutput are visible
+  if (threadIdx.x == 0) {
+    SparseTopKLaunchDependentGrids(use_pdl);
+  }
 
   const uint32_t warp_id = threadIdx.x >> 5;
   const uint32_t lane = threadIdx.x & 31;
@@ -856,6 +908,32 @@ inline cudaError_t ConfigureSparseTopKSelect() {
   return cudaSuccess;
 }
 
+inline cudaError_t LaunchSparseTopKKernel(const void* kernel, dim3 grid, dim3 block,
+                                          void** args, size_t dyn_smem_bytes,
+                                          cudaStream_t stream, bool enable_pdl) {
+  if (!enable_pdl) {
+    return cudaLaunchKernel(kernel, grid, block, args, dyn_smem_bytes, stream);
+  }
+
+#if ((__CUDACC_VER_MAJOR__ >= 12) || \
+     ((__CUDACC_VER_MAJOR__ == 11) && (__CUDACC_VER_MINOR__ >= 8)))
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+
+  cudaLaunchConfig_t config = {};
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = dyn_smem_bytes;
+  config.stream = stream;
+  config.attrs = attrs;
+  config.numAttrs = 1;
+  return cudaLaunchKernelExC(&config, kernel, args);
+#else
+  return cudaLaunchKernel(kernel, grid, block, args, dyn_smem_bytes, stream);
+#endif
+}
+
 cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
                               uint64_t out_stride_t, uint64_t out_stride_h,
                               uint64_t out_stride_k,
@@ -865,22 +943,25 @@ cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
                               const int32_t* num_valid_pages_per_token,
                               uint32_t force_begin, uint32_t force_end,
                               bool input_qo_outermost,
-                              cudaStream_t stream) {
+                              cudaStream_t stream, bool enable_pdl) {
   const uint32_t num_rows = total_qo_len * num_qo_heads;
   if (num_rows == 0) return cudaSuccess;
 
   auto kernel = IndexerTopKWithSortKernel<16>;
   const size_t dyn_smem_bytes = static_cast<size_t>(topk) * sizeof(int32_t);
   const uint32_t input_qo_outermost_u32 = input_qo_outermost ? 1u : 0u;
+  const uint32_t use_pdl = enable_pdl ? 1u : 0u;
   void* args[] = {(void*)&in_row_contig, (void*)&out,
                   (void*)&out_stride_t, (void*)&out_stride_h, (void*)&out_stride_k,
                   (void*)&total_qo_len,
                   (void*)&num_qo_heads, (void*)&max_k_tiles, (void*)&topk,
                   (void*)&num_valid_pages, (void*)&num_valid_pages_per_token,
-                  (void*)&force_begin, (void*)&force_end, (void*)&input_qo_outermost_u32};
+                  (void*)&force_begin, (void*)&force_end, (void*)&input_qo_outermost_u32,
+                  (void*)&use_pdl};
   dim3 grid(num_rows);
   dim3 block(kIndexerNumThreadsPerBlock);
-  return cudaLaunchKernel((const void*)kernel, grid, block, args, dyn_smem_bytes, stream);
+  return LaunchSparseTopKKernel((const void*)kernel, grid, block, args, dyn_smem_bytes,
+                                stream, enable_pdl);
 }
 
 cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transposed, int32_t* out,
@@ -891,9 +972,10 @@ cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transp
                                           uint32_t num_valid_pages,
                                           const int32_t* num_valid_pages_per_token,
                                           uint32_t force_begin, uint32_t force_end,
-                                          cudaStream_t stream) {
+                                          cudaStream_t stream, bool enable_pdl) {
   const uint32_t num_rows = total_qo_len * num_qo_heads;
   if (num_rows == 0) return cudaSuccess;
+  const uint32_t use_pdl = enable_pdl ? 1u : 0u;
 
   // ---- (1) Transpose: dispatch to TransposeXorF4<32> fast path when
   //          preconditions are met (qo & K both divisible by 32 and 4),
@@ -908,18 +990,21 @@ cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transp
       dim3 grid(total_qo_len / kXorTile, max_k_tiles / kXorTile, num_qo_heads);
       dim3 block(kXorTile * kXorTile / 4);  // = 256 threads
       void* tr_args[] = {
-          (void*)&in_strided, (void*)&transposed, (void*)&max_k_tiles, (void*)&total_qo_len};
-      cudaError_t err = cudaLaunchKernel((const void*)SparseTopKTransposeXorF4Kernel<kXorTile>,
-                                         grid, block, tr_args, 0, stream);
+          (void*)&in_strided, (void*)&transposed, (void*)&max_k_tiles, (void*)&total_qo_len,
+          (void*)&use_pdl};
+      cudaError_t err = LaunchSparseTopKKernel(
+          (const void*)SparseTopKTransposeXorF4Kernel<kXorTile>, grid, block, tr_args, 0,
+          stream, enable_pdl);
       if (err != cudaSuccess) return err;
     } else {
       dim3 grid((total_qo_len + kTransposeTile - 1) / kTransposeTile,
                 (max_k_tiles + kTransposeTile - 1) / kTransposeTile, num_qo_heads);
       dim3 block(kTransposeTile, kTransposeBlockRows);
       void* tr_args[] = {
-          (void*)&in_strided, (void*)&transposed, (void*)&max_k_tiles, (void*)&total_qo_len};
-      cudaError_t err = cudaLaunchKernel((const void*)SparseTopKTransposeKernel, grid, block,
-                                         tr_args, 0, stream);
+          (void*)&in_strided, (void*)&transposed, (void*)&max_k_tiles, (void*)&total_qo_len,
+          (void*)&use_pdl};
+      cudaError_t err = LaunchSparseTopKKernel((const void*)SparseTopKTransposeKernel, grid,
+                                               block, tr_args, 0, stream, enable_pdl);
       if (err != cudaSuccess) return err;
     }
   }
@@ -929,7 +1014,7 @@ cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transp
                            total_qo_len, num_qo_heads, max_k_tiles, topk,
                            num_valid_pages, num_valid_pages_per_token,
                            force_begin, force_end,
-                           /*input_qo_outermost=*/false, stream);
+                           /*input_qo_outermost=*/false, stream, enable_pdl);
 }
 
 // =============================================================================
@@ -964,10 +1049,11 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
                                     const int32_t* num_valid_pages_per_token,
                                     SparseTopKInputLayout input_layout,
                                     uint32_t force_begin, uint32_t force_end,
-                                    cudaStream_t stream) {
+                                    cudaStream_t stream, bool enable_pdl = true) {
   constexpr uint32_t topk = 16;
   const uint32_t num_rows = total_qo_len * num_qo_heads;
   if (num_rows == 0) return cudaSuccess;
+  const uint32_t use_pdl = enable_pdl ? 1u : 0u;
 
   // ---- Trivial path: max_k_tiles <= topk → identity fill -----------------
   if (max_k_tiles <= topk) {
@@ -976,9 +1062,9 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
     void* args[] = {(void*)&out, (void*)&out_stride_t, (void*)&out_stride_h,
                     (void*)&out_stride_k, (void*)&total_qo_len, (void*)&num_qo_heads,
                     (void*)&max_k_tiles, (void*)&topk, (void*)&num_valid_pages,
-                    (void*)&num_valid_pages_per_token};
-    return cudaLaunchKernel((const void*)SparseTopKIdentityFillKernel, grid, block, args, 0,
-                            stream);
+                    (void*)&num_valid_pages_per_token, (void*)&use_pdl};
+    return LaunchSparseTopKKernel((const void*)SparseTopKIdentityFillKernel, grid, block,
+                                  args, 0, stream, enable_pdl);
   }
 
   // ---- IndexerTopK insertion-sort path ------------------------------------
@@ -989,7 +1075,7 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
                              total_qo_len, num_qo_heads, max_k_tiles, topk,
                              num_valid_pages, num_valid_pages_per_token,
                              force_begin, force_end,
-                             /*input_qo_outermost=*/true, stream);
+                             /*input_qo_outermost=*/true, stream, enable_pdl);
   }
 
   float* transpose_buf = reinterpret_cast<float*>(workspace);
@@ -998,7 +1084,7 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
                                        total_qo_len, num_qo_heads,
                                        max_k_tiles, topk, num_valid_pages,
                                        num_valid_pages_per_token,
-                                       force_begin, force_end, stream);
+                                       force_begin, force_end, stream, enable_pdl);
 }
 
 }  // namespace sparse_topk
