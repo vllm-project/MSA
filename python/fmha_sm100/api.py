@@ -1215,6 +1215,7 @@ def sparse_topk_select(
     force_begin_blocks: int = 0,
     force_end_blocks: int = 0,
     max_score_layout: str = "HKT",
+    block_table: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Select top-k KV-tile indices per (qo_head, token) row from the FMHA max-score tensor.
 
@@ -1252,12 +1253,19 @@ def sparse_topk_select(
         Number of KV blocks at the end of the valid sequence (indices
         nvp-N..nvp-1, closest to the current query) to always include.  Useful
         for local-window attention.  Default 0.
+    block_table : torch.Tensor, optional
+        Optional int32 tensor with shape ``(total_qo_len, num_qo_heads, max_k_tiles)``.
+        The kernel still selects and sorts logical tile indices, but after sorting
+        each logical index ``idx`` is replaced with ``block_table[t, h, idx]`` in
+        the output.  Use this for per-token/per-head physical page-table gathers.
 
     Returns
     -------
     torch.Tensor
-        Shape ``(total_qo_len, num_qo_heads, topk)``, int32, ascending by tile index.
-        Out-of-range entries (if any) are ``-1`` at the tail.
+        Shape ``(total_qo_len, num_qo_heads, topk)``, int32.  Without
+        ``block_table``, values are logical tile indices in ascending tile order.
+        With ``block_table``, values are gathered block-table entries after that
+        logical ascending sort.  Out-of-range entries (if any) are ``-1`` at the tail.
     """
 
     assert max_score.dtype == torch.float32, f"max_score must be float32, got {max_score.dtype}"
@@ -1275,6 +1283,25 @@ def sparse_topk_select(
     else:
         total_qo_len, num_qo_heads, max_k_tiles = max_score.shape
         layout_arg = 1
+
+    if block_table is not None:
+        assert block_table.dtype == torch.int32, (
+            f"block_table must be int32, got {block_table.dtype}"
+        )
+        assert block_table.device == max_score.device, (
+            f"block_table must be on {max_score.device}, got {block_table.device}"
+        )
+        assert block_table.dim() == 3, (
+            f"block_table must be 3D [total_qo_len, num_qo_heads, max_k_tiles], "
+            f"got {tuple(block_table.shape)}"
+        )
+        assert tuple(block_table.shape) == (total_qo_len, num_qo_heads, max_k_tiles), (
+            f"block_table shape must be {(total_qo_len, num_qo_heads, max_k_tiles)}, "
+            f"got {tuple(block_table.shape)}"
+        )
+        assert all(s >= 0 for s in block_table.stride()), (
+            f"block_table must have non-negative strides, got {block_table.stride()}"
+        )
 
     # v2.3 kernel only supports the insertion-sort path (K < 12288).
     assert max_k_tiles < 12288, (
@@ -1356,7 +1383,7 @@ def sparse_topk_select(
     # post-process torch.where + sort + torch.where chain (~84-101 us / call)
     # is replaced by passing num_valid_pages directly to the kernel.
     module.sparse_topk_select(
-        max_score, output_indices, workspace_buffer,
+        max_score, output_indices, workspace_buffer, block_table,
         topk,
         nvp_arg,
         nvp_tensor,

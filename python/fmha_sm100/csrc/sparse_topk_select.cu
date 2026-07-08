@@ -33,7 +33,9 @@ void sparse_topk_select_init() {
 //   To disable clamping, pass num_valid_pages = max_k_tiles (or any value
 //   >= max_k_tiles).
 void sparse_topk_select(TensorView max_score, TensorView output_indices,
-                        Optional<TensorView> maybe_workspace_buffer, int64_t topk,
+                        Optional<TensorView> maybe_workspace_buffer,
+                        Optional<TensorView> maybe_block_table,
+                        int64_t topk,
                         int64_t num_valid_pages,
                         Optional<TensorView> maybe_num_valid_pages_per_token,
                         int64_t force_begin_blocks, int64_t force_end_blocks,
@@ -68,6 +70,33 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
   TVM_FFI_ICHECK(topk == 16) << "this kernel only supports topk == 16, got " << topk;
   TVM_FFI_ICHECK(num_valid_pages > 0)
       << "num_valid_pages must be > 0, got " << num_valid_pages;
+
+  const int32_t* block_table_ptr = nullptr;
+  uint64_t block_table_stride_t = 0;
+  uint64_t block_table_stride_h = 0;
+  uint64_t block_table_stride_k = 0;
+  if (maybe_block_table.has_value()) {
+    TensorView block_table = maybe_block_table.value();
+    CHECK_CUDA(block_table);
+    CHECK_DIM(3, block_table);
+    TVM_FFI_ICHECK(encode_dlpack_dtype(block_table.dtype()) == int32_code)
+        << "block_table must be int32";
+    TVM_FFI_ICHECK(block_table.size(0) == total_qo_len &&
+                   block_table.size(1) == num_qo_heads &&
+                   block_table.size(2) == max_k_tiles)
+        << "block_table must have shape [total_qo_len=" << total_qo_len
+        << ", num_qo_heads=" << num_qo_heads << ", max_k_tiles=" << max_k_tiles
+        << "], got [" << block_table.size(0) << ", " << block_table.size(1)
+        << ", " << block_table.size(2) << "]";
+    TVM_FFI_ICHECK(block_table.stride(0) >= 0 && block_table.stride(1) >= 0 &&
+                   block_table.stride(2) >= 0)
+        << "block_table must have non-negative strides";
+    CHECK_DEVICE(block_table, max_score);
+    block_table_ptr = TensorDataPtrConst<int32_t>(block_table);
+    block_table_stride_t = static_cast<uint64_t>(block_table.stride(0));
+    block_table_stride_h = static_cast<uint64_t>(block_table.stride(1));
+    block_table_stride_k = static_cast<uint64_t>(block_table.stride(2));
+  }
 
   const int32_t* num_valid_pages_per_token = nullptr;
   if (maybe_num_valid_pages_per_token.has_value()) {
@@ -105,9 +134,13 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
       TensorDataPtrConst<float>(max_score),
       TensorDataPtr<int32_t>(output_indices),
       workspace_ptr,
+      block_table_ptr,
       static_cast<uint64_t>(output_indices.stride(0)),
       static_cast<uint64_t>(output_indices.stride(1)),
       static_cast<uint64_t>(output_indices.stride(2)),
+      block_table_stride_t,
+      block_table_stride_h,
+      block_table_stride_k,
       static_cast<uint32_t>(total_qo_len), static_cast<uint32_t>(num_qo_heads),
       static_cast<uint32_t>(max_k_tiles), static_cast<uint32_t>(num_valid_pages),
       num_valid_pages_per_token, layout,
