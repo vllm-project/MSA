@@ -8,7 +8,7 @@
  *   http://www.apache.org/licenses/LICENSE-2.0
  *
  * ------------------------------------------------------------------------
- * Portions of this file (indexerTopK histogram-step + insertion-sort
+ * Portions of this file (indexerTopK histogram-step + final-candidate selection
  * algorithm) are derived from NVIDIA TensorRT-LLM:
  *   Copyright (c) 2019-2026 NVIDIA CORPORATION
  *   Copyright (c) 2021 NAVER Corp. (CLOVA)
@@ -122,10 +122,10 @@ __device__ __forceinline__ int32_t GatherBlockTableValue(
 //   [transpose_buf (Hq, qo, K) row-contig fp32 — workspace]
 //          |
 //          v  IndexerTopKWithSortKernel<MAX_TOPK>(grid=num_rows, block=512)
-//          |    Stage 0: 11-bit fp16 hist + cub::BlockScan + threshold + classify
-//          |    Stage 1/2/3: 11+11+10 bit fp32 (only if Stage 0 didn't finish)
-//          |    Final pass: insertion sort over kNumFinalItems=2048 candidates
-//          |    NEW: cub::BlockRadixSort<uint32_t, 512, 1> on smemOutput (asc by idx)
+//          |    Stage 0: 10-bit fp16 hist + cub::BlockScan + threshold + classify
+//          |    Stage 1/2/3: 10+10+10 bit fp32 (only if Stage 0 didn't finish)
+//          |    Final pass: bounded rank-select / warp merge over the staged bin
+//          |    Warp-only bitonic sort on smemOutput (ascending by index)
 //          |    NEW: write gmem with qo_outermost offset
 //          |
 //   [out (qo, num_qo_heads, topk) int32, ascending-by-index]
@@ -572,6 +572,34 @@ __global__ void SparseTopKIdentityFillKernel(int32_t* __restrict__ out,
 // {1, 2} keys depending on MAX_TOPK), modelled on v1.6.5's WarpBitonicSortAsc16.
 // Expected cost: < 1 us, savings ~12 us per kernel call.
 
+constexpr int kFinalCandidateSourceBits = 14;
+constexpr uint64_t kFinalCandidateSourceMask = (1ull << kFinalCandidateSourceBits) - 1;
+
+// Pack score, staging position, and source index into one sortable key.  The
+// high 32 bits preserve numeric float order.  Staging position is next so an
+// equal-score tie follows the legacy rank loop, which preferred larger staged
+// positions (`i < j` incremented i's rank).  The source index is payload in the
+// low 14 bits; max_k_tiles is constrained to < 12288 by the dispatcher.
+__device__ __forceinline__ uint64_t MakeFinalCandidateKey(float logit,
+                                                         int staging_position,
+                                                         int source_index) {
+  // Numeric comparison treats -0.0f and +0.0f as equal, so canonicalize zero
+  // before converting the score to an integer ordering key.
+  const uint32_t raw_bits = __float_as_uint(logit);
+  const uint32_t bits = (raw_bits & 0x7fffffffu) == 0 ? 0u : raw_bits;
+  const uint32_t ordered_bits =
+      (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+  return (static_cast<uint64_t>(ordered_bits) << 32) |
+         (static_cast<uint64_t>(staging_position) << kFinalCandidateSourceBits) |
+         static_cast<uint32_t>(source_index);
+}
+
+struct FinalCandidateKeyGreater {
+  __device__ __forceinline__ bool operator()(uint64_t lhs, uint64_t rhs) const {
+    return lhs > rhs;
+  }
+};
+
 // 32-element ascending sort, 32 lanes × 1 key each (for MAX_TOPK ≤ 32).
 // Lanes with no real data should pass key = ~0u sentinel, which sorts to the end.
 __device__ __forceinline__ void WarpBitonicSortAsc32(uint32_t& key, uint32_t lane) {
@@ -643,25 +671,23 @@ __device__ __forceinline__ void WarpBitonicSortAsc64(uint32_t* keys, uint32_t la
 // =============================================================================
 //
 // Per-CTA work (1 CTA per (qo_head, qo_pos) row):
-//   1. Stage 0: 11-bit fp16 histogram (2048 bins) → cub::BlockScan threshold
+//   1. Stage 0: 10-bit fp16 histogram (1024 bins) → cub::BlockScan threshold
 //      → classify each element: bin < threshold ⇒ direct emit to smemOutput;
 //        bin == threshold ⇒ stage to smemFinal.items if it fits (≤ 2048).
-//   2. Stage 1/2/3 (only if needed): 11+11+10 bit fp32 histogram refinement
+//   2. Stage 1/2/3 (only if needed): 10+10+10 bit fp32 histogram refinement
 //      on the elements that landed in the threshold bin.
 //   3. If we never fell through to step 3, the staging buffer has a
-//      well-defined subset of "ties at the boundary" — insertion sort over
-//      smemFinal.items emits the remaining (topk - foundSoFar) slots into
-//      smemOutput.
-//   4. NEW (v2.0 fused sort): cub::BlockRadixSort<uint32_t, 512, 1> over
-//      smemOutput[0..topk-1] → ascending by index.
+//      well-defined subset of "ties at the boundary".  Small bins use bounded
+//      all-pairs ranking; large bins use a two-level warp merge.
+//   4. Warp-only bitonic sort over smemOutput[0..topk-1] → ascending by index.
 //   5. Write to gmem with qo_outermost strides:
 //        out[t][qo_head_idx][k] at t*out_stride_t + qo_head_idx*out_stride_h + k*out_stride_k
 //
 // Template params:
 //   MAX_TOPK            — round-up template bin (16/32/64), runtime topk ≤ MAX_TOPK
 //   kNumThreadsPerBlock — fixed at 512 (matches trtllm canonical config)
-//   kNumBins            — fixed at 2048 (11-bit fp16 / fp32 hist)
-//   kNumFinalItems      — fixed at 2048 (insertion sort staging capacity)
+//   kNumBins            — fixed at 1024 (10-bit fp16 / fp32 hist)
+//   kNumFinalItems      — fixed at 2048 (final-candidate staging capacity)
 //
 // Dynamic SMEM = topk * sizeof(int32_t).  The module configures the kernel's
 // dynamic-SMEM attribute once at load time so graph capture only sees launches.
@@ -669,6 +695,7 @@ constexpr uint32_t kSparseTopkMaxK = 64;
 constexpr int kIndexerNumThreadsPerBlock = 512;
 constexpr int kIndexerNumBins = 1024;  // 10-bit hist (was 2048 / 11-bit)
 constexpr int kIndexerNumFinalItems = 2048;
+constexpr int kIndexerQuadraticSelectionLimit = 512;
 
 template <uint32_t MAX_TOPK>
 __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSortKernel(
@@ -693,8 +720,17 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   constexpr int kNumThreadsPerBlock = kIndexerNumThreadsPerBlock;
   constexpr int kNumBins = kIndexerNumBins;
   constexpr int kNumFinalItems = kIndexerNumFinalItems;
+  constexpr int kNumWarps = kNumThreadsPerBlock / 32;
+  constexpr int kCandidatesPerThread =
+      (kNumFinalItems + kNumThreadsPerBlock - 1) / kNumThreadsPerBlock;
+  constexpr int kWarpCandidatesPerLane =
+      (kNumWarps * MAX_TOPK + 31) / 32;
+  static_assert(kNumThreadsPerBlock % 32 == 0);
+  static_assert(kCandidatesPerThread * kNumThreadsPerBlock >= kNumFinalItems);
 
   using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
+  using CandidateWarpSort = cub::WarpMergeSort<uint64_t, kCandidatesPerThread, 32>;
+  using CandidateGlobalSort = cub::WarpMergeSort<uint64_t, kWarpCandidatesPerLane, 32>;
 
   struct FinalItems {
     int indices[kNumFinalItems];
@@ -704,12 +740,18 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     typename Scan::TempStorage scan;
     int data[kNumBins];
   };
+  struct CandidateWarpSortStorage {
+    typename CandidateWarpSort::TempStorage warps[kNumWarps];
+  };
 
   // SMEM union — v2.1 dropped the cub::BlockRadixSort sortByIndex member
-  // since the asc-by-index sort is now warp-only (uses no SMEM).
+  // since the asc-by-index sort is now warp-only.  Final-candidate merge-sort
+  // storage can alias items after every candidate has been packed in registers.
   __shared__ union {
     FinalItems items;
     Histogram histo;
+    CandidateWarpSortStorage candidateWarpSort;
+    typename CandidateGlobalSort::TempStorage candidateGlobalSort;
   } smemFinal;
 
   // Dynamic SMEM holds the top-K accumulator (one int32 per slot, sized by topk).
@@ -719,6 +761,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   __shared__ int smemFinalDstIdx[1];
   __shared__ int smemFinalBinSize[1];
   __shared__ int smemFoundTopKValues[1];
+  __shared__ uint64_t smemWarpTopCandidateKeys[kNumWarps * MAX_TOPK];
 
   // ---- bid -> row decode ---------------------------------------------------
   // HKT transpose path: bid = qo_head_idx * total_qo_len + t.
@@ -803,7 +846,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   int thresholdBinIdx = -1;
   uint32_t logitPattern = 0;
 
-  // ---- Stage 0: fp16 11-bit hist -----------------------------------------
+  // ---- Stage 0: fp16 10-bit hist -----------------------------------------
   bool continueToNextStep =
       processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
           logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
@@ -836,29 +879,89 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   }
 
   if (!continueToNextStep) {
-    // Insertion sort path: the threshold bin fit within kNumFinalItems, so we
-    // sort the staged candidates by score (ties by source idx) and emit the
-    // remaining (topK - foundSoFar) entries to smemOutput.
+    // The threshold bin fit within kNumFinalItems.  The all-pairs rank loop is
+    // fastest for small bins; cap it at 512 candidates so its worst-case work
+    // stays bounded.  Larger bins use a two-level warp merge: each warp
+    // contributes its local top candidates, then warp 0 merges at most
+    // kNumWarps * topK keys in O(finalCount * log(finalCount)) work.
     const int baseIdx = smemFoundTopKValues[0];
     const int finalCount = smemFinalDstIdx[0];
-    for (int i = threadIdx.x; i < finalCount; i += kNumThreadsPerBlock) {
-      int outIndex = 0;
-      auto logit = smemFinal.items.logits[i];
-      for (int j = 0; j < finalCount; j++) {
-        auto otherLogit = smemFinal.items.logits[j];
-        if (logit < otherLogit || (logit == otherLogit && i < j)) {
-          outIndex++;
+    const int numFinalSelections = topK - baseIdx;
+    const int selectionLane = threadIdx.x & 31;
+    const int selectionWarp = threadIdx.x >> 5;
+
+    if (finalCount <= kIndexerQuadraticSelectionLimit) {
+      for (int i = threadIdx.x; i < finalCount; i += kNumThreadsPerBlock) {
+        int outIndex = 0;
+        const float logit = smemFinal.items.logits[i];
+        for (int j = 0; j < finalCount; ++j) {
+          const float otherLogit = smemFinal.items.logits[j];
+          if (logit < otherLogit || (logit == otherLogit && i < j)) {
+            ++outIndex;
+          }
+        }
+        if (outIndex + baseIdx < topK) {
+          smemOutput[outIndex + baseIdx] = smemFinal.items.indices[i];
         }
       }
-      if (outIndex + baseIdx < topK) {
-        smemOutput[outIndex + baseIdx] = smemFinal.items.indices[i];
+      __syncthreads();
+    } else {
+      // Pack all shared-memory candidates into registers before merge-sort
+      // reuses the same union as temporary storage.
+      uint64_t candidateKeys[kCandidatesPerThread];
+#pragma unroll
+      for (int item = 0; item < kCandidatesPerThread; ++item) {
+        const int position = threadIdx.x + item * kNumThreadsPerBlock;
+        candidateKeys[item] =
+            position < finalCount
+                ? MakeFinalCandidateKey(smemFinal.items.logits[position], position,
+                                        smemFinal.items.indices[position])
+                : 0;
+      }
+      __syncthreads();
+
+      CandidateWarpSort(smemFinal.candidateWarpSort.warps[selectionWarp])
+          .Sort(candidateKeys, FinalCandidateKeyGreater{});
+
+#pragma unroll
+      for (int item = 0; item < kCandidatesPerThread; ++item) {
+        const int rank = selectionLane * kCandidatesPerThread + item;
+        if (rank < numFinalSelections) {
+          smemWarpTopCandidateKeys[selectionWarp * numFinalSelections + rank] =
+              candidateKeys[item];
+        }
+      }
+      __syncthreads();
+
+      // Merge the per-warp top keys with warp 0.  No item ranked below R within
+      // its own warp can enter the block-wide top R.
+      if (selectionWarp == 0) {
+        const int numWarpCandidates = kNumWarps * numFinalSelections;
+        uint64_t warpCandidateKeys[kWarpCandidatesPerLane];
+#pragma unroll
+        for (int item = 0; item < kWarpCandidatesPerLane; ++item) {
+          const int position = selectionLane * kWarpCandidatesPerLane + item;
+          warpCandidateKeys[item] =
+              position < numWarpCandidates ? smemWarpTopCandidateKeys[position] : 0;
+        }
+
+        CandidateGlobalSort(smemFinal.candidateGlobalSort)
+            .Sort(warpCandidateKeys, FinalCandidateKeyGreater{});
+
+#pragma unroll
+        for (int item = 0; item < kWarpCandidatesPerLane; ++item) {
+          const int rank = selectionLane * kWarpCandidatesPerLane + item;
+          if (rank < numFinalSelections) {
+            smemOutput[baseIdx + rank] = static_cast<int>(
+                warpCandidateKeys[item] & kFinalCandidateSourceMask);
+          }
+        }
       }
     }
-    __syncthreads();
   }
 
   // ---- v2.1 warp-only fused asc-by-index sort -----------------------------
-  // After insertion-sort fills smemOutput[0..topk-1] (unsorted by index),
+  // After final-candidate selection fills smemOutput[0..topk-1] (unsorted by index),
   // only warp 0 (32 lanes) participates in the sort.  Other 480 threads idle.
   //
   // Why warp-only vs cub::BlockRadixSort<512, 1>:

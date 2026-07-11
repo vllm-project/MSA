@@ -517,6 +517,9 @@ def _do_compile_sparse_topk():
     nvcc = os.path.join(cuda_home, "bin", "nvcc")
 
     obj = cache_dir / "sparse_topk_select.o"
+    cached_cu = cache_dir / "sparse_topk_select.cu"
+    cached_cuh = cache_dir / "sparse_topk_select.cuh"
+    cached_ffi_header = cache_dir / "tvm_ffi_utils.h"
 
     nvcc_flags = _get_nvcc_flags(cache_dir, False)
 
@@ -533,7 +536,7 @@ rule nvcc_link
   command = $nvcc -shared $in -o $out -lcuda
   description = Linking $out
 
-build {obj}: nvcc_compile {cache_dir / "sparse_topk_select.cu"}
+build {obj}: nvcc_compile {cached_cu} | {cached_cuh} {cached_ffi_header}
 build {so_path}: nvcc_link {obj}
 """
     (cache_dir / "build.ninja").write_text(ninja_content)
