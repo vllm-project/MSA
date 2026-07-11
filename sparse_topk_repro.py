@@ -98,6 +98,22 @@ def _stress_scores(rows, max_k_tiles, nvp, kind):
     return scores
 
 
+def _refined_stress_scores(rows, max_k_tiles, final_count):
+    """Force stage-0/1 overflow, then a stage-2 threshold bin."""
+    scores = torch.full(
+        (rows, 1, max_k_tiles), -float("inf"), device=DEV, dtype=torch.float32
+    )
+    low = torch.tensor([0x3F060FFF], device=DEV, dtype=torch.uint32).view(
+        torch.float32
+    )
+    high = torch.tensor([0x3F070FFF], device=DEV, dtype=torch.uint32).view(
+        torch.float32
+    )
+    scores[..., :3200] = low
+    scores[..., :final_count] = high
+    return scores
+
+
 def _validate_selection(scores, output, nvp):
     assert output.dtype == torch.int32
     assert torch.all(output >= 0)
@@ -124,7 +140,7 @@ def stress(iters, soak_iters):
         )
         elapsed = time_us(fn, iters=iters, warmup=30)
         _validate_selection(scores, output, nvp)
-        path = "rank" if nvp <= 512 else "merge" if nvp <= 2048 else "refine"
+        path = "rank" if nvp <= 416 else "merge" if nvp <= 2048 else "refine"
         print(f"{nvp:>6} | {elapsed:>10.2f} | {path:>12}")
 
     print("\n# Distribution sweep (THK, grid=120, K=8192, nvp=1600)")
@@ -137,6 +153,30 @@ def stress(iters, soak_iters):
         elapsed = time_us(fn, iters=iters, warmup=30)
         _validate_selection(scores, output, 1600)
         print(f"{kind:>12} | {elapsed:>10.2f}")
+
+    print("\n# Refinement-to-selection sweep (THK, grid=120, K=8192, nvp=3200)")
+    print(f"{'finalCount':>10} | {'time (us)':>10} | {'path':>12}")
+    for final_count in (256, 384, 385, 400, 416, 417, 511, 512, 513,
+                        782, 1024, 1600, 2048):
+        scores = _refined_stress_scores(rows, max_k_tiles, final_count)
+        fn = lambda: sparse_topk_select(
+            scores, TOPK, num_valid_pages=3200, output=output, max_score_layout="THK"
+        )
+        elapsed = time_us(fn, iters=iters, warmup=30)
+        _validate_selection(scores, output, 3200)
+        path = "rank" if final_count <= 384 else "merge"
+        print(f"{final_count:>10} | {elapsed:>10.2f} | {path:>12}")
+
+    print("\n# Padding sweep (stage-2 finalCount=512, nvp=3200)")
+    print(f"{'max_k_tiles':>12} | {'time (us)':>10}")
+    for padded_k in (3200, 4096, 6144, 8192, 10240, 12032):
+        scores = _refined_stress_scores(rows, padded_k, 512)
+        fn = lambda: sparse_topk_select(
+            scores, TOPK, num_valid_pages=3200, output=output, max_score_layout="THK"
+        )
+        elapsed = time_us(fn, iters=iters, warmup=30)
+        _validate_selection(scores, output, 3200)
+        print(f"{padded_k:>12} | {elapsed:>10.2f}")
 
     print("\n# Grid sweep (THK, K=8192, nvp=1600, all-equal)")
     print(f"{'rows':>6} | {'time (us)':>10} | {'ns/row':>10}")
@@ -200,7 +240,10 @@ def main():
         choices=(256, 512, 782, 1600, 3200),
         help="launch one case for ncu/nsys instead of running the timing table",
     )
-    parser.add_argument("--profile-kind", choices=("spread", "equal"), default="equal")
+    parser.add_argument(
+        "--profile-kind", choices=("spread", "equal", "refined"), default="equal"
+    )
+    parser.add_argument("--profile-final-count", type=int, default=512)
     parser.add_argument("--stress", action="store_true")
     parser.add_argument("--stress-iters", type=int, default=500)
     parser.add_argument("--soak-iters", type=int, default=10_000)
@@ -211,7 +254,22 @@ def main():
         return
 
     if args.profile_nvp is not None:
-        fn = call(make(args.profile_nvp, args.profile_kind), args.profile_nvp)
+        if args.profile_kind == "refined":
+            if args.profile_nvp != 3200:
+                parser.error("--profile-kind refined requires --profile-nvp 3200")
+            profile_scores = _refined_stress_scores(T, MK, args.profile_final_count)
+            profile_output = torch.empty(
+                T, H, TOPK, dtype=torch.int32, device=DEV
+            )
+            fn = lambda: sparse_topk_select(
+                profile_scores,
+                TOPK,
+                num_valid_pages=3200,
+                output=profile_output,
+                max_score_layout="THK",
+            )
+        else:
+            fn = call(make(args.profile_nvp, args.profile_kind), args.profile_nvp)
         torch.cuda.nvtx.range_push(
             f"sparse_topk_{args.profile_kind}_nvp_{args.profile_nvp}"
         )

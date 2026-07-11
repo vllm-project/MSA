@@ -182,9 +182,9 @@ occupancy win and a lower worst-case ceiling.
 
 The kernel now uses a hybrid final-candidate selector:
 
-- `finalCount <= 512`: retain the existing all-pairs rank loop, which is faster
+- `finalCount <= 416`: retain the existing all-pairs rank loop, which is faster
   for small boundary bins.
-- `finalCount > 512`: pack each candidate into an exact sortable key, take each
+- `finalCount > 416`: pack each candidate into an exact sortable key, take each
   warp's local top-k with `cub::WarpMergeSort`, then merge at most 256 keys in
   warp 0. This preserves the existing score order and staged-position tie rule
   while bounding the large-bin path.
@@ -215,26 +215,47 @@ The 782- and 1600-candidate fixed profiles are effectively identical. The
 remaining large-bin hotspot is shared-memory traffic inside the warp merge,
 not data-dependent quadratic ranking.
 
+A follow-up stress case exposed an overflow-at-stage-0, overflow-at-stage-1,
+then shrink-to-512-at-stage-2 corner. It combined repeated full-row scans with
+the retained quadratic path and reached 28.2-28.5 us. Two additional changes
+close that hole:
+
+- histogram/refinement passes stop at per-row `num_valid_pages` rather than
+  rescanning the padded `max_k_tiles` tail;
+- the measured rank/merge crossover is capped at 416 candidates.
+
+The crafted stage-2 `finalCount=512` case is now ~20.8 us and stays flat as
+`max_k_tiles` varies from 3200 to 12032; previously it grew from 23.6 to
+30.8 us over that range.
+
+For that exact corner, Nsight Compute reports 12.34M -> 4.71M warp
+instructions (-62%) and a cold profiled duration of 44.1 -> 37.7 us. The new
+merge performs more shared-memory traffic, but eliminates the quadratic
+instruction tail; steady-state event timing captures the larger 28.2 ->
+20.8 us improvement.
+
 ### PDL stress results
 
 The final branch is based on `dev` with PDL enabled. A GB200 stress run covered
 the 512/513 selector cutoff, the 2048/2049 refinement boundary, four score
-distributions, grids from 1 to 1024 rows, THK/HKT layouts, strided output, and a
+distributions, grids from 1 to 1024 rows, THK/HKT layouts, strided output, the
+multi-stage refinement corner, padding lengths up to 12032, and a
 10,000-launch soak:
 
 | Case | Time |
 |---|---:|
-| spread, nvp=1600, grid=120 | 12.38 us |
-| clustered, nvp=1600, grid=120 | 17.18 us |
-| all-equal, nvp=782, grid=120 | 17.25 us |
-| all-equal, nvp=1600, grid=120 | 17.42 us |
-| all-equal merge range, nvp=513..2048 | 17.17-17.45 us |
-| THK contiguous / strided, nvp=1600 | 17.37 / 17.40 us |
-| HKT end-to-end, nvp=1600 | 17.17 us |
-| 10,000-launch soak | 17.38 us average |
+| spread, nvp=1600, grid=120 | 10.96 us |
+| clustered, nvp=1600, grid=120 | 14.98 us |
+| all-equal, nvp=782, grid=120 | 15.08 us |
+| all-equal, nvp=1600, grid=120 | 15.19 us |
+| all-equal merge range, nvp=417..2048 | 14.84-15.27 us |
+| refined stage-2 finalCount=512 | 20.75 us |
+| THK contiguous / strided, nvp=1600 | 15.19 / 15.18 us |
+| HKT end-to-end, nvp=1600 | 15.22 us |
+| 10,000-launch soak | 15.15 us average |
 
 A concurrent four-GB200 follow-up ran 5,000 launches per GPU; all four passed
-at 17.36-17.40 us average.
+at 15.11-15.24 us average.
 
 ### Validation plan for whichever fix
 

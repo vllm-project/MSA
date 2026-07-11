@@ -695,7 +695,7 @@ constexpr uint32_t kSparseTopkMaxK = 64;
 constexpr int kIndexerNumThreadsPerBlock = 512;
 constexpr int kIndexerNumBins = 1024;  // 10-bit hist (was 2048 / 11-bit)
 constexpr int kIndexerNumFinalItems = 2048;
-constexpr int kIndexerQuadraticSelectionLimit = 512;
+constexpr int kIndexerQuadraticSelectionLimit = 416;
 
 template <uint32_t MAX_TOPK>
 __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSortKernel(
@@ -783,12 +783,16 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   // Per-row input pointer (row stride = max_k_tiles).
   const float* logits = in + static_cast<size_t>(bid) * max_k_tiles;
   const int rowStart = 0;
-  const int rowEnd = static_cast<int>(max_k_tiles);
-  const int rowLen = rowEnd - rowStart;
   const int topK = static_cast<int>(topk);
   SparseTopKWaitOnDependentGrids(use_pdl);
   const uint32_t row_num_valid_pages =
       LoadRowNumValidPages(num_valid_pages_per_token, t, num_valid_pages);
+  // Padding is always -inf and can never be a useful sparse-attention page.
+  // Restrict every histogram/refinement pass to the valid prefix instead of
+  // repeatedly scanning max_k_tiles for rows with a large padded tail.
+  const int rowEnd = static_cast<int>(
+      row_num_valid_pages < max_k_tiles ? row_num_valid_pages : max_k_tiles);
+  const int rowLen = rowEnd - rowStart;
   const uint32_t force_end_start =
       (force_end <= row_num_valid_pages) ? row_num_valid_pages - force_end : 0;
 
@@ -854,7 +858,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
           force_begin, force_end_start, row_num_valid_pages);
 
   if (continueToNextStep) {
-    // Stage 1: fp32 high 11 bits.
+    // Stage 1: fp32 high 10 bits.
     continueToNextStep =
         processHistogramStep<1, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
             logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
@@ -862,7 +866,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
             force_begin, force_end_start, row_num_valid_pages);
   }
   if (continueToNextStep) {
-    // Stage 2: fp32 mid 11 bits.
+    // Stage 2: fp32 mid 10 bits.
     continueToNextStep =
         processHistogramStep<2, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
             logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
@@ -880,10 +884,10 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
 
   if (!continueToNextStep) {
     // The threshold bin fit within kNumFinalItems.  The all-pairs rank loop is
-    // fastest for small bins; cap it at 512 candidates so its worst-case work
-    // stays bounded.  Larger bins use a two-level warp merge: each warp
-    // contributes its local top candidates, then warp 0 merges at most
-    // kNumWarps * topK keys in O(finalCount * log(finalCount)) work.
+    // fastest for small bins, but cap it below the measured crossover to avoid
+    // an overflow -> refinement -> O(n^2) cliff.  Larger bins use a two-level
+    // warp merge: each warp contributes its local top candidates, then warp 0
+    // merges at most kNumWarps * topK keys.
     const int baseIdx = smemFoundTopKValues[0];
     const int finalCount = smemFinalDstIdx[0];
     const int numFinalSelections = topK - baseIdx;
