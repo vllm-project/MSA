@@ -1899,7 +1899,7 @@ class SparseDecodeAttentionForwardSm100:
         tmem_load_atom_pre: cute.CopyAtom,
         tmem_store_atom_pre: cute.CopyAtom,
         tmem_store_vec_atom_pre: cute.CopyAtom,
-        thr_mma_qk_pre: cute.core.ThrMma,
+        thr_mma_qk_pre: cute.ThrMma,
         pipeline_s_p_o: pipeline.PipelineAsync,
         pipeline_p_lastsplit: pipeline.PipelineAsync,
         pipeline_sm_stats: pipeline.PipelineAsync,
