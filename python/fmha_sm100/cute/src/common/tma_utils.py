@@ -120,7 +120,7 @@ def prefetch_tma_desc_raw(tma_desc_ptr, *, loc=None, ip=None):
     ptr_i64_align = cute_ir.assume(ptr_i64_align_ty, ptr_i64, loc=loc, ip=ip)
     ptr_ty = cute_ir.PtrType.get(
         cute_nvgpu_ir.TmaDescriptorTiledType.get(),
-        cute_ir.AddressSpace.gmem,
+        cute_ir.AddressSpace.generic,
         128,
     )
     desc_ptr = cute_ir.inttoptr(ptr_ty, ptr_i64_align, loc=loc, ip=ip)

@@ -153,7 +153,9 @@ def make_tiled_copy_B(
 
 
 def mma_make_fragment_A(
-    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+    smem: cute.Tensor,
+    thr_mma: cute.ThrMma,
+    swapAB: cutlass.Constexpr[bool] = False,
 ) -> cute.Tensor:
     if const_expr(swapAB):
         return mma_make_fragment_B(smem, thr_mma)
@@ -162,7 +164,9 @@ def mma_make_fragment_A(
 
 
 def mma_make_fragment_B(
-    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+    smem: cute.Tensor,
+    thr_mma: cute.ThrMma,
+    swapAB: cutlass.Constexpr[bool] = False,
 ) -> cute.Tensor:
     if const_expr(swapAB):
         return mma_make_fragment_A(smem, thr_mma)
@@ -705,7 +709,14 @@ def cvt_fp4x8_e2m1_scaled_e4m3x8(
 
     from cutlass import CUDA_VERSION
 
-    if CUDA_VERSION.major > 13 or (CUDA_VERSION.major == 13 and CUDA_VERSION.minor >= 2):
+    # CUTLASS DSL 4.6.0 is built against CUDA 13.3, but enabling this path
+    # currently triggers NVVM_ERROR_COMPILATION. Keep using the original
+    # implementation for now.
+    use_native_fp4_mul = False
+    if use_native_fp4_mul and (
+        CUDA_VERSION.major > 13
+        or (CUDA_VERSION.major == 13 and CUDA_VERSION.minor >= 2)
+    ):
         out = llvm.inline_asm(
             llvm.StructType.get_literal([T.i32(), T.i32()]),
             [
