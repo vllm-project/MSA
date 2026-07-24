@@ -343,7 +343,10 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     int full_trip;
     if constexpr (kSparseAttnMode == SparseAttnMode::Sparse) {
       constexpr int full_tile_kv = get<1>(TileShape{});
-      full_trip = (params.kv_block_num * KVPageSize + full_tile_kv - 1) / full_tile_kv;
+      int valid_sparse_blocks = (kv_len + KVPageSize - 1) / KVPageSize;
+      valid_sparse_blocks = min(valid_sparse_blocks, params.kv_block_num);
+      valid_sparse_blocks = max(valid_sparse_blocks, 1);
+      full_trip = (valid_sparse_blocks * KVPageSize + full_tile_kv - 1) / full_tile_kv;
     } else {
       full_trip = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
     }

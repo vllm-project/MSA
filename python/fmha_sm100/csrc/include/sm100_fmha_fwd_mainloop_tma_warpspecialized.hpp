@@ -227,7 +227,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
                                                  int kv_block_num = 0) {
     if constexpr (kNeedSparse) {
       constexpr int tile_kv = get<1>(TileShape{});
-      return (kv_block_num * KVPageSize + tile_kv - 1) / tile_kv;
+      int kv_len = get<1>(problem_shape);
+      int valid_sparse_blocks = (kv_len + KVPageSize - 1) / KVPageSize;
+      valid_sparse_blocks = min(valid_sparse_blocks, kv_block_num);
+      valid_sparse_blocks = max(valid_sparse_blocks, 1);
+      return (valid_sparse_blocks * KVPageSize + tile_kv - 1) / tile_kv;
     } else {
       return Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
     }

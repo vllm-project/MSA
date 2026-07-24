@@ -32,8 +32,10 @@ struct FMHACutlassSM100Params {
   int q_stride_h;
   int k_stride_n;
   int k_stride_h;
+  int k_stride_t;
   int v_stride_n;
   int v_stride_h;
+  int v_stride_t;
   int batch_size;
   int total_qo_len;
   int total_kv_len;
