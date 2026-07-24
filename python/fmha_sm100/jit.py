@@ -199,6 +199,7 @@ def _get_nvcc_flags(cache_dir, fmha=True):
         "--expt-relaxed-constexpr", "--expt-extended-lambda",
         "-gencode=arch=compute_100a,code=sm_100a",
         "-gencode=arch=compute_103a,code=sm_103a",
+        "-gencode=arch=compute_100f,code=sm_100f",
         "-static-global-template-stub=false",
         "-DFLASHINFER_ENABLE_BF16",
         "-DFLASHINFER_ENABLE_FP8_E4M3",
