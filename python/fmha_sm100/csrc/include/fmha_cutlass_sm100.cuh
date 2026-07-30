@@ -111,7 +111,8 @@ struct FwdRunner {
                          float sm_scale, float q_scale, float k_scale, float v_scale,
                          float o_scale, int num_qo_heads, int num_kv_heads, int head_dim_qk,
                          int head_dim_vo, int q_stride_n, int q_stride_h, int k_stride_n,
-                         int k_stride_h, int v_stride_n, int v_stride_h, int batch_size,
+                         int k_stride_h, int k_stride_t, int v_stride_n, int v_stride_h,
+                         int v_stride_t, int batch_size,
                          int total_qo_len, int total_kv_len, int max_qo_len, int* qo_offsets,
                          cudaStream_t stream,
                          int num_kv_splits = 1,
@@ -172,8 +173,8 @@ struct FwdRunner {
       int k_stride_head = k_stride_h;
       int v_stride_page = v_stride_n;
       int v_stride_head = v_stride_h;
-      stride_K = make_stride(head_dim_qk, _1{}, k_stride_head, k_stride_page);
-      stride_V = make_stride(_1{}, head_dim_vo, v_stride_head, v_stride_page);
+      stride_K = make_stride(k_stride_t, _1{}, k_stride_head, k_stride_page);
+      stride_V = make_stride(_1{}, v_stride_t, v_stride_head, v_stride_page);
       auto shape_K = make_shape(KVPageSize, head_dim_qk, num_kv_heads, total_page_num);
       auto shape_V = make_shape(head_dim_vo, KVPageSize, num_kv_heads, total_page_num);
 
@@ -294,8 +295,8 @@ struct FwdRunner {
       gpu_trace::teardown(_gt_param, stream);
       return cudaSuccess;
     } else {
-      stride_K = make_stride(k_stride_n, _1{}, make_stride(_0{}, k_stride_h));
-      stride_V = make_stride(_1{}, v_stride_n, make_stride(_0{}, v_stride_h));
+      stride_K = make_stride(k_stride_t, _1{}, make_stride(_0{}, k_stride_h));
+      stride_V = make_stride(_1{}, v_stride_t, make_stride(_0{}, v_stride_h));
 
       auto shape_Q = make_shape(total_qo_len, head_dim_qk, make_shape(h_r, num_kv_heads));
       auto shape_O = make_shape(max_qo_len, head_dim_vo,
@@ -430,7 +431,8 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
                          double sm_scale, double q_scale, double k_scale, double v_scale,
                          double o_scale, int num_qo_heads, int num_kv_heads, int head_dim_qk,
                          int head_dim_vo, int q_stride_n, int q_stride_h, int k_stride_n,
-                         int k_stride_h, int v_stride_n, int v_stride_h, int batch_size,
+                         int k_stride_h, int k_stride_t, int v_stride_n, int v_stride_h,
+                         int v_stride_t, int batch_size,
                          int total_qo_len, int total_kv_len, int max_qo_len, int* qo_offsets,
                          cudaStream_t stream,
                          int num_kv_splits = 1,
@@ -460,7 +462,8 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
       qo_segment_offsets, kv_segment_offsets, packed_work_range,
       packed_work_info, o, mask_mode_code, sm_scale,
       q_scale, k_scale, v_scale, o_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo,
-      q_stride_n, q_stride_h, k_stride_n, k_stride_h, v_stride_n, v_stride_h, batch_size,
+      q_stride_n, q_stride_h, k_stride_n, k_stride_h, k_stride_t,
+      v_stride_n, v_stride_h, v_stride_t, batch_size,
       total_qo_len, total_kv_len, max_qo_len, qo_offsets, stream,
       num_kv_splits, kv_tile_begin_indices, kv_tile_end_indices, kv_split_indices,
       ptr_lse_accum,

@@ -421,7 +421,8 @@ def _run_case_paged(b, q_len, k_len, h_q, h_k, d, dtype, page_size=128, causal=T
 
 
 def _run_case_sparse(b, q_len, k_len, h_q, h_k, d, dtype, page_size=128,
-                     kv_block_num=8, causal=True, seed=42):
+                     kv_block_num=8, causal=True, seed=42,
+                     interleaved_kv=False):
     """Test sparse attention mode (kv_block_indexes path) with paged KV cache.
 
     Sparse mode: per (Q token, KV head) the kernel attends only to a chosen
@@ -440,7 +441,8 @@ def _run_case_sparse(b, q_len, k_len, h_q, h_k, d, dtype, page_size=128,
     device = "cuda:0"
     dtype_name = {torch.float8_e4m3fn: "fp8", torch.bfloat16: "bf16"}[dtype]
     name = (f"sparse b={b} q={q_len} k={k_len} h_q={h_q} h_k={h_k} d={d} "
-            f"ps={page_size} kbn={kv_block_num} {dtype_name}")
+            f"ps={page_size} kbn={kv_block_num} {dtype_name}"
+            f"{' interleaved_kv' if interleaved_kv else ''}")
 
     assert k_len % page_size == 0, f"k_len={k_len} must be page_size={page_size} aligned"
     pages_per_seq = k_len // page_size
@@ -465,10 +467,20 @@ def _run_case_sparse(b, q_len, k_len, h_q, h_k, d, dtype, page_size=128,
 
     # Shuffle physical placement: kernel must follow kv_indices.
     perm = torch.randperm(total_pages, device=device, dtype=torch.int64)
-    k_pages_phys = torch.empty_like(k_pages_logical)
-    v_pages_phys = torch.empty_like(v_pages_logical)
-    k_pages_phys[perm] = k_pages_logical
-    v_pages_phys[perm] = v_pages_logical
+    if interleaved_kv:
+        kv_pages_logical = torch.cat(
+            (k_pages_logical, v_pages_logical), dim=-1
+        )
+        kv_pages_phys = torch.empty_like(kv_pages_logical)
+        kv_pages_phys[perm] = kv_pages_logical
+        k_pages_phys, v_pages_phys = kv_pages_phys.split(d, dim=-1)
+        assert k_pages_phys.stride(2) == 2 * d
+        assert v_pages_phys.stride(2) == 2 * d
+    else:
+        k_pages_phys = torch.empty_like(k_pages_logical)
+        v_pages_phys = torch.empty_like(v_pages_logical)
+        k_pages_phys[perm] = k_pages_logical
+        v_pages_phys[perm] = v_pages_logical
     kv_indices = perm.to(torch.int32)
 
     # Q
@@ -1536,6 +1548,7 @@ def main():
             (32,  1, 8192, 32,  8,  16),  # large batch decode + long KV
             (1,   1, 8192, 64,  4,  32),  # extreme GQA + max kbn
             (1,   1, 1024,  4,  4,  4),   # MHA, smallest kbn
+            (32,  4,  256, 16,  1, 16),   # fewer valid pages than kbn
             # MTP / multi-token decode (q in {2,4,8})
             (1,   2, 4096, 32,  8,  8),   # MTP-2
             (1,   4, 4096, 16,  4, 16),   # MTP-4
@@ -1568,6 +1581,23 @@ def main():
                         print(f"  [EXCEPTION] {case_name}: {type(e).__name__}: {str(e)[:200]}")
                         failed_cases.append(f"{case_name}: EXCEPTION {type(e).__name__}")
                         all_pass = False
+
+        print("\n=== Sparse Attention (vLLM interleaved FP8 KV) ===")
+        try:
+            all_pass &= _run_case_sparse(
+                32, 4, 8192, 16, 1, 128, torch.float8_e4m3fn,
+                page_size=128, kv_block_num=16, interleaved_kv=True,
+            )
+        except Exception as e:
+            case_name = "sparse vLLM interleaved FP8 KV"
+            print(
+                f"  [EXCEPTION] {case_name}: "
+                f"{type(e).__name__}: {str(e)[:200]}"
+            )
+            failed_cases.append(
+                f"{case_name}: EXCEPTION {type(e).__name__}"
+            )
+            all_pass = False
 
         print("\n=== Sparse Attention (Prefill, q_len > 128, MM-SA-Nv path) ===")
         sparse_prefill_cases = [
