@@ -224,7 +224,8 @@ std::tuple<at::Tensor, at::Tensor> sparse_kvouter_attn(
     at::Tensor cu_seqlens_q,
     at::Tensor used_kv_lens,
     double softmax_scale,
-    int64_t replicas) {
+    int64_t replicas,
+    std::optional<at::Tensor> out_opt) {
   const KvouterHandle& H = get_handle(handle);
   const auto device = q.device();
   // Pin all allocations + kernel launches to q's device so we never run on the wrong
@@ -433,7 +434,16 @@ std::tuple<at::Tensor, at::Tensor> sparse_kvouter_attn(
   // =============================== combine =============================== //
   auto lp = m_partial.reshape({-1});
   auto ll = l_partial.reshape({-1});
-  auto out = at::empty({tq, hq, d}, at::TensorOptions().dtype(H.out_dtype).device(device));
+  at::Tensor out;
+  if (out_opt.has_value()) {
+    out = out_opt.value();
+    TORCH_CHECK(out.dim() == 3 && out.size(0) == tq && out.size(1) == hq && out.size(2) == d,
+                "out must be [Tq, Hq, D]");
+    TORCH_CHECK(out.scalar_type() == H.out_dtype, "out dtype must match the handle's out_dtype");
+    TORCH_CHECK(out.is_contiguous() && out.device() == device, "out must be contiguous on q's device");
+  } else {
+    out = at::empty({tq, hq, d}, at::TensorOptions().dtype(H.out_dtype).device(device));
+  }
   auto out_b = out.unsqueeze(0);
   at::Tensor lse;
   {

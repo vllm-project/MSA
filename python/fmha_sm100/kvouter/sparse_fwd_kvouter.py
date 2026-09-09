@@ -2450,6 +2450,7 @@ def sparse_kvouter_attn_fwd_indexed(
     sel_slots: Optional[torch.Tensor] = None,
     sel_offsets: Optional[torch.Tensor] = None,
     num_sel: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """KV-outer attention over a paged cache + pre-built index tensors (forward + merge).
 
@@ -2493,4 +2494,6 @@ def sparse_kvouter_attn_fwd_indexed(
         sel_offsets=sel_offsets,
         num_sel=num_sel,
     )
-    return merge_kv_partials(o_partial, m_partial, l_partial, inv, out_dtype=out_dtype, return_lse=return_lse)
+    return merge_kv_partials(
+        o_partial, m_partial, l_partial, inv, out_dtype=out_dtype, return_lse=return_lse, out=out
+    )

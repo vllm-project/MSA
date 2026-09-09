@@ -109,6 +109,7 @@ def kvouter_attention(
     page_size: int = DEFAULT_PAGE_SIZE,
     out_dtype: torch.dtype = torch.bfloat16,
     return_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """KV-outer (split-KV / KV-stationary) sparse attention — index build + forward + merge.
 
@@ -142,6 +143,8 @@ def kvouter_attention(
         page_size: Paged-cache page size, 64 or 128 (default 64).
         out_dtype: dtype of the returned ``o`` (default ``torch.bfloat16``).
         return_lse: If True, also return the log-sum-exp; otherwise the second tuple element is ``None``.
+        out: Optional preallocated output ``[Tq, Hq, D]`` of ``out_dtype`` (contiguous, on
+            ``q.device``); written in place and returned as ``o``.
 
     Returns:
         Tuple ``(o, lse)``:
@@ -191,6 +194,7 @@ def kvouter_attention(
             page_size=page_size,
             out_dtype=out_dtype,
             return_lse=return_lse,
+            out=out,
         )
     assert backend == "python", f"unknown kvouter_attention backend {backend!r}"
     num_kv_heads = k_cache.shape[1]
@@ -225,6 +229,7 @@ def kvouter_attention(
         used_kv_lens=used_kv_lens,
         out_dtype=out_dtype,
         return_lse=return_lse,
+        out=out,
         inv=inv,
         sel_slots=sel_slots,
         sel_offsets=sel_offsets,

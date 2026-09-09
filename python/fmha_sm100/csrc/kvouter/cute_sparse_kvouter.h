@@ -14,6 +14,7 @@
  */
 #pragma once
 
+#include <optional>
 #include <torch/extension.h>
 
 #include <cstdint>
@@ -98,6 +99,8 @@ int64_t sparse_kvouter_init(
 //                 in-kernel causal/padding mask. Length must equal B.
 //   softmax_scale QK softmax scale (typically 1/sqrt(D)).
 //   replicas      Adaptive index-counter replica count for this request (a power of
+//   out_opt       Optional preallocated [Tq, Hq, D] output (out_dtype, contiguous, on
+//                 q's device); written in place and returned as `o`.
 //                 two in [16, 128]); selects the matching pre-registered
 //                 init:r<R>/count:r<R>/reduce:r<R>/scatter:r<R> kernels and sizes the
 //                 3D count buffer [Hkv, num_block_slots, R]. Computed by the Python
@@ -116,6 +119,7 @@ std::tuple<at::Tensor, at::Tensor> sparse_kvouter_attn(
     at::Tensor cu_seqlens_q,
     at::Tensor used_kv_lens,
     double softmax_scale,
-    int64_t replicas);
+    int64_t replicas,
+    std::optional<at::Tensor> out_opt);
 
 }  // namespace fmha_sm100

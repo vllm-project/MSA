@@ -919,6 +919,7 @@ def merge_kv_partials(
     inv: Optional[torch.Tensor] = None,  # [Hkv, Tq, topK] int32 (q, rank) -> pair pos (flat mode)
     out_dtype: torch.dtype = torch.bfloat16,
     return_lse: bool = True,
+    out: Optional[torch.Tensor] = None,  # preallocated [Tq, Hq, D] out_dtype (written in place)
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Merge the ``topK`` per-(q, rank) partials into the final output.
 
@@ -976,7 +977,13 @@ def merge_kv_partials(
         op = o_partial.permute(2, 1, 0, 3).unsqueeze(1)  # (topK, 1, Tq, Hq, D), D contiguous
         lp = lse_partial.permute(2, 1, 0).unsqueeze(1)  # (topK, 1, Tq, Hq), topK stride-1 after transpose
         ll = l_partial.permute(2, 1, 0).unsqueeze(1) if l_partial is not None else None
-    out = torch.empty(tq, hq, d, dtype=out_dtype, device=device)  # (Tq, Hq, D)
+    if out is None:
+        out = torch.empty(tq, hq, d, dtype=out_dtype, device=device)  # (Tq, Hq, D)
+    else:
+        assert out.shape == (tq, hq, d), f"out shape {tuple(out.shape)} != {(tq, hq, d)}"
+        assert out.dtype == out_dtype and out.device == device and out.is_contiguous(), (
+            "out must be a contiguous [Tq, Hq, D] tensor of out_dtype on q.device"
+        )
     out_batched = out.unsqueeze(0)
     # LSE is allocated head-major (batch, Hq, Tq) with Tq contiguous; combined with the kernel's
     # LSE_layout_transpose this makes the kernel write the final LSE as [Hq, Tq] directly (no host

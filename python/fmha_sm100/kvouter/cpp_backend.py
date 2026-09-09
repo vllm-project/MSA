@@ -17,6 +17,7 @@ import ctypes
 import importlib
 import math
 import threading
+from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
@@ -52,6 +53,50 @@ _HANDLE_LOCK = threading.Lock()
 _EXTENSION_LOAD_ERROR: Optional[BaseException] = None
 
 
+def _jit_build_extension() -> None:
+    """Build the C++ op with torch.utils.cpp_extension when ``fmha_sm100._C`` is
+    absent. vLLM installs fmha_sm100 as plain files (no setup.py build), so the
+    op is compiled once per host and cached under ~/.cache/torch_extensions."""
+    import nvidia_cutlass_dsl
+    from torch.utils.cpp_extension import CUDA_HOME, load
+
+    csrc = Path(__file__).resolve().parent.parent / "csrc" / "kvouter"
+    cute_base = next(
+        Path(p)
+        for p in nvidia_cutlass_dsl.__path__
+        if (Path(p) / "include" / "CuteDSLRuntime.h").is_file()
+        and (Path(p) / "lib" / "libcute_dsl_runtime.so").is_file()
+    )
+    if CUDA_HOME is None:
+        raise RuntimeError("CUDA_HOME/nvcc not found; a CUDA 13 toolkit is required")
+    cuda_home = Path(CUDA_HOME)
+    stub_dirs = [
+        d
+        for d in (
+            cuda_home / "lib64" / "stubs",
+            cuda_home / "lib" / "stubs",
+            *sorted((cuda_home / "targets").glob("*/lib/stubs")),
+        )
+        if (d / "libcuda.so").is_file()
+    ]
+    lib = cute_base / "lib"
+    load(
+        name="fmha_sm100_kvouter_C",
+        sources=[str(csrc / "bindings.cpp"), str(csrc / "cute_sparse_kvouter.cpp")],
+        extra_include_paths=[str(csrc), str(cute_base / "include")],
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_ldflags=[
+            f"-L{lib}",
+            f"-Wl,-rpath,{lib}",
+            "-lcute_dsl_runtime",
+            *(f"-L{d}" for d in stub_dirs),
+            "-lcuda",
+        ],
+        with_cuda=True,
+        verbose=False,
+    )
+
+
 def _ensure_extension_loaded() -> bool:
     """Load the CuTe runtime globally, then register the package operators."""
     global _EXTENSION_LOAD_ERROR
@@ -63,7 +108,10 @@ def _ensure_extension_loaded() -> bool:
 
         for path in cute.runtime.find_runtime_libraries(enable_tvm_ffi=False):
             ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
-        importlib.import_module("fmha_sm100._C")
+        try:
+            importlib.import_module("fmha_sm100._C")
+        except ImportError:
+            _jit_build_extension()
     except Exception as exc:
         _EXTENSION_LOAD_ERROR = exc
         return False
@@ -193,6 +241,7 @@ def kvouter_attention_cpp(
     return_lse: bool = False,
     partial_dtype: Optional[torch.dtype] = None,
     store_in_corr: bool = True,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """C++-backed equivalent of :func:`...interface.kvouter_attention`.
 
@@ -260,6 +309,7 @@ def kvouter_attention_cpp(
         used_kv_lens,
         float(softmax_scale),
         int(replicas),
+        out,
     )
     if not return_lse:
         return o, None
