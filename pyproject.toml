@@ -20,6 +20,7 @@ dependencies = [
     "cuda-python",
     "nvidia-cutlass-dsl>=4.6.0",
     "quack-kernels>=0.6.1",
+    "flash-attn-4==4.0.0b15",
 ]
 
 [project.urls]

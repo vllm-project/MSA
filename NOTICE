@@ -87,6 +87,23 @@ Where:      Apache-2.0-tagged sources under python/fmha_sm100/csrc/
 Full text:  https://www.apache.org/licenses/LICENSE-2.0
 
 --------------------------------------------------------------------------------
+Fireworks AI (minimax-kernels KV-outer) — Apache License 2.0
+--------------------------------------------------------------------------------
+
+Copyright (c) 2026 Fireworks AI
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Project:    https://github.com/fw-ai/minimax-kernels
+Where:      python/fmha_sm100/kvouter/ and python/fmha_sm100/csrc/kvouter/
+            (KV-outer sparse attention backend used by sparse_fmha_adapter.py).
+Full text:  https://www.apache.org/licenses/LICENSE-2.0
+
+--------------------------------------------------------------------------------
 NVIDIA TensorRT-LLM — Apache License 2.0
 --------------------------------------------------------------------------------
 

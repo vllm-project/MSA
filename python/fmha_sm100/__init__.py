@@ -27,6 +27,8 @@ _SPARSE_LAZY_EXPORTS = frozenset(
         "fp4_indexer_block_scores",
         "build_k2q_csr",
         "SparseK2qCsrBuilderSm100",
+        "kvouter_attention",
+        "can_run_sparse_kvouter",
     }
 )
 
