@@ -34,26 +34,33 @@ __all__ = [
 ]
 
 
+_FA4_DEPS_ERROR: Optional[BaseException] = None
+
+
 def _check_fa4_deps() -> bool:
     """Return whether the CuTe-DSL dependencies used by these kernels resolve."""
+    global _FA4_DEPS_ERROR
     try:
         # lazy: CuTe-DSL imports initialize compiler/runtime state.
         import cutlass.cute  # noqa: F401
         import flash_attn.cute.flash_fwd_sm100  # noqa: F401
         from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned  # noqa: F401
-    except Exception:
+    except Exception as exc:
+        _FA4_DEPS_ERROR = exc
         return False
     return True
 
 
 def _require_fa4_deps() -> None:
-    """Raise a focused error when the required public CuTe packages are absent."""
+    """Raise a focused error when the required public CuTe packages are absent
+    or incompatible (the underlying import error is chained)."""
     if not _check_fa4_deps():
         raise ImportError(
-            "MiniMax M3 sparse attention requires nvidia-cutlass-dsl, "
-            "quack-kernels, and the FlashAttention-4 CuTe package. "
-            "Install this project's declared CUDA 13 dependencies."
-        )
+            "MiniMax M3 KV-outer sparse attention requires nvidia-cutlass-dsl, "
+            "quack-kernels and the FlashAttention-4 CuTe package "
+            "(flash-attn-4==4.0.0b15, which imports only with nvidia-cutlass-dsl "
+            f"4.5.x). Underlying error: {_FA4_DEPS_ERROR!r}"
+        ) from _FA4_DEPS_ERROR
 
 
 def can_run_sparse_kvouter(dtype: Optional[torch.dtype] = None) -> bool:

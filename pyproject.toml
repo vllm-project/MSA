@@ -20,8 +20,16 @@ dependencies = [
     "cuda-python",
     "nvidia-cutlass-dsl>=4.6.0",
     "quack-kernels>=0.6.1",
-    "flash-attn-4==4.0.0b15",
 ]
+
+[project.optional-dependencies]
+# KV-outer sparse prefill (fmha_sm100.kvouter) is written against the
+# FlashAttention-4 CuTe internals of 4.0.0b15, which import only with
+# nvidia-cutlass-dsl 4.5.x (4.6 removed cute.core.ThrMma). Until kvouter is
+# ported to flash-attn-4 4.0.0b30, use it on the 4.5.x stack
+# (nvidia-cutlass-dsl 4.5.x, quack-kernels 0.4.x); the legacy CuTe kernels run
+# on both stacks.
+kvouter = ["flash-attn-4==4.0.0b15"]
 
 [project.urls]
 
