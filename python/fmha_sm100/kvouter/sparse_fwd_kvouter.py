@@ -393,7 +393,7 @@ class SparseKVOuterForward(FlashAttentionForwardSm100):
         qhead = const_expr(self.qhead_per_kvhead)
         nbox_m = const_expr(self.m_block_size // qhead)
         hq = Int32(idx_ranks.shape[0]) * qhead
-        src_rgs = cute.make_fragment(nbox_m, Int32)
+        src_rgs = cute.make_rmem_tensor(nbox_m, Int32)
         lane0 = cute.arch.lane_idx() == 0
         for mb in cutlass.range_constexpr(nbox_m):
             src_rg = oob_rg
@@ -439,7 +439,7 @@ class SparseKVOuterForward(FlashAttentionForwardSm100):
                 sPairs_slot[tidx, 0] = Int32(0x3FFFFFFF)
                 sPairs_slot[tidx, 1] = Int32(0)
         num_ptr = cute.ceil_div(cute.size(tQcQ_row), threads_per_row)
-        tPrPtr = cute.make_fragment(num_ptr, Int64)
+        tPrPtr = cute.make_rmem_tensor(num_ptr, Int64)
         for i in cutlass.range_constexpr(num_ptr):
             row = i * num_threads + tQcQ_row[tidx % threads_per_row][0]
             head = Int32(0)
@@ -512,7 +512,7 @@ class SparseKVOuterForward(FlashAttentionForwardSm100):
         num_threads = gmem_tiled_copy.size
         qhead = const_expr(self.qhead_per_kvhead)
         num_ptr = cute.ceil_div(cute.size(tQcQ_row), threads_per_row)
-        tQidx = cute.make_fragment(num_ptr, Int32)
+        tQidx = cute.make_rmem_tensor(num_ptr, Int32)
         for i in cutlass.range_constexpr(num_ptr):
             row = i * num_threads + tQcQ_row[tidx % threads_per_row][0]
             qidx = Int32(0)
@@ -536,7 +536,7 @@ class SparseKVOuterForward(FlashAttentionForwardSm100):
         num_threads = gmem_tiled_copy.size
         qhead = const_expr(self.qhead_per_kvhead)
         num_ptr = cute.ceil_div(cute.size(tQcQ_row), threads_per_row)
-        tPrPtr = cute.make_fragment(num_ptr, Int64)
+        tPrPtr = cute.make_rmem_tensor(num_ptr, Int64)
         for i in cutlass.range_constexpr(num_ptr):
             row = i * num_threads + tQcQ_row[tidx % threads_per_row][0]
             head = Int32(0)
@@ -1090,11 +1090,11 @@ class SparseKVOuterForward(FlashAttentionForwardSm100):
         cta_qk_tiler = (self.mma_tiler_qk[0] // thr_mma_qk.thr_id.shape, self.mma_tiler_qk[1])
         tScP_shape = (cta_qk_tiler[0], tilePlikeFP32)
         pipeline_s_p.consumer_wait_w_index_phase(stage, mma_si_consumer_phase)
-        tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
+        tSrS_t2r = cute.make_rmem_tensor(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
-        tSrP_r2t_f32 = cute.make_fragment(
+        tSrP_r2t_f32 = cute.make_rmem_tensor(
             thr_tmem_store.partition_S(cute.make_identity_tensor(tScP_shape)).shape, Float32
         )
         tSrP_r2t = cute.make_tensor(cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout)
@@ -1264,7 +1264,7 @@ class SparseKVOuterForward(FlashAttentionForwardSm100):
     @cute.jit
     def correction_epilogue(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         tidx: Int32,
         stage,
@@ -1311,7 +1311,7 @@ class SparseKVOuterForward(FlashAttentionForwardSm100):
         for i in cutlass.range(self.head_dim_v_padded // corr_tile_size, unroll_full=True):
             tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
             tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
-            tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
+            tOrO_frg = cute.make_rmem_tensor(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
             cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
             for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
                 tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
