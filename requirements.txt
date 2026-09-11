@@ -12,3 +12,5 @@ cuda-python
 # CuTe-DSL sparse attention backend
 nvidia-cutlass-dsl>=4.6.0
 quack-kernels>=0.6.1
+# KV-outer prefill (fmha_sm100.kvouter): pip install "fmha_sm100[kvouter]"
+# (flash-attn-4==4.0.0b15; needs the nvidia-cutlass-dsl 4.5.x stack today).

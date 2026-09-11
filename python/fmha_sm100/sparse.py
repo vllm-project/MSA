@@ -86,6 +86,9 @@ from quantize import (  # noqa: E402
     swizzle_nvfp4_scale_to_128x4,
 )
 
+# Fireworks KV-outer (KV-stationary) block-sparse prefill (fmha_sm100/kvouter/).
+from .kvouter import can_run_sparse_kvouter, kvouter_attention  # noqa: E402
+
 __all__ = [
     # attention
     "sparse_atten_func",
@@ -96,6 +99,9 @@ __all__ = [
     "fp4_indexer_block_scores",
     "build_k2q_csr",
     "SparseK2qCsrBuilderSm100",
+    # kv-outer prefill
+    "kvouter_attention",
+    "can_run_sparse_kvouter",
     # nvfp4 quantization helpers
     "Nvfp4QuantizedTensor",
     "quantize_bf16_to_nvfp4_128x4",
