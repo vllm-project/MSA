@@ -196,12 +196,6 @@ template <class Traits> struct SharedStorage {
 
   CUTLASS_DEVICE int32_t *merge_flag_ptr() { return merge_flag; }
 
-  static constexpr int kMainloopSmemBytes =
-      sizeof(SmemQ) + sizeof(SmemKv) + sizeof(SmemP) + sizeof(SmemPageOffsetsKv) + sizeof(SmemO) +
-      sizeof(SmemMergeStage) + 3 * sizeof(SmemWarpGroupReduction) + sizeof(SchedulerStorage) +
-      Traits::kTmemSwStateBytes + sizeof(merge_flag) + Traits::kBarrierStorageBytes +
-      sizeof(SmemSelection);
-  static constexpr int kActiveSmemBytes = kMainloopSmemBytes;
 
   static_assert(sizeof(SmemQ) == Traits::kNumStagesQ * Traits::kSmemQBytesPerStage,
                 "SmemQ must match the q8kv4 FMHA forward layout.");
@@ -222,5 +216,9 @@ template <class Traits> struct SharedStorage {
   static_assert(sizeof(PipelineStorage) == Traits::kBarrierStorageBytes,
                 "barrier storage must match the q8kv4 FMHA forward layout.");
 };
+
+// Dynamic shared memory of a launch: the whole struct. The 1 KB and 128 B alignment of the
+// tiles pads the layout, so the sum of the member sizes falls short of where the barriers end.
+template <class Traits> inline constexpr int kSharedStorageBytes = sizeof(SharedStorage<Traits>);
 
 } // namespace cutlass::fmha::collective

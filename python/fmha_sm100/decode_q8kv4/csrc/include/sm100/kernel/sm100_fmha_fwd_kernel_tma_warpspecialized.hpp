@@ -42,7 +42,7 @@ template <class Traits> struct Sm100FmhaFwdQ8Kv4KernelTmaWarpspecialized {
 
   static constexpr int MaxThreadsPerBlock = Traits::kNumThreads;
   static constexpr int MinBlocksPerMultiprocessor = 1;
-  static constexpr int SharedStorageSize = Storage::kActiveSmemBytes;
+  static constexpr int SharedStorageSize = kSharedStorageBytes<Traits>;
 
   struct ActiveCtaCapacity {
     int device_id = -1;
@@ -83,7 +83,7 @@ template <class Traits> struct Sm100FmhaFwdQ8Kv4KernelTmaWarpspecialized {
 
   static dim3 get_block_shape() { return dim3(Traits::kNumThreads, 1, 1); }
 
-  static int get_smem_size() { return Storage::kActiveSmemBytes; }
+  static int get_smem_size() { return SharedStorageSize; }
 
   // Layouts above the opt-in limit need the oversized shared-memory configuration (Rubin:
   // up to 327 KB per block, L1 reduced to 8 KB), selected through the shared-memory-mode
