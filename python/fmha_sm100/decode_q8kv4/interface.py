@@ -395,7 +395,7 @@ def plan_decode(
     device = torch.device("cuda", _device_index(device))
     from . import jit
 
-    jit._validate_gqa_arch(num_q_heads // num_kv_heads, device)
+    jit._target_arch(device)
     backend_plan = _prepare_decode_plan(
         batch_size,
         q_len_per_req,

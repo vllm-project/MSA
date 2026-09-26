@@ -209,9 +209,23 @@ def _probe_qmul4(nvcc: Path, arch: str, probe_dir: Path) -> bool:
     return supported
 
 
+# Set to 1 to skip the QMUL4 instruction path and compile the FP16 dequant fallback even when the
+# toolchain supports QMUL4: the path a CUDA toolkit older than 13.4 would take.
+DISABLE_QMUL4_ENV = "FMHA_SM100_DECODE_Q8KV4_DISABLE_QMUL4"
+
+
+def _qmul4_disabled() -> bool:
+    value = os.environ.get(DISABLE_QMUL4_ENV, "").strip().lower() or "0"
+    if value not in ("0", "1", "false", "true"):
+        raise ValueError(f"{DISABLE_QMUL4_ENV} must be 0 or 1, got {value!r}")
+    return value in ("1", "true")
+
+
 @cache
 def _dequant_mode(arch: str) -> str:
-    return _QMUL4_DEQUANT if _supports_qmul4(arch) else _FP16_DEQUANT
+    if _qmul4_disabled() or not _supports_qmul4(arch):
+        return _FP16_DEQUANT
+    return _QMUL4_DEQUANT
 
 
 def _cache_dir(component: str, arch: str, dequant_mode: str) -> Path:
@@ -384,13 +398,6 @@ class JitSpec:
         return tvm_ffi.load_module(str(so_path))
 
 
-def _validate_gqa_arch(gqa_ratio: int, device=None) -> str:
-    arch = _target_arch(device)
-    if gqa_ratio == 8 and arch not in ("100a", "103a"):
-        raise RuntimeError("Q8KV4 decode attention with GQA=8 requires SM100 or SM103")
-    return arch
-
-
 def gen_jit_spec(
     *,
     topk: int = 16,
@@ -407,7 +414,7 @@ def gen_jit_spec(
         raise ValueError(
             f"block_scale_shift must be in [0, {MAX_BLOCK_SCALE_SHIFT}], got {block_scale_shift}"
         )
-    arch = _validate_gqa_arch(gqa_ratio, device)
+    arch = _target_arch(device)
     return JitSpec(
         _SPARSE_VARIANTS[bool(split_kv)],
         bool(split_kv),
@@ -543,6 +550,7 @@ def _clear_loaded_extensions() -> None:
 
 
 __all__ = [
+    "DISABLE_QMUL4_ENV",
     "MAX_BLOCK_SCALE_SHIFT",
     "MAX_TOPK",
     "JitSpec",
