@@ -14,6 +14,7 @@
 #include "sm100_fmha_fp4_transform.cuh"
 #include "sm100_fmha_pipeline.hpp"
 #include "sm100_fmha_q8kv4_traits.hpp"
+#include "sm100_fmha_selection_ring.hpp"
 #include "sm100_fmha_storage.hpp"
 
 // The softmax warps rescale the O accumulator themselves with the per-head factor they already
@@ -39,6 +40,7 @@ template <class Traits> struct Sm100FmhaSoftmaxTmaWarpspecialized {
     int s_event = 0;
     int local_event = 0;
     int o_event = 0;
+    int selection_event = 0;
     bool grid_dependency_synchronized = false;
   };
 
@@ -96,17 +98,6 @@ template <class Traits> struct Sm100FmhaSoftmaxTmaWarpspecialized {
 
   CUTLASS_DEVICE static uint64_t *p_empty_barrier(Storage &storage, int stage) {
     return storage.pipelines.ptr(Barriers::kPEmptyArv1 + stage);
-  }
-
-  CUTLASS_DEVICE static int kv_length_for_batch(Params const &params, int batch_idx,
-                                                int kv_head_idx, int q_token_idx) {
-    return fmha_fwd_kv_length_for_batch<Traits>(params, batch_idx, kv_head_idx, q_token_idx);
-  }
-
-  CUTLASS_DEVICE static int kv_tile_count(Params const &params, int batch_idx, int kv_head_idx,
-                                          int q_token_idx) {
-    int const kv_len = kv_length_for_batch(params, batch_idx, kv_head_idx, q_token_idx);
-    return (kv_len + Traits::kTileKv - 1) / Traits::kTileKv;
   }
 
   CUTLASS_DEVICE static uint32_t full_phase(int event, int stages) {
@@ -454,7 +445,7 @@ template <class Traits> struct Sm100FmhaSoftmaxTmaWarpspecialized {
   template <bool ApplyTailMask>
   CUTLASS_DEVICE void process_tile(Storage &storage, uint32_t tmem_base, int tile, int s_stage,
                                    uint32_t s_full_phase, bool rescale_o, uint32_t o_full_phase,
-                                   int kv_len, int warp_group_lane, float scale_softmax_log2,
+                                   int tail_bound, int warp_group_lane, float scale_softmax_log2,
                                    ColumnFragment &old_max, ColumnFragment &new_max,
                                    ColumnFragment &sum) const {
     Sm100FmhaBarrier::wait(s_full_barrier(storage, s_stage), s_full_phase,
@@ -468,7 +459,7 @@ template <class Traits> struct Sm100FmhaSoftmaxTmaWarpspecialized {
     ScoreFragment qk;
     load_s_regs(qk, tmem_base, s_stage);
     if constexpr (ApplyTailMask) {
-      apply_dense_tail_mask(qk, tile, kv_len, warp_group_lane);
+      apply_dense_tail_mask(qk, tile, tail_bound, warp_group_lane);
     }
     local_col_max(new_max, qk);
     reduce_col_max(storage, new_max, warp_group_lane);
@@ -498,10 +489,10 @@ template <class Traits> struct Sm100FmhaSoftmaxTmaWarpspecialized {
                                int kv_head_idx, int q_token_idx, int lane_idx,
                                int warp_group_warp_idx, State &state, int kv_tile_begin = 0,
                                int kv_tile_end = INT_MAX) const {
-    int const kv_len = kv_length_for_batch(params, batch_idx, kv_head_idx, q_token_idx);
-    int const full_tiles = (kv_len + Traits::kTileKv - 1) / Traits::kTileKv;
+    using Ring = Sm100FmhaSelectionRing<Traits>;
+    uint32_t const record = Ring::consume(storage, lane_idx, state.selection_event);
     Sm100FmhaKvTileRange const tile_range =
-        make_kv_tile_range(full_tiles, kv_tile_begin, kv_tile_end);
+        make_kv_tile_range(Ring::selected_pages(record), kv_tile_begin, kv_tile_end);
     int const tiles = tile_range.count;
     if (tiles <= 0) {
       return;
@@ -527,19 +518,22 @@ template <class Traits> struct Sm100FmhaSoftmaxTmaWarpspecialized {
     }
     float const scale_softmax_log2 = params.scale_softmax_log2;
 
+    // At most one tile holds the query's own page and carries a causal tail (the producer
+    // resolved which); every other tile is fully visible.
+    int const tail_tile = Ring::tail_tile(record);
+    int const tail_bound = tail_tile * Traits::kTileKv + Ring::tail_limit(record);
     auto advance_stage = [&](int local_tile, int global_tile, auto apply_tail_mask) {
       int const s_event = state.s_event + local_tile;
       process_tile<decltype(apply_tail_mask)::value>(
           storage, tmem_base, global_tile, s_event & 1, full_phase(s_event, 2), local_tile > 0,
-          full_phase(state.o_event + local_tile - 1, 1), kv_len, warp_group_lane,
+          full_phase(state.o_event + local_tile - 1, 1), tail_bound, warp_group_lane,
           scale_softmax_log2, old_max, new_max, sum);
     };
 
-    int const tail_tokens = kv_len % Traits::kTileKv;
     CUTLASS_PRAGMA_NO_UNROLL
     for (int tile = 0; tile < tiles; ++tile) {
       int const global_tile = tile_range.begin + tile;
-      if (tail_tokens != 0 && global_tile == full_tiles - 1) {
+      if (global_tile == tail_tile) {
         advance_stage(tile, global_tile, cute::true_type{});
       } else {
         advance_stage(tile, global_tile, cute::false_type{});

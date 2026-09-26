@@ -15,6 +15,7 @@
 #include "fmha_common.hpp"
 #include "sm100_fmha_pipeline.hpp"
 #include "sm100_fmha_q8kv4_traits.hpp"
+#include "sm100_fmha_selection_ring.hpp"
 #include "sm100_fmha_storage.hpp"
 #include "sm100_mma_n8.hpp"
 
@@ -31,6 +32,7 @@ template <class Traits> struct Sm100FmhaMmaTmaWarpspecialized {
     int transformed_event = 0;
     int s_event = 0;
     int s_acquire_event = 0;
+    int selection_event = 0;
     uint32_t o_empty_phase = 1;
   };
 
@@ -113,16 +115,6 @@ template <class Traits> struct Sm100FmhaMmaTmaWarpspecialized {
 
   CUTLASS_DEVICE static uint64_t *o_empty_barrier(Storage &storage) {
     return storage.pipelines.ptr(Barriers::kOEmptyArv128);
-  }
-
-  CUTLASS_DEVICE static int kv_length_for_batch(Params const &params, int batch_idx,
-                                                int kv_head_idx, int q_token_idx) {
-    return fmha_fwd_kv_length_for_batch<Traits>(params, batch_idx, kv_head_idx, q_token_idx);
-  }
-
-  CUTLASS_DEVICE static int kv_tile_count(Params const &params, int batch_idx, int kv_head_idx,
-                                          int q_token_idx) {
-    return fmha_fwd_kv_tile_count_for_batch<Traits>(params, batch_idx, kv_head_idx, q_token_idx);
   }
 
   CUTLASS_DEVICE static uint32_t full_phase(int event, int stages) {
@@ -269,7 +261,9 @@ template <class Traits> struct Sm100FmhaMmaTmaWarpspecialized {
   CUTLASS_DEVICE void run_tile(Storage &storage, Params const &params, int batch_idx,
                                int kv_head_idx, int q_token_idx, int lane_idx, State &state,
                                int kv_tile_begin = 0, int kv_tile_end = INT_MAX) const {
-    int const full_tiles = kv_tile_count(params, batch_idx, kv_head_idx, q_token_idx);
+    int const full_tiles =
+        Sm100FmhaSelectionRing<Traits>::selected_pages(
+            Sm100FmhaSelectionRing<Traits>::consume(storage, lane_idx, state.selection_event));
     Sm100FmhaKvTileRange const tile_range =
         make_kv_tile_range(full_tiles, kv_tile_begin, kv_tile_end);
     int const tiles = tile_range.count;

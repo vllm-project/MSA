@@ -18,6 +18,7 @@
 #include "sm100_fmha_kv_transform_tma_warpspecialized.hpp"
 #include "sm100_fmha_pipeline.hpp"
 #include "sm100_fmha_q8kv4_traits.hpp"
+#include "sm100_fmha_selection_ring.hpp"
 #include "sm100_fmha_storage.hpp"
 
 namespace cutlass::fmha::collective {
@@ -39,6 +40,7 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
   struct State {
     int softmax_event = 0;
     int o_event = 0;
+    int selection_event = 0;
     uint32_t merge_stage_phase = 0;
     bool grid_dependency_synchronized = false;
     typename KvTransform::VState sparse_v_state;
@@ -102,16 +104,6 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
 
   CUTLASS_DEVICE static bool use_workspace_split(Params const &params) {
     return params.num_kv_splits > 1 && params.workspace_o_ptr != nullptr;
-  }
-
-  CUTLASS_DEVICE static int kv_length_for_batch(Params const &params, int batch_idx,
-                                                int kv_head_idx, int q_token_idx) {
-    return fmha_fwd_kv_length_for_batch<Traits>(params, batch_idx, kv_head_idx, q_token_idx);
-  }
-
-  CUTLASS_DEVICE static int kv_tile_count(Params const &params, int batch_idx, int kv_head_idx,
-                                          int q_token_idx) {
-    return fmha_fwd_kv_tile_count_for_batch<Traits>(params, batch_idx, kv_head_idx, q_token_idx);
   }
 
   CUTLASS_DEVICE static uint32_t full_phase(int event, int stages) {
@@ -778,7 +770,9 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
                                int warp_group_warp_idx, State &state, int kv_tile_begin = 0,
                                int kv_tile_end = INT_MAX, int kv_split_idx = 0,
                                int kv_split_count = 0) const {
-    int const full_tiles = kv_tile_count(params, batch_idx, kv_head_idx, q_token_idx);
+    int const full_tiles =
+        Sm100FmhaSelectionRing<Traits>::selected_pages(
+            Sm100FmhaSelectionRing<Traits>::consume(storage, lane_idx, state.selection_event));
     Sm100FmhaKvTileRange const tile_range =
         make_kv_tile_range(full_tiles, kv_tile_begin, kv_tile_end);
     int const tiles = tile_range.count;

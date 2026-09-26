@@ -16,6 +16,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 from ._build_utils import cuda_home
+from .jit import MAX_TOPK as _MAX_TOPK
 
 __all__ = ["BatchDecodeWithPagedKVCacheWrapper"]
 
@@ -24,7 +25,6 @@ _HEAD_DIM = 128
 _DEFAULT_NUM_Q_HEADS = 64
 _DEFAULT_NUM_KV_HEADS = 4
 _PAGE_SIZE = 128
-_TOPK = 16
 _DATA_ALIGNMENT = 16
 
 
@@ -75,6 +75,7 @@ def _select_num_kv_splits(
     q_len_per_req: int,
     sm_count: int,
     num_kv_heads: int,
+    topk: int,
 ) -> int:
     """Choose split-KV from host-known CTA parallelism and fixed TopK work."""
     logical_ctas = batch_size * q_len_per_req * num_kv_heads
@@ -86,7 +87,7 @@ def _select_num_kv_splits(
         return 1
     selected = 1
     for num_splits in (2, 4, 8):
-        pages_per_split = (_TOPK + num_splits - 1) // num_splits
+        pages_per_split = (topk + num_splits - 1) // num_splits
         if pages_per_split < 2 or logical_ctas * num_splits > sm_count:
             break
         selected = num_splits
@@ -150,6 +151,7 @@ def _make_backend_plan(
     num_kv_splits: int,
     usable_sm_count: int,
     device: int,
+    topk: int,
     split_mode: str = "streamk",
 ):
     """Create the opaque C++ plan for the only supported decode domain."""
@@ -157,7 +159,7 @@ def _make_backend_plan(
     qo_segment_lens = torch.full(
         (batch_size,), q_len_per_req, dtype=torch.int32, device="cpu"
     )
-    kv_segment_lens = torch.full_like(qo_segment_lens, _TOPK * _PAGE_SIZE)
+    kv_segment_lens = torch.full_like(qo_segment_lens, topk * _PAGE_SIZE)
     return _get_cpp().plan_decode(
         qo_segment_lens,
         kv_segment_lens,
@@ -165,7 +167,7 @@ def _make_backend_plan(
         num_kv_heads,
         num_kv_splits,
         _PAGE_SIZE,
-        _TOPK,
+        topk,
         usable_sm_count,
         device,
         split_mode,
@@ -179,6 +181,7 @@ def _prepare_decode_plan(
     device,
     num_q_heads: int,
     num_kv_heads: int,
+    topk: int,
     num_kv_splits: int | None = None,
     usable_sm_count: int | None = None,
 ):
@@ -195,7 +198,7 @@ def _prepare_decode_plan(
         else min(int(usable_sm_count), physical_sm_count)
     )
     selected_splits = (
-        _select_num_kv_splits(batch_size, q_len_per_req, sm_count, num_kv_heads)
+        _select_num_kv_splits(batch_size, q_len_per_req, sm_count, num_kv_heads, topk)
         if num_kv_splits is None
         else int(num_kv_splits)
     )
@@ -210,6 +213,7 @@ def _prepare_decode_plan(
         num_kv_splits=selected_splits,
         usable_sm_count=sm_count,
         device=device_idx,
+        topk=topk,
         split_mode=(
             _split_mode(
                 num_q_heads // num_kv_heads,
@@ -327,11 +331,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             raise ValueError("page_table must contain at least one page slot")
         if seq_lens.shape != (batch_size,):
             raise ValueError("seq_lens must have shape [batch]")
-        expected_topk_shape = (
-            batch_size * q_len_per_req,
-            num_kv_heads,
-            _TOPK,
-        )
+        if topk_indices.ndim != 3 or not 1 <= topk_indices.shape[2] <= _MAX_TOPK:
+            raise ValueError(
+                f"topk_indices must have shape [batch * q_len_per_req, num_kv_heads, topk] "
+                f"with 1 <= topk <= {_MAX_TOPK}"
+            )
+        topk = int(topk_indices.shape[2])
+        expected_topk_shape = (batch_size * q_len_per_req, num_kv_heads, topk)
         if tuple(topk_indices.shape) != expected_topk_shape:
             raise ValueError(f"topk_indices must have shape {expected_topk_shape}")
 
@@ -347,6 +353,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             device=page_table.device,
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
+            topk=topk,
             num_kv_splits=num_kv_splits,
             usable_sm_count=usable_sm_count,
         )

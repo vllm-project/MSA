@@ -391,8 +391,8 @@ PlanInfo _make_decode_plan_impl(at::Tensor qo_segment_lens, at::Tensor kv_segmen
 
   TORCH_CHECK(max_qo_len_orig > 0,
               "decode attention requires positive query lengths; got max_qo_len=", max_qo_len_orig);
-  TORCH_CHECK(page_size == 128 && kv_block_num == 16,
-              "Q8KV4 sparse decode requires page_size=128 and TopK=16");
+  TORCH_CHECK(page_size == 128 && kv_block_num >= 1 && kv_block_num <= kMaxSparseTopK,
+              "Q8KV4 sparse decode requires page_size=128 and 1 <= TopK <= ", kMaxSparseTopK);
   TORCH_CHECK(num_kv_heads > 0 && num_qo_heads % num_kv_heads == 0 &&
                   (num_qo_heads / num_kv_heads == 8 || num_qo_heads / num_kv_heads == 16),
               "Q8KV4 sparse decode requires 8 or 16 Q heads per KV head");
@@ -657,7 +657,8 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
       head_dim_qk == 128 && head_dim_vo == 128 && (pack_factor == 8 || pack_factor == 16) &&
       fmha_fwd_q_tokens > 0 && num_kv_heads > 0 &&
       orig_num_qo_heads == num_kv_heads * pack_factor && fmha_fwd_scale_layout_ok &&
-      fmha_fwd_runtime_topk == 16 && plan.kv_block_num == 16;
+      fmha_fwd_runtime_topk == plan.kv_block_num && fmha_fwd_runtime_topk >= 1 &&
+      fmha_fwd_runtime_topk <= kMaxSparseTopK;
 
   int fmha_fwd_run_kv_splits = use_split_kv ? plan.num_kv_splits : 1;
   bool fmha_fwd_in_kernel_split = false;
@@ -668,7 +669,7 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
     call_fmha_variant(variant_fn, fmha_fwd_run_kv_splits, fmha_fwd_in_kernel_split,
                       fmha_fwd_uniform_full_pages);
   } else {
-    TORCH_CHECK(false, "input does not match the Q8KV4 sparse TopK16 decode domain: ",
+    TORCH_CHECK(false, "input does not match the Q8KV4 sparse decode domain: ",
                 "sparse_candidate=", fmha_fwd_sparse_candidate, " page_size=", page_size,
                 " head_dim_qk=", head_dim_qk, " head_dim_vo=", head_dim_vo,
                 " pack_factor=", pack_factor, " q_tokens=", fmha_fwd_q_tokens,
@@ -703,7 +704,8 @@ std::unique_ptr<PlanInfo> make_decode_plan(at::Tensor qo_segment_lens, at::Tenso
   ensure_initialized();
   TORCH_CHECK(!qo_segment_lens.is_cuda() && !kv_segment_lens.is_cuda(),
               "make_decode_plan requires host query lengths and planning KV capacity");
-  TORCH_CHECK(topk == 16, "Q8KV4 decode requires TopK 16");
+  TORCH_CHECK(topk >= 1 && topk <= kMaxSparseTopK, "Q8KV4 decode requires 1 <= TopK <= ",
+              kMaxSparseTopK);
   auto qo_offset = kv_segment_lens - qo_segment_lens;
   return std::make_unique<PlanInfo>(_make_decode_plan_impl(
       qo_segment_lens, kv_segment_lens, num_qo_heads, num_kv_heads, qo_offset, num_kv_splits,

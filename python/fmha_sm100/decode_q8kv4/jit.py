@@ -34,9 +34,12 @@ _TEMPLATES = _CSRC / "templates"
 _SOURCES = _CSRC / "src"
 _SM100_INCLUDE = _CSRC / "include/sm100"
 _SPARSE_VARIANTS = {
-    False: "decode_attention_q8kv4_topk16",
-    True: "decode_attention_q8kv4_topk16_split",
+    False: "decode_attention_q8kv4",
+    True: "decode_attention_q8kv4_split",
 }
+# Widest TopK list one kernel binary accepts (kernel template bound and host-API constant
+# kMaxSparseTopK); the list width itself is a runtime argument.
+MAX_TOPK = 64
 _QMUL4_DEQUANT = "qmul4"
 _FP16_DEQUANT = "fp16_fallback"
 _QMUL4_PROBE_SOURCE = r"""
@@ -345,7 +348,7 @@ class JitSpec:
             "single_wg": "false",
             "is_split_kv": "true" if self.split_kv else "false",
             "sparse_mode": "Sparse",
-            "sparse_topk": 16,
+            "sparse_topk": MAX_TOPK,
             "fixed_q_tokens_per_batch": 0,
         }
         inst_template = jinja2.Template(
@@ -387,8 +390,8 @@ def gen_jit_spec(
     gqa_ratio: int = 16,
     device=None,
 ) -> JitSpec:
-    if int(topk) != 16:
-        raise ValueError(f"Q8KV4 decode attention requires TopK 16, got {topk}")
+    if not 1 <= int(topk) <= MAX_TOPK:
+        raise ValueError(f"Q8KV4 decode attention requires 1 <= TopK <= {MAX_TOPK}, got {topk}")
     if gqa_ratio not in (8, 16):
         raise ValueError("Q8KV4 decode attention requires GQA ratio 8 or 16")
     arch = _validate_gqa_arch(gqa_ratio, device)
@@ -511,6 +514,7 @@ def _clear_loaded_extensions() -> None:
 
 
 __all__ = [
+    "MAX_TOPK",
     "JitSpec",
     "gen_jit_spec",
     "get_fmha_fwd_variant",

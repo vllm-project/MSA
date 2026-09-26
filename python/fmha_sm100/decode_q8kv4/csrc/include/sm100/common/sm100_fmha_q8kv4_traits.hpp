@@ -72,6 +72,11 @@ template <int HeadGroup = 16> struct Sm100FmhaQ8Kv4BaseTraits {
 
   static constexpr int kNumPageOffsetStages = 6;
   static constexpr int kPageOffsetsPerStage = 32;
+  // Per-item selection records (page count, tail mask) published by the page-offsets warp and
+  // read by every other working warp; the depth bounds how far the producer runs ahead.
+  static constexpr int kNumSelectionStages = 4;
+  static constexpr int kSelectionConsumerWarps = kNumLoadWarps + kNumMmaWarps + kNumSoftmaxWarps +
+                                                 kNumCorrectionWarps + kNumTransformKvWarps;
   static constexpr int kSmemPBytes = kNumStagesQ * kSmemQBytesPerStage;
   static constexpr int kSmemOBytes = kHeadGroup * kHeadDim * 2;
   // Balanced-schedule merge: a segment's workspace slot is one block of 16 rows x 256 B bf16
@@ -112,13 +117,13 @@ template <int HeadGroup = 16> struct Sm100FmhaQ8Kv4BaseTraits {
                 "split plan Q tile must map to FMHA forward decode Q tiles.");
 };
 
-template <int TopK, bool EnableSplitKv, int HeadGroup = 16>
+template <int MaxTopK, bool EnableSplitKv, int HeadGroup = 16>
 struct Sm100FmhaQ8Kv4SparseTraits : Sm100FmhaQ8Kv4BaseTraits<HeadGroup> {
-  static constexpr int kSparseTopK = TopK;
-  static constexpr int kSparseKvTokens = TopK * Sm100FmhaQ8Kv4BaseTraits<HeadGroup>::kPageSize;
+  // Widest TopK list accepted at run time; the per-item tail mask holds one bit per page.
+  static constexpr int kMaxSparseTopK = MaxTopK;
   static constexpr bool kEnableSplitKvPath = EnableSplitKv;
   static constexpr bool kEnableStaticPath = true;
-  static_assert(TopK == 16, "first sparse FMHA forward decode variant supports topK=16.");
+  static_assert(MaxTopK > 0 && MaxTopK <= 64, "the selection tail mask holds at most 64 pages.");
 };
 
 template <bool IsSplitKV, SparseAttnMode kSparseAttnMode, bool IsQ8KV4, int SparseTopK = 16,

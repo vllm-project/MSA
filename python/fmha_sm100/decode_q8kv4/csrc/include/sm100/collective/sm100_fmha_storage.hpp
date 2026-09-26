@@ -70,7 +70,11 @@ template <class Traits> struct BarrierLayout {
   // Count 512.
   static constexpr int kArv512Offset = kOEmptyArv128 + 1;
   static constexpr int kWorkIdStorageEmptyArv512 = kArv512Offset + 0;
-  static constexpr int kNumUsedSlots = kWorkIdStorageEmptyArv512 + 2;
+  // Selection ring (appended so the slot table above keeps its original offsets): full has one
+  // producer arrival, empty one arrival per consuming warp.
+  static constexpr int kSelectionFullArv1 = kWorkIdStorageEmptyArv512 + 2;
+  static constexpr int kSelectionEmptyArvWarps = kSelectionFullArv1 + Traits::kNumSelectionStages;
+  static constexpr int kNumUsedSlots = kSelectionEmptyArvWarps + Traits::kNumSelectionStages;
 
   static_assert(kNumUsedSlots <= Traits::kNumBarrierSlots,
                 "barrier layout must fit the pipeline storage.");
@@ -138,6 +142,11 @@ template <class Traits> struct SharedStorage {
     float data[Traits::kWarpGroupReductionFloats];
   };
 
+  // One packed selection record per ring stage (see Sm100FmhaSelectionRing::pack).
+  struct alignas(16) SmemSelection {
+    uint32_t data[Traits::kNumSelectionStages];
+  };
+
   struct PipelineStorage {
     uint64_t barriers[Traits::kNumBarrierSlots];
 
@@ -155,10 +164,13 @@ template <class Traits> struct SharedStorage {
       CUTLASS_PRAGMA_UNROLL
       for (int slot = lane_idx; slot < Traits::kNumBarrierSlots;
            slot += cutlass::NumThreadsPerWarp) {
-        uint32_t const arrive_count = slot < Barriers::kArv32Offset    ? 1u
-                                      : slot < Barriers::kArv128Offset ? 32u
-                                      : slot < Barriers::kArv512Offset ? 128u
-                                                                       : 512u;
+        uint32_t const arrive_count =
+            slot >= Barriers::kSelectionEmptyArvWarps ? Traits::kSelectionConsumerWarps
+            : slot >= Barriers::kSelectionFullArv1    ? 1u
+            : slot < Barriers::kArv32Offset           ? 1u
+            : slot < Barriers::kArv128Offset          ? 32u
+            : slot < Barriers::kArv512Offset          ? 128u
+                                                      : 512u;
         init_mbarrier(barriers + slot, arrive_count);
       }
     }
@@ -168,6 +180,7 @@ template <class Traits> struct SharedStorage {
   SmemKv smem_kv;
   SmemP smem_p;
   SmemPageOffsetsKv smem_page_offsets_kv;
+  SmemSelection smem_selection;
   SmemO smem_o;
   SmemMergeStage smem_merge_stage;
   SmemWarpGroupReduction smem_softmax_red0;
@@ -186,7 +199,8 @@ template <class Traits> struct SharedStorage {
   static constexpr int kMainloopSmemBytes =
       sizeof(SmemQ) + sizeof(SmemKv) + sizeof(SmemP) + sizeof(SmemPageOffsetsKv) + sizeof(SmemO) +
       sizeof(SmemMergeStage) + 3 * sizeof(SmemWarpGroupReduction) + sizeof(SchedulerStorage) +
-      Traits::kTmemSwStateBytes + sizeof(merge_flag) + Traits::kBarrierStorageBytes;
+      Traits::kTmemSwStateBytes + sizeof(merge_flag) + Traits::kBarrierStorageBytes +
+      sizeof(SmemSelection);
   static constexpr int kActiveSmemBytes = kMainloopSmemBytes;
 
   static_assert(sizeof(SmemQ) == Traits::kNumStagesQ * Traits::kSmemQBytesPerStage,

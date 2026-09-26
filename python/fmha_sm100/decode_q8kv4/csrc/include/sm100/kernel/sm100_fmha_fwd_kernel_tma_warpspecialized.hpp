@@ -183,7 +183,8 @@ template <class Traits> struct Sm100FmhaFwdQ8Kv4KernelTmaWarpspecialized {
       return cudaErrorInvalidValue;
     }
     {
-      if (params.kv_block_indexes_ptr == nullptr || params.kv_block_num != Traits::kSparseTopK) {
+      if (params.kv_block_indexes_ptr == nullptr || params.kv_block_num < 1 ||
+          params.kv_block_num > Traits::kMaxSparseTopK) {
         return cudaErrorInvalidValue;
       }
     }

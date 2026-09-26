@@ -30,10 +30,14 @@ struct Sm100FmhaKvTileRange {
   int count = 0;
 };
 
+// One query's page selection, derived from its TopK list rather than from its position, so
+// the list may be unordered, may omit the query's own page, and may end early.
 struct Sm100FmhaSparseSelection {
   int visible_kv_len = 0;
-  int visible_pages = 0;
-  int selected_pages = 0;
+  int local_page = 0;      // page that holds the query token
+  int tail_limit = 0;      // tokens of the local page visible to the query, 1..kPageSize
+  int selected_pages = 0;  // leading list entries whose page lies in [0, local_page]
+  int tail_tile = -1;      // tile holding the local page when its tail must be masked, else -1
 };
 
 CUTLASS_DEVICE
@@ -162,59 +166,80 @@ CUTLASS_DEVICE int fmha_fwd_packed_row_base(Sm100FmhaFwdKernelParams<Traits> con
   return fmha_fwd_packed_q_offset<Traits>(params, batch_idx) + q_token_idx * Traits::kHeadGroup;
 }
 
+// Lane-parallel view of a query's TopK list: lane l holds entries l and l + 32 (-1 past the
+// list). The page-offsets warp loads these once and uses them both for the selection below and
+// for its physical-page lookups.
+struct Sm100FmhaSelectionLanes {
+  int page0 = -1;
+  int page1 = -1;
+};
+
+template <class Traits>
+CUTLASS_DEVICE Sm100FmhaSelectionLanes
+fmha_fwd_load_selection_lanes(Sm100FmhaFwdKernelParams<Traits> const &params, int batch_idx,
+                              int kv_head_idx, int q_token_idx, int lane_idx) {
+  static_assert(Traits::kMaxSparseTopK <= 2 * cutlass::NumThreadsPerWarp,
+                "the selection scan covers two warp-wide rounds");
+  Sm100FmhaSelectionLanes lanes;
+  if (params.kv_block_indexes_ptr == nullptr) {
+    return lanes;
+  }
+  // Query tokens per request are uniform in this kernel, so the row needs no offset load.
+  int const q_token_global = batch_idx * params.q_tokens_per_batch + q_token_idx;
+  int const *list =
+      params.kv_block_indexes_ptr +
+      (static_cast<int64_t>(q_token_global) * params.num_kv_heads + kv_head_idx) *
+          params.kv_block_num;
+  int const idx1 = lane_idx + cutlass::NumThreadsPerWarp;
+  lanes.page0 = lane_idx < params.kv_block_num ? __ldg(list + lane_idx) : -1;
+  lanes.page1 = idx1 < params.kv_block_num ? __ldg(list + idx1) : -1;
+  return lanes;
+}
+
+// Warp-cooperative (ballots): derive the selection from the list lanes. Valid entries form a
+// prefix; counting stops at the first entry that is negative or lies past the query's page,
+// which covers -1 padding and pages beyond an MTP token's own page.
 template <class Traits>
 CUTLASS_DEVICE Sm100FmhaSparseSelection
 fmha_fwd_sparse_selection(Sm100FmhaFwdKernelParams<Traits> const &params, int batch_idx,
-                          int kv_head_idx, int q_token_idx) {
-  int const visible_kv_len = fmha_fwd_visible_kv_length<Traits>(params, batch_idx, q_token_idx);
-  int const visible_pages = (visible_kv_len + Traits::kPageSize - 1) / Traits::kPageSize;
-  if (visible_pages <= 0 || params.kv_block_indexes_ptr == nullptr) {
-    return Sm100FmhaSparseSelection{visible_kv_len, visible_pages, 0};
+                          int q_token_idx, Sm100FmhaSelectionLanes const &lanes) {
+  Sm100FmhaSparseSelection selection;
+  selection.visible_kv_len = fmha_fwd_visible_kv_length<Traits>(params, batch_idx, q_token_idx);
+  if (selection.visible_kv_len <= 0 || params.kv_block_indexes_ptr == nullptr) {
+    return selection;
   }
-  (void)kv_head_idx;
-  int const selected_pages =
-      visible_pages < Traits::kSparseTopK ? visible_pages : Traits::kSparseTopK;
-  return Sm100FmhaSparseSelection{visible_kv_len, visible_pages, selected_pages};
-}
-
-template <class Traits>
-CUTLASS_DEVICE int fmha_fwd_sparse_kv_length(Sm100FmhaFwdKernelParams<Traits> const &params,
-                                             int batch_idx, int kv_head_idx, int q_token_idx) {
-  Sm100FmhaSparseSelection const selection =
-      fmha_fwd_sparse_selection<Traits>(params, batch_idx, kv_head_idx, q_token_idx);
-  if (selection.selected_pages <= 0) {
-    return 0;
-  }
-  int const full_selected_kv_len = selection.selected_pages * Traits::kPageSize;
-  int const page_mask = Traits::kPageSize - 1;
-  int const tail_correction =
-      (Traits::kPageSize - (selection.visible_kv_len & page_mask)) & page_mask;
-  return full_selected_kv_len - tail_correction;
-}
-
-template <class Traits>
-CUTLASS_DEVICE int fmha_fwd_sparse_kv_tile_count(Sm100FmhaFwdKernelParams<Traits> const &params,
-                                                 int batch_idx, int kv_head_idx, int q_token_idx) {
-  Sm100FmhaSparseSelection const selection =
-      fmha_fwd_sparse_selection<Traits>(params, batch_idx, kv_head_idx, q_token_idx);
-  return selection.selected_pages;
-}
-
-template <class Traits>
-CUTLASS_DEVICE int fmha_fwd_kv_length_for_batch(Sm100FmhaFwdKernelParams<Traits> const &params,
-                                                int batch_idx, int kv_head_idx, int q_token_idx) {
-  {
-    return fmha_fwd_sparse_kv_length<Traits>(params, batch_idx, kv_head_idx, q_token_idx);
-  }
+  selection.local_page = (selection.visible_kv_len - 1) / Traits::kPageSize;
+  selection.tail_limit = (selection.visible_kv_len - 1) % Traits::kPageSize + 1;
+  int const local_page = selection.local_page;
+  uint32_t const valid0 =
+      __ballot_sync(0xffffffffu, lanes.page0 >= 0 && lanes.page0 <= local_page);
+  uint32_t const local0 = __ballot_sync(0xffffffffu, lanes.page0 == local_page);
+  uint32_t const valid1 =
+      __ballot_sync(0xffffffffu, lanes.page1 >= 0 && lanes.page1 <= local_page);
+  uint32_t const local1 = __ballot_sync(0xffffffffu, lanes.page1 == local_page);
+  uint64_t const valid_bits = static_cast<uint64_t>(valid0) | (static_cast<uint64_t>(valid1) << 32);
+  uint64_t const local_bits = static_cast<uint64_t>(local0) | (static_cast<uint64_t>(local1) << 32);
+  uint64_t const invalid_bits = ~valid_bits;
+  int const selected = invalid_bits == 0 ? 64 : __ffsll(static_cast<long long>(invalid_bits)) - 1;
+  uint64_t const prefix_mask = selected == 64 ? ~0ull : ((1ull << selected) - 1ull);
+  selection.selected_pages = selected;
+  // Page ids are unique within a list, so at most one selected tile holds the local page; a
+  // fully visible local page needs no tail mask.
+  uint64_t const tail_bits = local_bits & prefix_mask;
+  selection.tail_tile = (tail_bits == 0 || selection.tail_limit == Traits::kPageSize)
+                            ? -1
+                            : __ffsll(static_cast<long long>(tail_bits)) - 1;
+  return selection;
 }
 
 template <class Traits>
 CUTLASS_DEVICE int fmha_fwd_kv_tile_count_for_batch(Sm100FmhaFwdKernelParams<Traits> const &params,
                                                     int batch_idx, int kv_head_idx,
                                                     int q_token_idx) {
-  {
-    return fmha_fwd_sparse_kv_tile_count<Traits>(params, batch_idx, kv_head_idx, q_token_idx);
-  }
+  int const lane_idx = threadIdx.x % cutlass::NumThreadsPerWarp;
+  Sm100FmhaSelectionLanes const lanes = fmha_fwd_load_selection_lanes<Traits>(
+      params, batch_idx, kv_head_idx, q_token_idx, lane_idx);
+  return fmha_fwd_sparse_selection<Traits>(params, batch_idx, q_token_idx, lanes).selected_pages;
 }
 
 enum class Sm100FmhaTmaDtype {
@@ -310,7 +335,8 @@ template <class Traits> struct FMHACutlassSM100ParamsBuilder {
     bool const has_power_of_two_q_tokens = q_tokens > 0 && (q_tokens & (q_tokens - 1)) == 0;
     bool const persistent_scheduler_supported =
         has_power_of_two_q_tokens && src.qo_segment_lens_ptr == nullptr &&
-        src.kv_block_num == Traits::kSparseTopK && src.num_kv_splits == 1;
+        src.kv_block_num >= 1 && src.kv_block_num <= Traits::kMaxSparseTopK &&
+        src.num_kv_splits == 1;
     policy.use_persistent_scheduler =
         persistent_scheduler_supported && policy.total_logical_ctas > policy.max_active_ctas &&
         policy.multi_ctas_kv_disabled && policy.persistent_scheduler_fits_smem;

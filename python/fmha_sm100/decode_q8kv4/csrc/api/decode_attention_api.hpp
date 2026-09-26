@@ -18,6 +18,10 @@
 
 namespace fmha_sm100::decode_q8kv4 {
 
+// Widest TopK list the kernel accepts; the JIT instantiates the kernel with the same bound
+// (jit.MAX_TOPK) and its per-item tail mask holds one bit per page.
+constexpr int kMaxSparseTopK = 64;
+
 struct PlanData {
   at::Tensor packed_work_range, packed_work_info;
   at::Tensor kv_tile_begin_indices, kv_tile_end_indices, kv_split_indices;
