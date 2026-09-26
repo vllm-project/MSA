@@ -88,16 +88,6 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
     }
   };
 
-  CUTLASS_DEVICE static void pack_scale_pairs(uint32_t &packed0, uint32_t &packed1, uint32_t h0,
-                                              uint32_t h1, uint32_t h2, uint32_t h3) {
-    uint32_t const pair01 = (h0 & 0xffffu) | ((h1 & 0xffffu) << 16);
-    uint32_t const pair23 = (h2 & 0xffffu) | ((h3 & 0xffffu) << 16);
-    asm volatile("prmt.b32 %0, %2, %3, 0x6420;\n"
-                 "prmt.b32 %1, %2, %3, 0x7531;\n"
-                 : "=&r"(packed0), "=&r"(packed1)
-                 : "r"(pair01), "r"(pair23));
-  }
-
   CUTLASS_DEVICE static uint32_t tmem_stage_col(int stage_idx, int loop_offset) {
     return Tmem::kPreparedKv +
            static_cast<uint32_t>(stage_idx * Tmem::kColsPerPreparedKvStage + loop_offset * 4);
@@ -203,56 +193,41 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
     fence_tmem_store();
   }
 
+#if !MINIMAX_MSA_Q8KV4_HAS_QMUL4
+  // FP16 fallback: convert one raw stage's V scales to F16 pairs once, instead of in every V
+  // iteration (Traits::kF16VScaleScratch sizes the scratch). The cache's token-quad order already
+  // holds, per head-dim group, the four tokens' E4M3 scales in one word, so a lane fetches its
+  // pair of group words with one 8-byte load. The QMUL4 path consumes those words in place.
   CUTLASS_DEVICE void prepare_v_scale_stage(int lane_idx, int warp_group_warp_idx,
                                             uint8_t *smem_stage_base, int barrier_id) const {
     uint8_t const *scale_stage_base = smem_stage_base + Traits::kRawKvDataBytesPerStage;
     uint8_t *scale_scratch_base =
         smem_stage_base + Traits::kRawKvDataBytesPerStage + Traits::kRawKvScaleBytesPerStage;
     int const warp_group_lane = warp_group_warp_idx * cutlass::NumThreadsPerWarp + lane_idx;
-#if MINIMAX_MSA_Q8KV4_HAS_QMUL4
-    int const scale_pair = warp_group_lane & 3;
-    int const token_quad = (warp_group_lane >> 2) & 3;
-#else
     // F16 scratch: quad fastest so the eight lanes of a 128-bit store phase cover one 128 B row.
     int const scale_pair = (warp_group_lane >> 2) & 3;
     int const token_quad = warp_group_lane & 3;
-#endif
     int const loop_offset = (warp_group_lane >> 4) & 7;
-    uint8_t const *scale_src =
-        scale_stage_base + loop_offset * 128 + token_quad * 32 + scale_pair * 2;
-    uint32_t const h0 = *reinterpret_cast<uint16_t const *>(scale_src + 0);
-    uint32_t const h1 = *reinterpret_cast<uint16_t const *>(scale_src + 8);
-    uint32_t const h2 = *reinterpret_cast<uint16_t const *>(scale_src + 16);
-    uint32_t const h3 = *reinterpret_cast<uint16_t const *>(scale_src + 24);
-    uint32_t packed0;
-    uint32_t packed1;
-    pack_scale_pairs(packed0, packed1, h0, h1, h2, h3);
-#if MINIMAX_MSA_Q8KV4_HAS_QMUL4
-    int const scale_dst_offset = loop_offset * 128 + token_quad * 32 + scale_pair * 8;
-    *reinterpret_cast<uint32_t *>(scale_scratch_base + scale_dst_offset) = packed0;
-    *reinterpret_cast<uint32_t *>(scale_scratch_base + scale_dst_offset + 4) = packed1;
-#else
-    // Convert the scales to F16 once here instead of in every V iteration
-    // (Traits::kF16VScaleScratch sizes the scratch for it). 16 B chunk per (loop offset, token
-    // quad, pair): {g0: f16x2(t0,t1), f16x2(t2,t3)} {g1: f16x2(t0,t1), f16x2(t2,t3)}. Quads are 16
-    // B apart so the four chunks a warp reads per V iteration sit in distinct banks (a 64 B quad
-    // stride aliases quads 0/2 and 1/3 across the 128 B bank wrap and makes the 128-bit loads 2-way
-    // conflicted).
+    uint2 const words = *reinterpret_cast<uint2 const *>(scale_stage_base + loop_offset * 128 +
+                                                         token_quad * 32 + scale_pair * 8);
+    // 16 B chunk per (loop offset, token quad, pair): {g0: f16x2(t0,t1), f16x2(t2,t3)}
+    // {g1: f16x2(t0,t1), f16x2(t2,t3)}. Quads are 16 B apart so the four chunks a warp reads per
+    // V iteration sit in distinct banks (a 64 B quad stride aliases quads 0/2 and 1/3 across the
+    // 128 B bank wrap and makes the 128-bit loads 2-way conflicted).
     uint4 f16_chunk;
-    convert_e4m3x4_scales_to_f16x2_pair(f16_chunk.x, f16_chunk.y, packed0);
-    convert_e4m3x4_scales_to_f16x2_pair(f16_chunk.z, f16_chunk.w, packed1);
+    convert_e4m3x4_scales_to_f16x2_pair(f16_chunk.x, f16_chunk.y, words.x);
+    convert_e4m3x4_scales_to_f16x2_pair(f16_chunk.z, f16_chunk.w, words.y);
     int const scale_dst_offset = loop_offset * 256 + token_quad * 16 + scale_pair * 64;
     *reinterpret_cast<uint4 *>(scale_scratch_base + scale_dst_offset) = f16_chunk;
-#endif
     Sm100FmhaNamedBarrier::sync(128, barrier_id);
   }
+#endif
 
   CUTLASS_DEVICE void transform_v_stage(uint32_t tmem_base, int stage_idx, int lane_idx,
                                         int warp_group_warp_idx,
                                         uint8_t const *smem_stage_base) const {
     uint8_t const *raw_stage_base = smem_stage_base;
-    uint8_t const *scale_scratch_base =
-        smem_stage_base + Traits::kRawKvDataBytesPerStage + Traits::kRawKvScaleBytesPerStage;
+    uint8_t const *scale_stage_base = smem_stage_base + Traits::kRawKvDataBytesPerStage;
 
     int const swizzle_mask = (lane_idx & 7) * 16;
     int const warp_col = warp_group_warp_idx * cutlass::NumThreadsPerWarp;
@@ -260,11 +235,13 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
     int const swizzled_col1 = (warp_col + 16) ^ swizzle_mask;
     uint8_t const *raw_lane_base = raw_stage_base + lane_idx * Traits::kHeadDim;
 #if MINIMAX_MSA_Q8KV4_HAS_QMUL4
+    // The cache's token-quad scale order is the converters' order: this lane's quad block, group
+    // words 2 * warp and 2 * warp + 1, read in place from the TMA-landed scales.
     uint8_t const *scale_reordered_lane_base =
-        scale_scratch_base + (lane_idx & 3) * 32 + warp_group_warp_idx * 8;
+        scale_stage_base + (lane_idx & 3) * 32 + warp_group_warp_idx * 8;
 #else
-    uint8_t const *scale_reordered_lane_base =
-        scale_scratch_base + (lane_idx & 3) * 16 + warp_group_warp_idx * 64;
+    uint8_t const *scale_reordered_lane_base = scale_stage_base + Traits::kRawKvScaleBytesPerStage +
+                                               (lane_idx & 3) * 16 + warp_group_warp_idx * 64;
 #endif
 
     CUTLASS_PRAGMA_UNROLL
@@ -332,8 +309,10 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
                            transformed_empty_phase, static_cast<uint32_t>(460 + transformed_stage));
     Sm100FmhaBarrier::wait(kv_full_barrier(storage, raw_stage), raw_full_phase,
                            static_cast<uint32_t>(440 + raw_stage));
+#if !MINIMAX_MSA_Q8KV4_HAS_QMUL4
     prepare_v_scale_stage(lane_idx, warp_group_warp_idx, storage.smem_kv.stage_ptr(raw_stage),
                           scale_barrier_id);
+#endif
 
     transform_v_stage(tmem_base, transformed_stage, lane_idx, warp_group_warp_idx,
                       storage.smem_kv.stage_ptr(raw_stage));

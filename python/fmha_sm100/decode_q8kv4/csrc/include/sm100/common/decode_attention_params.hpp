@@ -43,7 +43,9 @@ struct FMHACutlassSM100Params {
   float *workspace_lse_ptr;
   int *num_kv_splits_per_row_ptr;
   int *kv_indices_ptr;
-  int kv_page_stride;
+  // Per-request base into kv_indices_ptr: request b's logical page p is physical page
+  // kv_indices_ptr[kv_indptr_ptr[b] + p]; batch_size + 1 entries.
+  int *kv_indptr_ptr;
   int total_page_num;
   int *kv_block_indexes_ptr;
   int kv_block_num;
@@ -59,12 +61,17 @@ struct FMHACutlassSM100Params {
   // TMA fused direct-O unpack is enabled for uniform-Q direct output.
   // When false, epilogue falls back to vec16 software scatter.
   bool tma_direct_o_enabled = false;
-  // NVFP4 KV: per-group scale factors for fp4→fp8 dequantization.
-  // When k_scale_ptr != nullptr, k_ptr/v_ptr point to fp4x2 (uint8) data.
-  // Paged scale shape: (total_pages, num_kv_heads, page_size, head_dim/16),
-  // dtype=fp8_e4m3.
+  // NVFP4 KV: per-group E4M3 block scales, nominal shape (total_pages, num_kv_heads, page_size,
+  // head_dim/16) with token rows of 8 contiguous bytes. Page and head strides are in bytes, like
+  // the data strides, so a packed page may hold the data blocks of all heads followed by their
+  // scale blocks. K scale blocks are linear (token * 8 + group); V scale blocks use the token-quad
+  // order the V converters consume ((token / 4) * 32 + group * 4 + token % 4).
   void *k_scale_ptr = nullptr;
   void *v_scale_ptr = nullptr;
+  int k_scale_stride_n = 0;
+  int k_scale_stride_h = 0;
+  int v_scale_stride_n = 0;
+  int v_scale_stride_h = 0;
   // Balanced (stream-K) schedule: per work entry, the number of KV segments of its item; and one
   // self-resetting arrival counter per (q token, KV head) item for the in-kernel merge.
   int *kv_split_count_ptr = nullptr;

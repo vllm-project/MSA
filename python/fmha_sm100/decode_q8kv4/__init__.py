@@ -3,9 +3,9 @@
 
 """High-performance SM100 Q8KV4 paged sparse decode attention."""
 
-from .interface import BatchDecodeWithPagedKVCacheWrapper
+from .interface import BatchDecodeWithPagedKVCacheWrapper, interleave_v_scales
 
-__all__ = ["BatchDecodeWithPagedKVCacheWrapper"]
+__all__ = ["BatchDecodeWithPagedKVCacheWrapper", "interleave_v_scales"]
 
 try:
     import ctypes

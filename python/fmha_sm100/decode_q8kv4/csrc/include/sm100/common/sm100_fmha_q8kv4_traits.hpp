@@ -61,11 +61,15 @@ template <int HeadGroup = 16> struct Sm100FmhaQ8Kv4BaseTraits {
   static constexpr int kSmemQBytesPerStage = kTileQ * kHeadDim;
   static constexpr int kRawKvDataBytesPerStage = kTileKv * kHeadDim;
   static constexpr int kRawKvScaleBytesPerStage = kTileKv * (kHeadDim / kScaleGroupSize);
-  // FP16 fallback: the V scale prepare pass stores F16 pairs (2x scratch) so the V loop needs no
-  // scale conversions. The QMUL4 path consumes E4M3 scales directly and keeps the 1x scratch.
+  // Scale layout in the cache. K: byte token * 8 + group (one 8-byte row per token). V: byte
+  // (token / 4) * 32 + group * 4 + token % 4, so each aligned 4-byte word holds the scales of four
+  // consecutive tokens for one head-dim group, the order the V converters consume (a converted V
+  // word covers four tokens at one dim; a K word covers four dims of one token).
+  // FP16 fallback: a prepare pass converts each stage's V scales to F16 pairs (2x scratch) so the
+  // V loop needs no scale conversions. The QMUL4 path consumes the E4M3 words in place.
   static constexpr bool kF16VScaleScratch = !MINIMAX_MSA_Q8KV4_HAS_QMUL4;
   static constexpr int kRawKvScaleScratchBytesPerStage =
-      (kF16VScaleScratch ? 2 : 1) * kRawKvScaleBytesPerStage;
+      kF16VScaleScratch ? 2 * kRawKvScaleBytesPerStage : 0;
   static constexpr int kRawKvStageBytes =
       kRawKvDataBytesPerStage + kRawKvScaleBytesPerStage + kRawKvScaleScratchBytesPerStage;
   static constexpr int kRawKvTmaBytes = kTileKv * (kHeadDim / 2) + kRawKvScaleBytesPerStage;
@@ -105,8 +109,9 @@ template <int HeadGroup = 16> struct Sm100FmhaQ8Kv4BaseTraits {
                 "q8kv4 FMHA forward raw KV stage stores one unpacked byte per fp4.");
   static_assert(kRawKvScaleBytesPerStage == 1024,
                 "q8kv4 FMHA forward scale stage stores one E4M3 byte per 16 values.");
-  static_assert(kRawKvScaleScratchBytesPerStage == (kF16VScaleScratch ? 2048 : 1024),
-                "q8kv4 FMHA forward scale scratch stores one reordered scale tile (E4M3 or F16).");
+  static_assert(kRawKvScaleScratchBytesPerStage == (kF16VScaleScratch ? 2048 : 0),
+                "q8kv4 FMHA forward scale scratch holds one F16 scale tile on the fallback path "
+                "and nothing when the converters read the E4M3 words in place.");
   static_assert(kRawKvStageBytes == 16384 + 1024 + kRawKvScaleScratchBytesPerStage,
                 "raw KV stage size must match the transformed-KV path.");
   static_assert(kRawKvTmaBytes == 9216,

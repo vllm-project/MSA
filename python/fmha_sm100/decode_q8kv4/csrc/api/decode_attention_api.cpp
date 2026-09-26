@@ -578,9 +578,9 @@ PlanInfo _make_decode_plan_impl(at::Tensor qo_segment_lens, at::Tensor kv_segmen
 // ============================================================================
 
 at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &plan,
-                            at::Tensor seq_lens, at::Tensor page_table, at::Tensor topk_indices,
-                            at::Tensor k_scale, at::Tensor v_scale, at::Tensor out,
-                            float sm_scale) {
+                            at::Tensor seq_lens, at::Tensor kv_indices, at::Tensor kv_indptr,
+                            at::Tensor topk_indices, at::Tensor k_scale, at::Tensor v_scale,
+                            at::Tensor out, float sm_scale) {
   c10::cuda::CUDAGuard device_guard(q.device());
   int device = q.get_device();
   int64_t nnz_qo = q.size(0);
@@ -597,6 +597,11 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
   TORCH_CHECK(seq_lens.is_cuda() && seq_lens.scalar_type() == at::kInt && seq_lens.dim() == 1 &&
                   seq_lens.size(0) == batch_size,
               "seq_lens must be a CUDA int32 tensor with shape [batch]");
+  TORCH_CHECK(kv_indices.is_cuda() && kv_indices.scalar_type() == at::kInt && kv_indices.dim() == 1,
+              "kv_indices must be a flat CUDA int32 tensor of physical page ids");
+  TORCH_CHECK(kv_indptr.is_cuda() && kv_indptr.scalar_type() == at::kInt && kv_indptr.dim() == 1 &&
+                  kv_indptr.size(0) == batch_size + 1,
+              "kv_indptr must be a CUDA int32 tensor with shape [batch + 1]");
 
   int pack_factor = plan.pack_factor;
   int orig_num_qo_heads = plan.orig_num_qo_heads > 0 ? plan.orig_num_qo_heads : num_qo_heads;
@@ -613,11 +618,9 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
   // reduction launch is skipped.
   bool const in_kernel_merge = plan.stream_k;
   auto &mgr = VariantManager::instance();
-  int64_t run_kv_page_stride = page_table.size(1);
 
   auto call_fmha_variant = [&](const tvm::ffi::Function &variant_fn, int64_t run_num_kv_splits,
-                               bool in_kernel_split_kv = false,
-                               bool use_uniform_full_page_kv_len = false) {
+                               bool in_kernel_split_kv = false) {
     variant_fn(
         torch_to_tvm(plan.cute_workspace_buffer), torch_to_tvm(q), torch_to_tvm(k), torch_to_tvm(v),
         torch_to_tvm(plan.qo_segment_lens), torch_to_tvm(seq_lens),
@@ -631,16 +634,23 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
         in_kernel_split_kv ? tvm::ffi::Tensor(nullptr) : tensor_or_null(plan.workspace_o),
         in_kernel_split_kv ? tvm::ffi::Tensor(nullptr) : tensor_or_null(plan.workspace_lse),
         in_kernel_split_kv ? tvm::ffi::Tensor(nullptr) : tensor_or_null(plan.num_kv_splits_per_row),
-        (int64_t)qo_tile_size, torch_to_tvm(page_table), run_kv_page_stride,
+        (int64_t)qo_tile_size, torch_to_tvm(kv_indices), torch_to_tvm(kv_indptr),
         torch_to_tvm(topk_indices), torch_to_tvm(k_scale), torch_to_tvm(v_scale),
         (int64_t)pack_factor, (int64_t)plan.q_tokens_per_batch, plan.qo_len_uniform,
-        use_uniform_full_page_kv_len, tensor_or_null(plan.kv_split_count),
-        tensor_or_null(plan.merge_counter), plan.merge_item_base, stream_int);
+        tensor_or_null(plan.kv_split_count), tensor_or_null(plan.merge_counter),
+        plan.merge_item_base, stream_int);
   };
 
   int fmha_fwd_runtime_topk = static_cast<int>(topk_indices.size(2));
-  bool fmha_fwd_uniform_full_pages = false;
-  bool fmha_fwd_scale_layout_ok = k_scale.dim() == 4 && v_scale.dim() == 4;
+  // Paged K/V data and scales: contiguous token rows of `row_bytes`, TMA-aligned page and head
+  // strides (the tensors arrive as byte views, so element strides are byte strides).
+  auto const strided_page_rows = [](at::Tensor const &tensor, int64_t row_bytes) {
+    return tensor.dim() == 4 && tensor.stride(3) == 1 && tensor.stride(2) == row_bytes &&
+           tensor.stride(1) % 16 == 0 && tensor.stride(0) % 16 == 0;
+  };
+  bool fmha_fwd_layout_ok =
+      strided_page_rows(k, head_dim_qk / 2) && strided_page_rows(v, head_dim_vo / 2) &&
+      strided_page_rows(k_scale, head_dim_qk / 16) && strided_page_rows(v_scale, head_dim_vo / 16);
   int fmha_fwd_q_tokens = 0;
   if (pack_factor == 8 || pack_factor == 16) {
     if (plan.q_tokens_per_batch > 0) {
@@ -656,7 +666,7 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
       (q.scalar_type() == at::kFloat8_e4m3fn || q.scalar_type() == at::kByte) && page_size == 128 &&
       head_dim_qk == 128 && head_dim_vo == 128 && (pack_factor == 8 || pack_factor == 16) &&
       fmha_fwd_q_tokens > 0 && num_kv_heads > 0 &&
-      orig_num_qo_heads == num_kv_heads * pack_factor && fmha_fwd_scale_layout_ok &&
+      orig_num_qo_heads == num_kv_heads * pack_factor && fmha_fwd_layout_ok &&
       fmha_fwd_runtime_topk == plan.kv_block_num && fmha_fwd_runtime_topk >= 1 &&
       fmha_fwd_runtime_topk <= kMaxSparseTopK;
 
@@ -666,16 +676,14 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
   if (fmha_fwd_sparse_candidate) {
     auto variant_fn =
         mgr.get_fmha_fwd_sparse_variant(fmha_fwd_runtime_topk, use_split_kv, device, pack_factor);
-    call_fmha_variant(variant_fn, fmha_fwd_run_kv_splits, fmha_fwd_in_kernel_split,
-                      fmha_fwd_uniform_full_pages);
+    call_fmha_variant(variant_fn, fmha_fwd_run_kv_splits, fmha_fwd_in_kernel_split);
   } else {
-    TORCH_CHECK(false, "input does not match the Q8KV4 sparse decode domain: ",
-                "sparse_candidate=", fmha_fwd_sparse_candidate, " page_size=", page_size,
-                " head_dim_qk=", head_dim_qk, " head_dim_vo=", head_dim_vo,
-                " pack_factor=", pack_factor, " q_tokens=", fmha_fwd_q_tokens,
-                " num_kv_splits=", plan.num_kv_splits, " use_split_kv=", use_split_kv,
-                " scale_layout_ok=", fmha_fwd_scale_layout_ok, " topk=", fmha_fwd_runtime_topk,
-                " hq=", orig_num_qo_heads, " hk=", num_kv_heads);
+    TORCH_CHECK(false, "input does not match the Q8KV4 sparse decode domain: ", "sparse_candidate=",
+                fmha_fwd_sparse_candidate, " page_size=", page_size, " head_dim_qk=", head_dim_qk,
+                " head_dim_vo=", head_dim_vo, " pack_factor=", pack_factor,
+                " q_tokens=", fmha_fwd_q_tokens, " num_kv_splits=", plan.num_kv_splits,
+                " use_split_kv=", use_split_kv, " layout_ok=", fmha_fwd_layout_ok,
+                " topk=", fmha_fwd_runtime_topk, " hq=", orig_num_qo_heads, " hk=", num_kv_heads);
   }
 
   // Split-KV reduction (separate launch); the balanced schedule merges in the kernel.
@@ -713,11 +721,12 @@ std::unique_ptr<PlanInfo> make_decode_plan(at::Tensor qo_segment_lens, at::Tenso
 }
 
 at::Tensor run_decode(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &plan_info,
-                      at::Tensor seq_lens, at::Tensor page_table, at::Tensor topk_indices,
-                      at::Tensor k_scale, at::Tensor v_scale, at::Tensor out, float sm_scale) {
+                      at::Tensor seq_lens, at::Tensor kv_indices, at::Tensor kv_indptr,
+                      at::Tensor topk_indices, at::Tensor k_scale, at::Tensor v_scale,
+                      at::Tensor out, float sm_scale) {
   ensure_initialized();
-  return _run_decode_impl(q, k, v, plan_info, seq_lens, page_table, topk_indices, k_scale, v_scale,
-                          out, sm_scale);
+  return _run_decode_impl(q, k, v, plan_info, seq_lens, kv_indices, kv_indptr, topk_indices,
+                          k_scale, v_scale, out, sm_scale);
 }
 
 } // namespace fmha_sm100::decode_q8kv4

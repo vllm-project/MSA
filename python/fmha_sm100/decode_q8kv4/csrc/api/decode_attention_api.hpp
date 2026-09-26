@@ -61,8 +61,9 @@ PlanInfo _make_decode_plan_impl(at::Tensor qo_segment_lens, at::Tensor kv_segmen
                                 const std::string &split_mode = "streamk");
 
 at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &plan_info,
-                            at::Tensor seq_lens, at::Tensor page_table, at::Tensor topk_indices,
-                            at::Tensor k_scale, at::Tensor v_scale, at::Tensor out, float sm_scale);
+                            at::Tensor seq_lens, at::Tensor kv_indices, at::Tensor kv_indptr,
+                            at::Tensor topk_indices, at::Tensor k_scale, at::Tensor v_scale,
+                            at::Tensor out, float sm_scale);
 
 std::unique_ptr<PlanInfo> make_decode_plan(at::Tensor qo_segment_lens, at::Tensor kv_segment_lens,
                                            int num_qo_heads, int num_kv_heads, int num_kv_splits,
@@ -70,8 +71,14 @@ std::unique_ptr<PlanInfo> make_decode_plan(at::Tensor qo_segment_lens, at::Tenso
                                            std::optional<int> device = std::nullopt,
                                            const std::string &split_mode = "streamk");
 
+// kv_indices is the flat physical-page list and kv_indptr [batch + 1] each request's base into
+// it. K/V data ([pages, heads, 128, 64] uint8) and block scales ([pages, heads, 128, 8] E4M3 as
+// uint8) are strided views: token rows contiguous, page and head strides free (multiples of 16
+// bytes), so packed pages holding all heads' data blocks followed by their scale blocks need no
+// copy. V scale blocks are in token-quad order, see FMHACutlassSM100Params.
 at::Tensor run_decode(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &plan_info,
-                      at::Tensor seq_lens, at::Tensor page_table, at::Tensor topk_indices,
-                      at::Tensor k_scale, at::Tensor v_scale, at::Tensor out, float sm_scale);
+                      at::Tensor seq_lens, at::Tensor kv_indices, at::Tensor kv_indptr,
+                      at::Tensor topk_indices, at::Tensor k_scale, at::Tensor v_scale,
+                      at::Tensor out, float sm_scale);
 
 } // namespace fmha_sm100::decode_q8kv4

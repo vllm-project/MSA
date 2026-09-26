@@ -21,10 +21,9 @@ void FMHAVariantRun_{{ variant_name }}(
     Optional<ffi::TensorView> maybe_kv_split_indices, Optional<ffi::TensorView> maybe_workspace_o,
     Optional<ffi::TensorView> maybe_workspace_lse,
     Optional<ffi::TensorView> maybe_num_kv_splits_per_row, int64_t qo_tile_size,
-    Optional<ffi::TensorView> maybe_kv_indices, int64_t kv_page_stride,
-    Optional<ffi::TensorView> maybe_kv_block_indexes, Optional<ffi::TensorView> maybe_k_scale,
-    Optional<ffi::TensorView> maybe_v_scale, int64_t pack_factor, int64_t q_tokens_per_batch,
-    bool qo_len_uniform, bool use_uniform_full_page_kv_len,
+    Optional<ffi::TensorView> maybe_kv_indices, ffi::TensorView kv_indptr,
+    Optional<ffi::TensorView> maybe_kv_block_indexes, ffi::TensorView k_scale,
+    ffi::TensorView v_scale, int64_t pack_factor, int64_t q_tokens_per_batch, bool qo_len_uniform,
     Optional<ffi::TensorView> maybe_kv_split_count, Optional<ffi::TensorView> maybe_merge_counter,
     int64_t merge_item_base, int64_t stream_ptr) {
   bool is_paged = maybe_kv_indices.has_value();
@@ -41,15 +40,14 @@ void FMHAVariantRun_{{ variant_name }}(
 
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
-  FMHACutlassSM100Params params;
+  FMHACutlassSM100Params params{};
   params.workspace_buffer_ptr = workspace_buffer.data_ptr();
   params.q_ptr = q.data_ptr();
   params.k_ptr = k.data_ptr();
   params.v_ptr = v.data_ptr();
   params.qo_segment_lens_ptr =
       qo_len_uniform ? nullptr : static_cast<int *>(qo_segment_lens.data_ptr());
-  params.kv_segment_lens_ptr =
-      use_uniform_full_page_kv_len ? nullptr : static_cast<int *>(kv_segment_lens.data_ptr());
+  params.kv_segment_lens_ptr = static_cast<int *>(kv_segment_lens.data_ptr());
   params.qo_segment_offsets_ptr =
       qo_len_uniform ? nullptr : static_cast<int *>(qo_segment_offsets.data_ptr());
   params.kv_segment_offsets_ptr = static_cast<int *>(kv_segment_offsets.data_ptr());
@@ -106,7 +104,7 @@ void FMHAVariantRun_{{ variant_name }}(
   params.kv_indices_ptr = maybe_kv_indices.has_value()
                               ? static_cast<int *>(maybe_kv_indices.value().data_ptr())
                               : nullptr;
-  params.kv_page_stride = static_cast<int>(kv_page_stride);
+  params.kv_indptr_ptr = static_cast<int *>(kv_indptr.data_ptr());
   params.total_page_num = is_paged ? k.size(0) : 0;
   params.kv_block_indexes_ptr = kv_block_indexes_ptr;
   params.kv_block_num = maybe_kv_block_indexes.has_value()
@@ -136,10 +134,12 @@ void FMHAVariantRun_{{ variant_name }}(
     }
   }
 
-  params.k_scale_ptr =
-      maybe_k_scale.has_value() ? static_cast<void *>(maybe_k_scale.value().data_ptr()) : nullptr;
-  params.v_scale_ptr =
-      maybe_v_scale.has_value() ? static_cast<void *>(maybe_v_scale.value().data_ptr()) : nullptr;
+  params.k_scale_ptr = k_scale.data_ptr();
+  params.k_scale_stride_n = k_scale.stride(0);
+  params.k_scale_stride_h = k_scale.stride(1);
+  params.v_scale_ptr = v_scale.data_ptr();
+  params.v_scale_stride_n = v_scale.stride(0);
+  params.v_scale_stride_h = v_scale.stride(1);
 
   cudaError_t status = {{ func_name }}(params);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)

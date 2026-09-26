@@ -23,6 +23,7 @@ PYBIND11_MODULE(_fmha_sm100_decode_q8kv4_cpp, module) {
              py::arg("split_mode") = "streamk");
 
   module.def("run_decode", &run_decode, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("plan"),
-             py::arg("seq_lens"), py::arg("page_table"), py::arg("topk_indices"),
-             py::arg("k_scale"), py::arg("v_scale"), py::arg("out"), py::arg("sm_scale"));
+             py::arg("seq_lens"), py::arg("kv_indices"), py::arg("kv_indptr"),
+             py::arg("topk_indices"), py::arg("k_scale"), py::arg("v_scale"), py::arg("out"),
+             py::arg("sm_scale"));
 }

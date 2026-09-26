@@ -47,15 +47,15 @@ template <class Traits> struct Sm100FmhaPageOffsetsTmaWarpspecialized {
     Sm100FmhaBarrier::arrive(full_barrier);
   }
 
-  // `logical_page` is this lane's list entry for the group, loaded once per item by run_tile.
-  CUTLASS_DEVICE void load_group(Storage &storage, Params const &params, int batch_idx,
-                                 int group_event, int page_group, int pages_this_batch,
-                                 int logical_page, int lane_idx) const {
+  // `logical_page` is this lane's list entry for the group, loaded once per item by run_tile;
+  // `page_base` / `page_count` are the request's range in the flat physical-page list.
+  CUTLASS_DEVICE void load_group(Storage &storage, Params const &params, int page_base,
+                                 int page_count, int group_event, int page_group,
+                                 int pages_this_batch, int logical_page, int lane_idx) const {
     int const page_idx = page_group * Traits::kPageOffsetsPerStage + lane_idx;
-    int lookup = batch_idx * params.kv_page_stride;
+    int lookup = page_base;
     if (page_idx < pages_this_batch) {
-      int const page_for_lookup =
-          logical_page >= 0 && logical_page < params.kv_page_stride ? logical_page : 0;
+      int const page_for_lookup = logical_page >= 0 && logical_page < page_count ? logical_page : 0;
       lookup += page_for_lookup;
     }
 #if MINIMAX_MSA_Q8KV4_HAS_QMUL4
@@ -85,6 +85,9 @@ template <class Traits> struct Sm100FmhaPageOffsetsTmaWarpspecialized {
     // for the other warps, then reuse the same entries for the physical-page lookups.
     Sm100FmhaSelectionLanes const lanes = fmha_fwd_load_selection_lanes<Traits>(
         params, batch_idx, kv_head_idx, q_token_idx, lane_idx);
+    // Issued alongside the list loads so the page lookups stay one dependent load deep.
+    int const page_base = __ldg(params.kv_indptr_ptr + batch_idx);
+    int const page_count = __ldg(params.kv_indptr_ptr + batch_idx + 1) - page_base;
     Sm100FmhaSparseSelection const selection =
         fmha_fwd_sparse_selection<Traits>(params, batch_idx, q_token_idx, lanes);
     Sm100FmhaSelectionRing<Traits>::publish(storage, selection, lane_idx, state.selection_event);
@@ -98,7 +101,7 @@ template <class Traits> struct Sm100FmhaPageOffsetsTmaWarpspecialized {
         (page_range.end + Traits::kPageOffsetsPerStage - 1) / Traits::kPageOffsetsPerStage;
     CUTLASS_PRAGMA_NO_UNROLL
     for (int group = begin_group; group < end_group; ++group) {
-      load_group(storage, params, batch_idx, state.group_event, group, page_range.end,
+      load_group(storage, params, page_base, page_count, state.group_event, group, page_range.end,
                  group == 0 ? lanes.page0 : lanes.page1, lane_idx);
       ++state.group_event;
     }
