@@ -11,7 +11,7 @@ import torch
 from fmha_sm100.decode_q8kv4 import BatchDecodeWithPagedKVCacheWrapper, plan_decode
 
 from .cases import KV_HEADS, PAGE_SIZE, SMOKE_CASES, make_inputs
-from .reference import assert_close_to_reference, dequantize, sparse_decode_reference
+from .reference import PageDequantizer, assert_close_to_reference, sparse_decode_reference
 from .runners import run_wrapper
 
 CASE = SMOKE_CASES[1]  # ragged lengths, one query token each
@@ -55,7 +55,7 @@ def test_selection_lists_follow_the_list_not_the_position(device, kind):
     inputs = make_inputs(CASE, device)
     inputs.topk_indices = _variant(inputs, kind)
     reference = sparse_decode_reference(
-        inputs, dequantize(inputs.k_codes, inputs.k_scale), dequantize(inputs.v_codes, inputs.v_scale)
+        inputs, PageDequantizer(inputs.k_codes, inputs.k_scale), PageDequantizer(inputs.v_codes, inputs.v_scale)
     )
     out = run_wrapper(inputs, label=f"contract {kind}")
     assert_close_to_reference(out, reference, label=f"contract {kind}")

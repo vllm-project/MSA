@@ -26,7 +26,7 @@ def dequantize(
     global_scale: float = 1.0,
     block_scale_shift: int = 0,
 ) -> torch.Tensor:
-    """``[P, H, 128, 64]`` packed codes and ``[P, H, 128, 8]`` linear scales to fp32 values."""
+    """``[..., 128, 64]`` packed codes and ``[..., 128, 8]`` linear scales to fp32 values."""
     lut = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=codes.device)
     values = torch.stack((codes & 0x0F, codes >> 4), dim=-1).reshape(*codes.shape[:-1], HEAD_DIM)
     staged_scale = (scale.float() / (1 << block_scale_shift)).clamp(-E4M3_MAX, E4M3_MAX)
@@ -36,10 +36,35 @@ def dequantize(
     return requantized * float(1 << block_scale_shift) * global_scale
 
 
+class PageDequantizer:
+    """Dequantizes one (physical page, head) block on demand and caches it.
+
+    The reference only touches the selected pages, so this keeps the fp32 values bounded by the
+    pages a case actually reads instead of the whole cache.
+    """
+
+    def __init__(self, codes: torch.Tensor, scale: torch.Tensor, *, global_scale: float = 1.0,
+                 block_scale_shift: int = 0):
+        self._codes = codes
+        self._scale = scale
+        self._global_scale = global_scale
+        self._block_scale_shift = block_scale_shift
+        self._cache: dict[tuple[int, int], torch.Tensor] = {}
+
+    def __call__(self, physical_page: int, head: int) -> torch.Tensor:
+        key = (physical_page, head)
+        block = self._cache.get(key)
+        if block is None:
+            block = dequantize(self._codes[physical_page, head], self._scale[physical_page, head],
+                               global_scale=self._global_scale, block_scale_shift=self._block_scale_shift)
+            self._cache[key] = block
+        return block
+
+
 def sparse_decode_reference(
     inputs: DecodeInputs,
-    k_values: torch.Tensor,
-    v_values: torch.Tensor,
+    k_values: PageDequantizer,
+    v_values: PageDequantizer,
     *,
     sm_scale: float = SM_SCALE,
     topk_indices: torch.Tensor | None = None,
@@ -52,7 +77,7 @@ def sparse_decode_reference(
     """
     case = inputs.case
     topk = inputs.topk_indices if topk_indices is None else topk_indices
-    num_kv_heads = k_values.shape[1]
+    num_kv_heads = inputs.k_codes.shape[1]
     gqa = inputs.num_q_heads // num_kv_heads
     q = inputs.q.float()
     out = torch.zeros((q.shape[0], inputs.num_q_heads, HEAD_DIM), dtype=torch.float32,
@@ -72,8 +97,8 @@ def sparse_decode_reference(
                         break
                     physical = page_table[batch][page]
                     visible = PAGE_SIZE if page < local_page else position % PAGE_SIZE + 1
-                    keys.append(k_values[physical, head, :visible])
-                    values.append(v_values[physical, head, :visible])
+                    keys.append(k_values(physical, head)[:visible])
+                    values.append(v_values(physical, head)[:visible])
                 if not keys:
                     continue
                 k = torch.cat(keys)

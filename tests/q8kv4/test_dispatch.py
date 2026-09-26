@@ -13,7 +13,7 @@ from fmha_sm100.q8kv4_decode_adapter import PLAN_KEY
 
 from .cases import HEAD_DIM, KV_HEADS, PAGE_SIZE, SM_SCALE, SMOKE_CASES, flat_page_table, global_scale, make_inputs, pack_vllm_pages, unpack_views
 from .conftest import run_timed
-from .reference import assert_close_to_reference, dequantize, sparse_decode_reference
+from .reference import PageDequantizer, assert_close_to_reference, sparse_decode_reference
 
 CASE = SMOKE_CASES[0]
 
@@ -36,7 +36,7 @@ class ApiHarness:
         self.kv_indices, self.kv_indptr = flat_page_table(self.inputs.page_table, CASE.seq_lens)
         self.unit = global_scale(1.0, device)
         self.reference = sparse_decode_reference(
-            self.inputs, dequantize(self.inputs.k_codes, self.inputs.k_scale), dequantize(self.inputs.v_codes, self.inputs.v_scale)
+            self.inputs, PageDequantizer(self.inputs.k_codes, self.inputs.k_scale), PageDequantizer(self.inputs.v_codes, self.inputs.v_scale)
         )
 
     def plan(self, num_q_heads=None, **kwargs):
@@ -119,7 +119,7 @@ def test_unfit_batches_and_calls_fall_back_or_raise(harness):
     assert plan_gqa4[3].get(PLAN_KEY) is None
     reference_gqa4 = sparse_decode_reference(
         harness.inputs.__class__(**{**vars(inputs), "q": q_gqa4, "gqa": 4}),
-        dequantize(inputs.k_codes, inputs.k_scale), dequantize(inputs.v_codes, inputs.v_scale))
+        PageDequantizer(inputs.k_codes, inputs.k_scale), PageDequantizer(inputs.v_codes, inputs.v_scale))
     assert_close_to_reference(harness.run(plan_gqa4, q=q_gqa4, label="api gqa4"), reference_gqa4, label="GQA 4 on kv_mode3")
     with pytest.raises(ValueError, match="cannot plan this batch"):
         harness.plan(num_q_heads=KV_HEADS * 4, decode_backend="q8kv4")

@@ -9,7 +9,7 @@ from fmha_sm100.decode_q8kv4 import jit, plan_decode, run_decode
 
 from .cases import KV_HEADS, SM_SCALE, SMOKE_CASES, DecodeCase, flat_page_table, make_inputs
 from .conftest import run_timed
-from .reference import assert_close_to_reference, dequantize, sparse_decode_reference
+from .reference import PageDequantizer, assert_close_to_reference, sparse_decode_reference
 from .runners import run_wrapper
 
 
@@ -29,7 +29,7 @@ def test_one_plan_serves_different_lengths_pages_and_lists(device):
         case = DecodeCase(f"reuse_{seed}", seq_lens, q_len=base.q_len, topk=base.topk, seed=seed)
         inputs = make_inputs(case, device)
         reference = sparse_decode_reference(
-            inputs, dequantize(inputs.k_codes, inputs.k_scale), dequantize(inputs.v_codes, inputs.v_scale))
+            inputs, PageDequantizer(inputs.k_codes, inputs.k_scale), PageDequantizer(inputs.v_codes, inputs.v_scale))
         assert_close_to_reference(_run_on_plan(plan, inputs, case.name), reference, label=case.name)
 
 

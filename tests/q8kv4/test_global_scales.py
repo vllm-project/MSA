@@ -10,7 +10,7 @@ from fmha_sm100.decode_q8kv4 import BatchDecodeWithPagedKVCacheWrapper
 
 from .cases import KV_HEADS, SM_SCALE, SMOKE_CASES, global_scale, make_inputs, scale_bytes_times_pow2
 from .conftest import run_timed
-from .reference import assert_close_to_reference, dequantize, sparse_decode_reference
+from .reference import PageDequantizer, assert_close_to_reference, sparse_decode_reference
 from .runners import run_wrapper
 
 CASES = [pytest.param(case, id=case.name) for case in SMOKE_CASES[:2]]
@@ -50,8 +50,8 @@ def test_te_style_cache_matches_reference_and_needs_staging(device, case, num_kv
     k_scale, v_scale, globals_ = _te_style(inputs)
     reference = sparse_decode_reference(
         inputs,
-        dequantize(inputs.k_codes, scale_bytes_times_pow2(inputs.k_scale, 8), global_scale=K_GLOBAL / 256, block_scale_shift=3),
-        dequantize(inputs.v_codes, scale_bytes_times_pow2(inputs.v_scale, 8), global_scale=V_GLOBAL / 256, block_scale_shift=3),
+        PageDequantizer(inputs.k_codes, scale_bytes_times_pow2(inputs.k_scale, 8), global_scale=K_GLOBAL / 256, block_scale_shift=3),
+        PageDequantizer(inputs.v_codes, scale_bytes_times_pow2(inputs.v_scale, 8), global_scale=V_GLOBAL / 256, block_scale_shift=3),
     )
     out = run_wrapper(inputs, block_scale_shift=3, k_scale=k_scale, v_scale_kernel=v_scale,
                       kv_global_scale=globals_, num_kv_splits=num_kv_splits, label=f"{case.name} TE-style")
