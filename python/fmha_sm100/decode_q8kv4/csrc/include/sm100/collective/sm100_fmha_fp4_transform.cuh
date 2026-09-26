@@ -16,7 +16,48 @@
 #include "cutlass/numeric_types.h"
 #include "nvfp4_to_e4m3.cuh"
 
+#if !defined(MINIMAX_MSA_Q8KV4_BLOCK_SCALE_SHIFT)
+#error "The Q8KV4 JIT must define MINIMAX_MSA_Q8KV4_BLOCK_SCALE_SHIFT"
+#endif
+
 namespace cutlass::fmha::collective {
+
+// f16x2 {2^-shift, 2^-shift}: the block-scale staging factor (see Traits::kBlockScaleShift).
+constexpr uint32_t kBlockScaleMultF16x2 =
+    ((15u - MINIMAX_MSA_Q8KV4_BLOCK_SCALE_SHIFT) << 10) * 0x00010001u;
+
+#if MINIMAX_MSA_Q8KV4_BLOCK_SCALE_SHIFT != 0
+#if MINIMAX_MSA_Q8KV4_HAS_QMUL4
+// Four E4M3 block scales divided by 2^shift: exact through f16, rounded back to E4M3 (scales
+// below 2^(shift - 6) become subnormal, below 2^(shift - 10) zero).
+CUTLASS_DEVICE
+uint32_t stage_e4m3x4_block_scales(uint32_t scale_e4m3x4) {
+  uint32_t staged;
+  asm("{\n"
+      ".reg .b16 lo, hi, staged_lo, staged_hi;\n"
+      ".reg .b32 f16_lo, f16_hi;\n"
+      "mov.b32 {lo, hi}, %1;\n"
+      "cvt.rn.f16x2.e4m3x2 f16_lo, lo;\n"
+      "cvt.rn.f16x2.e4m3x2 f16_hi, hi;\n"
+      "mul.rn.f16x2 f16_lo, f16_lo, %2;\n"
+      "mul.rn.f16x2 f16_hi, f16_hi, %2;\n"
+      "cvt.rn.satfinite.e4m3x2.f16x2 staged_lo, f16_lo;\n"
+      "cvt.rn.satfinite.e4m3x2.f16x2 staged_hi, f16_hi;\n"
+      "mov.b32 %0, {staged_lo, staged_hi};\n"
+      "}\n"
+      : "=r"(staged)
+      : "r"(scale_e4m3x4), "r"(kBlockScaleMultF16x2));
+  return staged;
+}
+#else
+CUTLASS_DEVICE
+uint32_t mul_f16x2(uint32_t a, uint32_t b) {
+  uint32_t product;
+  asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(product) : "r"(a), "r"(b));
+  return product;
+}
+#endif
+#endif
 
 CUTLASS_DEVICE
 float2 make_f32x2(float x, float y) {
@@ -204,6 +245,9 @@ void convert_e2m1x8_token_pair_to_e4m3x8(uint32_t &dst_a_lo, uint32_t &dst_a_hi,
                ".reg .b32 fa0, fa1, fa2, fa3, fb0, fb1, fb2, fb3;\n"
                ".reg .b16 ea0, ea1, ea2, ea3, eb0, eb1, eb2, eb3;\n"
                "cvt.rn.f16x2.e4m3x2 scale_f16x2, %6;\n"
+#if MINIMAX_MSA_Q8KV4_BLOCK_SCALE_SHIFT != 0
+               "mul.rn.f16x2 scale_f16x2, scale_f16x2, %7;\n"
+#endif
                "mov.b32 {scale_ha, scale_hb}, scale_f16x2;\n"
                "mov.b32 scale_f16_a, {scale_ha, scale_ha};\n"
                "mov.b32 scale_f16_b, {scale_hb, scale_hb};\n"
@@ -239,7 +283,7 @@ void convert_e2m1x8_token_pair_to_e4m3x8(uint32_t &dst_a_lo, uint32_t &dst_a_hi,
                "mov.b32 %3, {eb2, eb3};\n"
                "}\n"
                : "=&r"(dst_a_lo), "=&r"(dst_a_hi), "=&r"(dst_b_lo), "=&r"(dst_b_hi)
-               : "r"(fp4x8_a), "r"(fp4x8_b), "h"(scale_e4m3x2));
+               : "r"(fp4x8_a), "r"(fp4x8_b), "h"(scale_e4m3x2), "r"(kBlockScaleMultF16x2));
 }
 #endif
 

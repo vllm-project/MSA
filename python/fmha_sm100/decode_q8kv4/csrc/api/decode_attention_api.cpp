@@ -313,12 +313,12 @@ public:
     reduction_fn_cache_[device] = fn;
     return fn;
   }
-  tvm::ffi::Function get_fmha_fwd_sparse_variant(int topk, bool split_kv, int device,
-                                                 int gqa_ratio) {
+  tvm::ffi::Function get_fmha_fwd_sparse_variant(int topk, bool split_kv, int device, int gqa_ratio,
+                                                 int block_scale_shift) {
     uint64_t const split_key = split_kv ? 1 : 0;
-    uint64_t const key = (static_cast<uint64_t>(device) << 33) |
-                         (static_cast<uint64_t>(gqa_ratio) << 17) |
-                         (static_cast<uint64_t>(topk) << 1) | split_key;
+    uint64_t const key =
+        (static_cast<uint64_t>(device) << 33) | (static_cast<uint64_t>(block_scale_shift) << 25) |
+        (static_cast<uint64_t>(gqa_ratio) << 17) | (static_cast<uint64_t>(topk) << 1) | split_key;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       auto it = fmha_fwd_sparse_variant_cache_.find(key);
@@ -327,7 +327,8 @@ public:
     }
     auto jit_fn = tvm::ffi::Function::GetGlobalRequired(
         "fmha_sm100.decode_q8kv4.jit_get_fmha_fwd_sparse_variant");
-    auto fn = jit_fn((int64_t)topk, split_kv, (int64_t)device, (int64_t)gqa_ratio)
+    auto fn = jit_fn((int64_t)topk, split_kv, (int64_t)device, (int64_t)gqa_ratio,
+                     (int64_t)block_scale_shift)
                   .cast<tvm::ffi::Function>();
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -580,7 +581,8 @@ PlanInfo _make_decode_plan_impl(at::Tensor qo_segment_lens, at::Tensor kv_segmen
 at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &plan,
                             at::Tensor seq_lens, at::Tensor kv_indices, at::Tensor kv_indptr,
                             at::Tensor topk_indices, at::Tensor k_scale, at::Tensor v_scale,
-                            at::Tensor out, float sm_scale) {
+                            at::Tensor out, float sm_scale, at::Tensor k_global_scale,
+                            at::Tensor v_global_scale, int block_scale_shift) {
   c10::cuda::CUDAGuard device_guard(q.device());
   int device = q.get_device();
   int64_t nnz_qo = q.size(0);
@@ -602,6 +604,13 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
   TORCH_CHECK(kv_indptr.is_cuda() && kv_indptr.scalar_type() == at::kInt && kv_indptr.dim() == 1 &&
                   kv_indptr.size(0) == batch_size + 1,
               "kv_indptr must be a CUDA int32 tensor with shape [batch + 1]");
+  for (auto const *scale : {&k_global_scale, &v_global_scale}) {
+    TORCH_CHECK(scale->is_cuda() && scale->scalar_type() == at::kFloat && scale->numel() == 1,
+                "k_global_scale and v_global_scale must be one-element CUDA float32 tensors");
+  }
+  TORCH_CHECK(block_scale_shift >= 0 && block_scale_shift <= kMaxBlockScaleShift,
+              "block_scale_shift must be in [0, ", kMaxBlockScaleShift, "]");
+  float const stage_gain = static_cast<float>(1 << block_scale_shift);
 
   int pack_factor = plan.pack_factor;
   int orig_num_qo_heads = plan.orig_num_qo_heads > 0 ? plan.orig_num_qo_heads : num_qo_heads;
@@ -636,9 +645,9 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
         in_kernel_split_kv ? tvm::ffi::Tensor(nullptr) : tensor_or_null(plan.num_kv_splits_per_row),
         (int64_t)qo_tile_size, torch_to_tvm(kv_indices), torch_to_tvm(kv_indptr),
         torch_to_tvm(topk_indices), torch_to_tvm(k_scale), torch_to_tvm(v_scale),
-        (int64_t)pack_factor, (int64_t)plan.q_tokens_per_batch, plan.qo_len_uniform,
-        tensor_or_null(plan.kv_split_count), tensor_or_null(plan.merge_counter),
-        plan.merge_item_base, stream_int);
+        torch_to_tvm(k_global_scale), torch_to_tvm(v_global_scale), (int64_t)pack_factor,
+        (int64_t)plan.q_tokens_per_batch, plan.qo_len_uniform, tensor_or_null(plan.kv_split_count),
+        tensor_or_null(plan.merge_counter), plan.merge_item_base, stream_int);
   };
 
   int fmha_fwd_runtime_topk = static_cast<int>(topk_indices.size(2));
@@ -674,8 +683,8 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
   bool fmha_fwd_in_kernel_split = false;
 
   if (fmha_fwd_sparse_candidate) {
-    auto variant_fn =
-        mgr.get_fmha_fwd_sparse_variant(fmha_fwd_runtime_topk, use_split_kv, device, pack_factor);
+    auto variant_fn = mgr.get_fmha_fwd_sparse_variant(fmha_fwd_runtime_topk, use_split_kv, device,
+                                                      pack_factor, block_scale_shift);
     call_fmha_variant(variant_fn, fmha_fwd_run_kv_splits, fmha_fwd_in_kernel_split);
   } else {
     TORCH_CHECK(false, "input does not match the Q8KV4 sparse decode domain: ", "sparse_candidate=",
@@ -689,16 +698,19 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
   // Split-KV reduction (separate launch); the balanced schedule merges in the kernel.
   if (use_split_kv && !in_kernel_merge) {
     float log2_e = std::log2(std::exp(1.0f));
-    float scale_softmax_log2 = sm_scale * log2_e;
+    // Same host folds as the kernel params (see FMHACutlassSM100ParamsBuilder::build); the
+    // reduction multiplies the global scales in on the device.
+    float scale_softmax_log2 = sm_scale * log2_e * stage_gain;
 
     auto reduction_fn = mgr.get_reduction_fn(device);
-    reduction_fn(
-        torch_to_tvm(plan.workspace_o), torch_to_tvm(out), torch_to_tvm(plan.workspace_lse),
-        torch_to_tvm(plan.num_kv_splits_per_row), (double)scale_softmax_log2, 1.0,
-        (int64_t)plan.num_kv_splits, (int64_t)qo_total_len, (int64_t)num_qo_heads,
-        (int64_t)head_dim_vo, (int64_t)(num_qo_heads * head_dim_vo), (int64_t)head_dim_vo,
-        (int64_t)(num_qo_heads * head_dim_vo), (int64_t)head_dim_vo, (int64_t)orig_num_qo_heads,
-        (int64_t)num_kv_heads, (int64_t)pack_factor, stream_int);
+    reduction_fn(torch_to_tvm(plan.workspace_o), torch_to_tvm(out),
+                 torch_to_tvm(plan.workspace_lse), torch_to_tvm(plan.num_kv_splits_per_row),
+                 (double)scale_softmax_log2, (double)stage_gain, torch_to_tvm(k_global_scale),
+                 torch_to_tvm(v_global_scale), (int64_t)plan.num_kv_splits, (int64_t)qo_total_len,
+                 (int64_t)num_qo_heads, (int64_t)head_dim_vo, (int64_t)(num_qo_heads * head_dim_vo),
+                 (int64_t)head_dim_vo, (int64_t)(num_qo_heads * head_dim_vo), (int64_t)head_dim_vo,
+                 (int64_t)orig_num_qo_heads, (int64_t)num_kv_heads, (int64_t)pack_factor,
+                 stream_int);
   }
 
   return out;
@@ -723,10 +735,12 @@ std::unique_ptr<PlanInfo> make_decode_plan(at::Tensor qo_segment_lens, at::Tenso
 at::Tensor run_decode(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &plan_info,
                       at::Tensor seq_lens, at::Tensor kv_indices, at::Tensor kv_indptr,
                       at::Tensor topk_indices, at::Tensor k_scale, at::Tensor v_scale,
-                      at::Tensor out, float sm_scale) {
+                      at::Tensor out, float sm_scale, at::Tensor k_global_scale,
+                      at::Tensor v_global_scale, int block_scale_shift) {
   ensure_initialized();
   return _run_decode_impl(q, k, v, plan_info, seq_lens, kv_indices, kv_indptr, topk_indices,
-                          k_scale, v_scale, out, sm_scale);
+                          k_scale, v_scale, out, sm_scale, k_global_scale, v_global_scale,
+                          block_scale_shift);
 }
 
 } // namespace fmha_sm100::decode_q8kv4

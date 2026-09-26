@@ -44,6 +44,9 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
     uint32_t merge_stage_phase = 0;
     bool grid_dependency_synchronized = false;
     typename KvTransform::VState sparse_v_state;
+    // Host scales x global scales, read once per CTA after the grid dependency.
+    float scale_log2 = 0.f;
+    float output_scale = 0.f;
   };
 
   struct StatsFragment {
@@ -486,7 +489,7 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
                                                     int kv_head_idx, int q_token_idx,
                                                     int kv_split_idx, StatsFragment const &stats,
                                                     ScaleFragment const &total_sum,
-                                                    int warp_group_lane) {
+                                                    int warp_group_lane, float scale_log2) {
     if ((params.workspace_lse_ptr == nullptr && params.merge_counter_ptr == nullptr) ||
         warp_group_lane >= 4) {
       return;
@@ -505,9 +508,9 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
       int const row = packed_base + local_row;
       if (row < params.total_qo_len && kv_head_idx < params.num_qo_heads) {
         float const row_sum = total_sum[i];
-        float const lse = row_sum == 0.f ? -INFINITY
-                                         : stats[i + kColumnsPerThread] +
-                                               __log2f(row_sum) / params.scale_softmax_log2;
+        float const lse = row_sum == 0.f
+                              ? -INFINITY
+                              : stats[i + kColumnsPerThread] + __log2f(row_sum) / scale_log2;
         if (slot_lse != nullptr) {
           slot_lse[local_row] = lse;
         } else {
@@ -591,7 +594,8 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
   // one slot's exp2 chain with the next slot's vector work.
   CUTLASS_DEVICE static void merge_fetch_fold_store(Storage &storage, Params const &params,
                                                     MergeItem const &item, int thread_idx,
-                                                    uint64_t *stage_full, uint32_t &stage_phase) {
+                                                    uint64_t *stage_full, uint32_t &stage_phase,
+                                                    float scale_log2, float output_scale) {
     static_assert(Traits::kHeadDim == 128 && (Traits::kHeadGroup == 8 || Traits::kHeadGroup == 16),
                   "in-kernel split merge is specialized for 16 rows of 128 elements.");
     constexpr int kThreads = cutlass::NumThreadsPerWarp * Traits::kNumCorrectionWarps;
@@ -606,7 +610,6 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
     int const kv_split_count = item.kv_split_count;
     int const row = thread_idx / kThreadsPerRow;
     int const col_base = (thread_idx % kThreadsPerRow) * kElementsPerThread;
-    float const scale_log2 = params.scale_softmax_log2;
     auto &stage = storage.smem_merge_stage;
 
     // One bulk copy per slot, issued by lane 0 of each participating warp (the copy is a uniform
@@ -728,7 +731,7 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
           packed[i] = 0u;
         }
       } else {
-        float const inv_w = 1.f / running_w;
+        float const inv_w = output_scale / running_w;
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < kPassElements / 2; ++i) {
           cutlass::bfloat16_t const lo(running_o[2 * i] * inv_w);
@@ -762,7 +765,7 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
     }
     merge_fetch_fold_store(storage, params, item, warp_group_lane,
                            storage.pipelines.ptr(Barriers::kMergeStageFullArv1),
-                           state.merge_stage_phase);
+                           state.merge_stage_phase, state.scale_log2, state.output_scale);
   }
 
   CUTLASS_DEVICE void run_tile(Storage &storage, Params const &params, int batch_idx,
@@ -777,6 +780,14 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
         make_kv_tile_range(full_tiles, kv_tile_begin, kv_tile_end);
     int const tiles = tile_range.count;
     int const warp_group_lane = warp_group_warp_idx * cutlass::NumThreadsPerWarp + lane_idx;
+    if (!state.grid_dependency_synchronized) {
+      cudaGridDependencySynchronize();
+      state.grid_dependency_synchronized = true;
+      // Once per CTA, after the grid dependency: the global scales may be produced by the
+      // preceding kernel in the stream. Empty segments merge and store too, so this comes first.
+      state.scale_log2 = params.scale_softmax_log2 * __ldg(params.k_global_scale_ptr);
+      state.output_scale = params.scale_output * __ldg(params.v_global_scale_ptr);
+    }
     // Balanced schedule (arrival counters present): items cut into several segments merge in
     // the kernel; items that stayed whole store directly and never touch the workspace.
     bool const balanced_schedule =
@@ -811,7 +822,7 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
         StatsFragment stats{};
         ScaleFragment total_sum{};
         store_lse_to_workspace(params, batch_idx, kv_head_idx, q_token_idx, kv_split_idx, stats,
-                               total_sum, warp_group_lane);
+                               total_sum, warp_group_lane, state.scale_log2);
       } else {
         OFragment zero{};
         ScaleFragment scale{};
@@ -823,13 +834,11 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
 
     uint32_t volatile *tmem_state = storage.tmem_state_ptr();
     uint32_t const tmem_base = tmem_state[0];
-    if (!state.grid_dependency_synchronized) {
-      cudaGridDependencySynchronize();
-      state.grid_dependency_synchronized = true;
-    }
+    // Partials for the separate reduction stay unscaled; whole items apply the output scale and
+    // the V global scale here.
     float const output_scale = use_workspace_split(params) && !direct_store
                                    ? params.scale_output_split
-                                   : params.scale_output;
+                                   : state.output_scale;
 
     {
       KvTransform{}.transform_sparse_v_event(storage, lane_idx, warp_group_warp_idx,
@@ -871,7 +880,7 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
     }
     if (use_workspace_split(params) && !direct_store) {
       store_lse_to_workspace(params, batch_idx, kv_head_idx, q_token_idx, kv_split_idx, stats,
-                             total_sum, warp_group_lane);
+                             total_sum, warp_group_lane, state.scale_log2);
     }
     store_o_to_global(storage, params, batch_idx, kv_head_idx, q_token_idx, kv_split_idx, regs_o,
                       final_scale, warp_group_lane, direct_store);

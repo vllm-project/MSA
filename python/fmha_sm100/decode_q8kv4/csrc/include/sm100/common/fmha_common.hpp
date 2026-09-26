@@ -61,6 +61,8 @@ template <class Traits> struct Sm100FmhaFwdKernelParams {
   void const *v_ptr = nullptr;
   void const *k_scale_ptr = nullptr;
   void const *v_scale_ptr = nullptr;
+  float const *k_global_scale_ptr = nullptr;
+  float const *v_global_scale_ptr = nullptr;
   void *o_ptr = nullptr;
   void *workspace_o_ptr = nullptr;
   float *workspace_lse_ptr = nullptr;
@@ -486,6 +488,8 @@ template <class Traits> struct FMHACutlassSM100ParamsBuilder {
     dst.v_ptr = src.v_ptr;
     dst.k_scale_ptr = src.k_scale_ptr;
     dst.v_scale_ptr = src.v_scale_ptr;
+    dst.k_global_scale_ptr = src.k_global_scale_ptr;
+    dst.v_global_scale_ptr = src.v_global_scale_ptr;
     dst.o_ptr = src.o_direct_ptr != nullptr ? src.o_direct_ptr : src.o_ptr;
     dst.workspace_o_ptr = src.workspace_o_ptr;
     dst.workspace_lse_ptr = src.workspace_lse_ptr;
@@ -519,13 +523,18 @@ template <class Traits> struct FMHACutlassSM100ParamsBuilder {
     dst.kv_block_num = src.kv_block_num;
     dst.num_ctas = src.num_ctas;
     dst.num_kv_splits = src.num_kv_splits;
-    dst.scale_softmax = src.sm_scale;
+    // The dequant divides every block scale by 2^kBlockScaleShift; the scores and the output
+    // carry the factor back. The global scales multiply in on the device.
+    float const stage_gain = static_cast<float>(1 << Traits::kBlockScaleShift);
+    dst.scale_softmax = src.sm_scale * stage_gain;
     dst.scale_q = 1.0f;
     dst.scale_k = 1.0f;
     dst.scale_v = 1.0f;
     dst.scale_o = 1.0f;
-    dst.scale_softmax_log2 = src.sm_scale * 1.4426950408889634f;
-    dst.scale_output = 1.0f;
+    dst.scale_softmax_log2 = src.sm_scale * 1.4426950408889634f * stage_gain;
+    dst.scale_output = stage_gain;
+    // Split partials stay in the staged domain; the separate reduction and the in-kernel merge
+    // apply the output scale and the V global scale once at the final store.
     dst.scale_output_split = 1.0f;
     dst.scheduler = Sm100FmhaScheduler<Traits>::to_underlying_arguments(
         dst.q_tokens_per_batch, dst.num_kv_heads, dst.batch_size, cutlass::KernelHardwareInfo{});

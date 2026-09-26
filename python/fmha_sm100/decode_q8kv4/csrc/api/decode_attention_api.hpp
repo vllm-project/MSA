@@ -21,6 +21,9 @@ namespace fmha_sm100::decode_q8kv4 {
 // Widest TopK list the kernel accepts; the JIT instantiates the kernel with the same bound
 // (jit.MAX_TOPK) and its per-item tail mask holds one bit per page.
 constexpr int kMaxSparseTopK = 64;
+// Largest block-scale staging shift (an E4M3 exponent offset); the JIT compiles one kernel per
+// shift, see Traits::kBlockScaleShift.
+constexpr int kMaxBlockScaleShift = 7;
 
 struct PlanData {
   at::Tensor packed_work_range, packed_work_info;
@@ -63,7 +66,8 @@ PlanInfo _make_decode_plan_impl(at::Tensor qo_segment_lens, at::Tensor kv_segmen
 at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &plan_info,
                             at::Tensor seq_lens, at::Tensor kv_indices, at::Tensor kv_indptr,
                             at::Tensor topk_indices, at::Tensor k_scale, at::Tensor v_scale,
-                            at::Tensor out, float sm_scale);
+                            at::Tensor out, float sm_scale, at::Tensor k_global_scale,
+                            at::Tensor v_global_scale, int block_scale_shift);
 
 std::unique_ptr<PlanInfo> make_decode_plan(at::Tensor qo_segment_lens, at::Tensor kv_segment_lens,
                                            int num_qo_heads, int num_kv_heads, int num_kv_splits,
@@ -76,9 +80,14 @@ std::unique_ptr<PlanInfo> make_decode_plan(at::Tensor qo_segment_lens, at::Tenso
 // uint8) are strided views: token rows contiguous, page and head strides free (multiples of 16
 // bytes), so packed pages holding all heads' data blocks followed by their scale blocks need no
 // copy. V scale blocks are in token-quad order, see FMHACutlassSM100Params.
+// k_global_scale / v_global_scale are one-element fp32 CUDA tensors read by the kernels (value =
+// code x block_scale x global_scale); block_scale_shift selects the kernel that divides the block
+// scales by 2^shift before the dequant product (0: products already fit E4M3; 3: block scales use
+// the full E4M3 range, the vLLM / TransformerEngine convention).
 at::Tensor run_decode(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &plan_info,
                       at::Tensor seq_lens, at::Tensor kv_indices, at::Tensor kv_indptr,
                       at::Tensor topk_indices, at::Tensor k_scale, at::Tensor v_scale,
-                      at::Tensor out, float sm_scale);
+                      at::Tensor out, float sm_scale, at::Tensor k_global_scale,
+                      at::Tensor v_global_scale, int block_scale_shift);
 
 } // namespace fmha_sm100::decode_q8kv4

@@ -64,6 +64,8 @@ struct Sm100FmhaReductionKernel {
     int num_qo_heads_orig = 0;
     int num_kv_heads = 0;
     int pack_factor = 1;
+    const float *k_global_scale_ptr = nullptr;
+    const float *v_global_scale_ptr = nullptr;
   };
 
   static dim3 get_grid_shape(Params const& params) {
@@ -76,6 +78,10 @@ struct Sm100FmhaReductionKernel {
     int head_idx = blockIdx.x;
     int abs_row = blockIdx.y;
     int d = threadIdx.x;
+    // Same folds as the attention kernel: K global scale into the LSE domain, V global scale and
+    // the staging gain into the output.
+    float const scale_softmax_log2 = params.scale_softmax_log2 * *params.k_global_scale_ptr;
+    float const inv_scale_o = params.inv_scale_o * *params.v_global_scale_ptr;
 
     if (abs_row >= params.total_qo_len || d >= params.head_dim_vo) return;
 
@@ -115,7 +121,7 @@ struct Sm100FmhaReductionKernel {
         o_ptr_used[dst_off] = ElementOut(0.f);
       } else {
         float o_s = static_cast<float>(params.ptr_O_partial[partial_off]);
-        o_ptr_used[dst_off] = ElementOut(o_s * params.inv_scale_o);
+        o_ptr_used[dst_off] = ElementOut(o_s * inv_scale_o);
       }
       return;
     }
@@ -150,12 +156,12 @@ struct Sm100FmhaReductionKernel {
       o_s = (lse_s != -INFINITY) ? o_s : 0.f;
 
       if (lse_s > running_lse) {
-        float rescale = exp2f(params.scale_softmax_log2 * (running_lse - lse_s));
+        float rescale = exp2f(scale_softmax_log2 * (running_lse - lse_s));
         running_o = fmaf(running_o, rescale, o_s);
         running_w = fmaf(running_w, rescale, 1.f);
         running_lse = lse_s;
       } else {
-        float rescale = exp2f(params.scale_softmax_log2 * (lse_s - running_lse));
+        float rescale = exp2f(scale_softmax_log2 * (lse_s - running_lse));
         running_o = fmaf(o_s, rescale, running_o);
         running_w += rescale;
       }
@@ -165,12 +171,12 @@ struct Sm100FmhaReductionKernel {
     if (num_splits > 0) {
       float o_last = (lse_cur != -INFINITY) ? o_s_cur : 0.f;
       if (lse_cur > running_lse) {
-        float rescale = exp2f(params.scale_softmax_log2 * (running_lse - lse_cur));
+        float rescale = exp2f(scale_softmax_log2 * (running_lse - lse_cur));
         running_o = fmaf(running_o, rescale, o_last);
         running_w = fmaf(running_w, rescale, 1.f);
         running_lse = lse_cur;
       } else {
-        float rescale = exp2f(params.scale_softmax_log2 * (lse_cur - running_lse));
+        float rescale = exp2f(scale_softmax_log2 * (lse_cur - running_lse));
         running_o = fmaf(o_last, rescale, running_o);
         running_w += rescale;
       }
@@ -182,7 +188,7 @@ struct Sm100FmhaReductionKernel {
     }
 
     float inv_w = warp_uniform(1.f / running_w);
-    o_ptr_used[dst_off] = ElementOut(running_o * inv_w * params.inv_scale_o);
+    o_ptr_used[dst_off] = ElementOut(running_o * inv_w * inv_scale_o);
   }
 };
 
@@ -198,26 +204,22 @@ __global__ void fmha_reduction_kernel(
 }
 
 template <typename ElementPartial, typename ElementOut>
-cudaError_t launch_fmha_reduction(
-    const ElementPartial* ptr_O_partial, ElementOut* ptr_O,
-    const float* ptr_lse,
-    const int* num_kv_splits_per_row,
-    float scale_softmax_log2, float inv_scale_o,
-    int num_kv_splits, int total_qo_len, int num_qo_heads, int head_dim_vo,
-    int stride_o_n, int stride_o_h, int stride_partial_n, int stride_partial_h,
-    ElementOut* ptr_O_direct, int num_qo_heads_orig,
-    int num_kv_heads, int pack_factor,
-    cudaStream_t stream) {
+cudaError_t
+launch_fmha_reduction(const ElementPartial *ptr_O_partial, ElementOut *ptr_O, const float *ptr_lse,
+                      const int *num_kv_splits_per_row, float scale_softmax_log2, float inv_scale_o,
+                      const float *k_global_scale, const float *v_global_scale, int num_kv_splits,
+                      int total_qo_len, int num_qo_heads, int head_dim_vo, int stride_o_n,
+                      int stride_o_h, int stride_partial_n, int stride_partial_h,
+                      ElementOut *ptr_O_direct, int num_qo_heads_orig, int num_kv_heads,
+                      int pack_factor, cudaStream_t stream) {
   if (total_qo_len <= 0) return cudaSuccess;
   using ReductionKernel =
       cutlass::fmha::kernel::Sm100FmhaReductionKernel<ElementPartial, ElementOut>;
   typename ReductionKernel::Params params{
-      ptr_O_partial, ptr_O, ptr_lse,
-      num_kv_splits_per_row,
-      scale_softmax_log2, inv_scale_o,
-      num_kv_splits, total_qo_len, num_qo_heads, head_dim_vo,
-      stride_o_n, stride_o_h, stride_partial_n, stride_partial_h,
-      ptr_O_direct, num_qo_heads_orig, num_kv_heads, pack_factor};
+      ptr_O_partial,     ptr_O,         ptr_lse,          num_kv_splits_per_row, scale_softmax_log2,
+      inv_scale_o,       num_kv_splits, total_qo_len,     num_qo_heads,          head_dim_vo,
+      stride_o_n,        stride_o_h,    stride_partial_n, stride_partial_h,      ptr_O_direct,
+      num_qo_heads_orig, num_kv_heads,  pack_factor,      k_global_scale,        v_global_scale};
   dim3 grid = ReductionKernel::get_grid_shape(params);
   dim3 block = ReductionKernel::get_block_shape();
   fmha_reduction_kernel<ElementPartial, ElementOut><<<grid, block, 0, stream>>>(params);

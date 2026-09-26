@@ -40,6 +40,9 @@ _SPARSE_VARIANTS = {
 # Widest TopK list one kernel binary accepts (kernel template bound and host-API constant
 # kMaxSparseTopK); the list width itself is a runtime argument.
 MAX_TOPK = 64
+# Largest block-scale staging shift (an E4M3 exponent offset, Traits::kBlockScaleShift); each
+# shift is its own kernel binary so caches whose products already fit pay nothing.
+MAX_BLOCK_SCALE_SHIFT = 7
 _QMUL4_DEQUANT = "qmul4"
 _FP16_DEQUANT = "fp16_fallback"
 _QMUL4_PROBE_SOURCE = r"""
@@ -215,7 +218,9 @@ def _cache_dir(component: str, arch: str, dequant_mode: str) -> Path:
     return _cache_root() / f"{component}_{dequant_mode}_{arch}_{_source_digest()}"
 
 
-def _nvcc_flags(cache_dir: Path, dequant_mode: str, arch: str) -> str:
+def _nvcc_flags(
+    cache_dir: Path, dequant_mode: str, arch: str, block_scale_shift: int = 0
+) -> str:
     include_dirs = [
         _SM100_INCLUDE,
         _SM100_INCLUDE / "common",
@@ -250,6 +255,7 @@ def _nvcc_flags(cache_dir: Path, dequant_mode: str, arch: str) -> str:
         "-DNDEBUG",
         f"-DMINIMAX_MSA_Q8KV4_HAS_QMUL4={int(dequant_mode == _QMUL4_DEQUANT)}",
         f"-DMINIMAX_MSA_Q8KV4_RAW_KV_STAGES={12 if arch == '107a' else 8}",
+        f"-DMINIMAX_MSA_Q8KV4_BLOCK_SCALE_SHIFT={block_scale_shift}",
         "-Xptxas",
         "-O3",
         "-Xcompiler",
@@ -282,6 +288,7 @@ def _write_ninja(
     sources: list[Path],
     dequant_mode: str,
     arch: str,
+    block_scale_shift: int = 0,
 ) -> None:
     nvcc = _cuda_home() / "bin/nvcc"
     objects = [cache_dir / f"source_{index}.o" for index in range(len(sources))]
@@ -292,7 +299,7 @@ def _write_ninja(
     content = f"""ninja_required_version = 1.5
 
 nvcc = {nvcc}
-nvcc_flags = {_nvcc_flags(cache_dir, dequant_mode, arch)}
+nvcc_flags = {_nvcc_flags(cache_dir, dequant_mode, arch, block_scale_shift)}
 
 rule nvcc_compile
   command = $nvcc $nvcc_flags -MMD -MF $out.d -c $in -o $out
@@ -319,20 +326,20 @@ class JitSpec:
     dequant_mode: str
     target_arch: str
     gqa_ratio: int = 16
+    block_scale_shift: int = 0
+
+    @property
+    def _component(self) -> str:
+        return f"{self.variant_name}_gqa{self.gqa_ratio}_shift{self.block_scale_shift}"
 
     @property
     def uri(self) -> str:
         return (
-            f"{self.variant_name}_gqa{self.gqa_ratio}_{self.dequant_mode}_"
-            f"{self.target_arch}_{_source_digest()}"
+            f"{self._component}_{self.dequant_mode}_{self.target_arch}_{_source_digest()}"
         )
 
     def build_and_load(self):
-        cache_dir = _cache_dir(
-            f"{self.variant_name}_gqa{self.gqa_ratio}",
-            self.target_arch,
-            self.dequant_mode,
-        )
+        cache_dir = _cache_dir(self._component, self.target_arch, self.dequant_mode)
         with _build_lock(cache_dir):
             return self._build_and_load_locked(cache_dir)
 
@@ -368,6 +375,7 @@ class JitSpec:
             [inst_cu, run_cu],
             self.dequant_mode,
             self.target_arch,
+            self.block_scale_shift,
         )
         _run_ninja(cache_dir, f"{self.variant_name} JIT module")
 
@@ -389,11 +397,16 @@ def gen_jit_spec(
     split_kv: bool = False,
     gqa_ratio: int = 16,
     device=None,
+    block_scale_shift: int = 0,
 ) -> JitSpec:
     if not 1 <= int(topk) <= MAX_TOPK:
         raise ValueError(f"Q8KV4 decode attention requires 1 <= TopK <= {MAX_TOPK}, got {topk}")
     if gqa_ratio not in (8, 16):
         raise ValueError("Q8KV4 decode attention requires GQA ratio 8 or 16")
+    if not 0 <= int(block_scale_shift) <= MAX_BLOCK_SCALE_SHIFT:
+        raise ValueError(
+            f"block_scale_shift must be in [0, {MAX_BLOCK_SCALE_SHIFT}], got {block_scale_shift}"
+        )
     arch = _validate_gqa_arch(gqa_ratio, device)
     return JitSpec(
         _SPARSE_VARIANTS[bool(split_kv)],
@@ -401,6 +414,7 @@ def gen_jit_spec(
         _dequant_mode(arch),
         arch,
         gqa_ratio,
+        int(block_scale_shift),
     )
 
 
@@ -418,10 +432,20 @@ class _VariantManager:
         self._lock = threading.Lock()
 
     def get(
-        self, *, topk: int, split_kv: bool, gqa_ratio: int = 16, device=None
+        self,
+        *,
+        topk: int,
+        split_kv: bool,
+        gqa_ratio: int = 16,
+        device=None,
+        block_scale_shift: int = 0,
     ) -> _VariantWrapper:
         spec = gen_jit_spec(
-            topk=topk, split_kv=split_kv, gqa_ratio=gqa_ratio, device=device
+            topk=topk,
+            split_kv=split_kv,
+            gqa_ratio=gqa_ratio,
+            device=device,
+            block_scale_shift=block_scale_shift,
         )
         cached = self._loaded.get(spec.uri)
         if cached is not None:
@@ -445,9 +469,14 @@ def get_fmha_fwd_variant(
     split_kv: bool = False,
     gqa_ratio: int = 16,
     device=None,
+    block_scale_shift: int = 0,
 ):
     return _variant_manager.get(
-        topk=topk, split_kv=split_kv, gqa_ratio=gqa_ratio, device=device
+        topk=topk,
+        split_kv=split_kv,
+        gqa_ratio=gqa_ratio,
+        device=device,
+        block_scale_shift=block_scale_shift,
     )
 
 
@@ -514,6 +543,7 @@ def _clear_loaded_extensions() -> None:
 
 
 __all__ = [
+    "MAX_BLOCK_SCALE_SHIFT",
     "MAX_TOPK",
     "JitSpec",
     "gen_jit_spec",

@@ -193,6 +193,39 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
     fence_tmem_store();
   }
 
+#if MINIMAX_MSA_Q8KV4_HAS_QMUL4 && MINIMAX_MSA_Q8KV4_BLOCK_SCALE_SHIFT != 0
+  // Block-scale staging on the QMUL4 path: the converters multiply the raw E4M3 scale words, so
+  // the stage's 1 KB scale block is shifted in place once, 128 threads x 8 consecutive bytes
+  // (conflict-free), before the converters read it.
+  CUTLASS_DEVICE static void stage_scale_words(uint8_t *smem_stage_base, int lane_idx,
+                                               int warp_group_warp_idx) {
+    static_assert(Traits::kRawKvScaleBytesPerStage == 128 * sizeof(uint2),
+                  "one 8-byte word pair per transform thread.");
+    uint2 *words = reinterpret_cast<uint2 *>(smem_stage_base + Traits::kRawKvDataBytesPerStage);
+    int const thread = warp_group_warp_idx * cutlass::NumThreadsPerWarp + lane_idx;
+    uint2 pair = words[thread];
+    pair.x = stage_e4m3x4_block_scales(pair.x);
+    pair.y = stage_e4m3x4_block_scales(pair.y);
+    words[thread] = pair;
+  }
+
+  // K: thread t shifts token row t, and transform_k_stage's warp w reads only rows w * 32 ..
+  // w * 32 + 31, so a warp-level sync orders the stores before its own loads.
+  CUTLASS_DEVICE static void stage_k_scales(uint8_t *smem_stage_base, int lane_idx,
+                                            int warp_group_warp_idx) {
+    stage_scale_words(smem_stage_base, lane_idx, warp_group_warp_idx);
+    __syncwarp();
+  }
+
+  // V: transform_v_stage's warp w reads group words 2w, 2w + 1 of every token quad, a 32 B column
+  // across the eight 128 B rows that the other warps' threads shifted, so the warpgroup syncs.
+  CUTLASS_DEVICE static void stage_v_scales(uint8_t *smem_stage_base, int lane_idx,
+                                            int warp_group_warp_idx, int barrier_id) {
+    stage_scale_words(smem_stage_base, lane_idx, warp_group_warp_idx);
+    Sm100FmhaNamedBarrier::sync(128, barrier_id);
+  }
+#endif
+
 #if !MINIMAX_MSA_Q8KV4_HAS_QMUL4
   // FP16 fallback: convert one raw stage's V scales to F16 pairs once, instead of in every V
   // iteration (Traits::kF16VScaleScratch sizes the scratch). The cache's token-quad order already
@@ -217,6 +250,12 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
     uint4 f16_chunk;
     convert_e4m3x4_scales_to_f16x2_pair(f16_chunk.x, f16_chunk.y, words.x);
     convert_e4m3x4_scales_to_f16x2_pair(f16_chunk.z, f16_chunk.w, words.y);
+#if MINIMAX_MSA_Q8KV4_BLOCK_SCALE_SHIFT != 0
+    f16_chunk.x = mul_f16x2(f16_chunk.x, kBlockScaleMultF16x2);
+    f16_chunk.y = mul_f16x2(f16_chunk.y, kBlockScaleMultF16x2);
+    f16_chunk.z = mul_f16x2(f16_chunk.z, kBlockScaleMultF16x2);
+    f16_chunk.w = mul_f16x2(f16_chunk.w, kBlockScaleMultF16x2);
+#endif
     int const scale_dst_offset = loop_offset * 256 + token_quad * 16 + scale_pair * 64;
     *reinterpret_cast<uint4 *>(scale_scratch_base + scale_dst_offset) = f16_chunk;
     Sm100FmhaNamedBarrier::sync(128, barrier_id);
@@ -284,6 +323,9 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
                            static_cast<uint32_t>(400 + raw_stage));
     Sm100FmhaBarrier::wait(transformed_empty_barrier(storage, transformed_stage),
                            transformed_empty_phase, static_cast<uint32_t>(420 + transformed_stage));
+#if MINIMAX_MSA_Q8KV4_HAS_QMUL4 && MINIMAX_MSA_Q8KV4_BLOCK_SCALE_SHIFT != 0
+    stage_k_scales(storage.smem_kv.stage_ptr(raw_stage), lane_idx, warp_group_warp_idx);
+#endif
 
     transform_k_stage(tmem_base, transformed_stage, lane_idx, warp_group_warp_idx,
                       storage.smem_kv.stage_ptr(raw_stage));
@@ -309,7 +351,12 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
                            transformed_empty_phase, static_cast<uint32_t>(460 + transformed_stage));
     Sm100FmhaBarrier::wait(kv_full_barrier(storage, raw_stage), raw_full_phase,
                            static_cast<uint32_t>(440 + raw_stage));
-#if !MINIMAX_MSA_Q8KV4_HAS_QMUL4
+#if MINIMAX_MSA_Q8KV4_HAS_QMUL4
+#if MINIMAX_MSA_Q8KV4_BLOCK_SCALE_SHIFT != 0
+    stage_v_scales(storage.smem_kv.stage_ptr(raw_stage), lane_idx, warp_group_warp_idx,
+                   scale_barrier_id);
+#endif
+#else
     prepare_v_scale_stage(lane_idx, warp_group_warp_idx, storage.smem_kv.stage_ptr(raw_stage),
                           scale_barrier_id);
 #endif

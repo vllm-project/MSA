@@ -19,6 +19,16 @@ template <int HeadGroup = 16> struct Sm100FmhaQ8Kv4BaseTraits {
   static constexpr int kPageSize = 128;
   static constexpr int kHeadGroup = HeadGroup;
   static constexpr int kScaleGroupSize = 16;
+#ifndef MINIMAX_MSA_Q8KV4_BLOCK_SCALE_SHIFT
+#error "The Q8KV4 JIT must define MINIMAX_MSA_Q8KV4_BLOCK_SCALE_SHIFT"
+#endif
+  // Block-scale staging: the dequant divides each E4M3 block scale by 2^kBlockScaleShift before
+  // forming code x scale, so caches whose block scales use the full E4M3 range (products up to
+  // 6 x 448) fit the E4M3 requant; the softmax and output scales fold the factor back. 0 for
+  // caches whose products already fit, 3 for the vLLM / TransformerEngine convention.
+  static constexpr int kBlockScaleShift = MINIMAX_MSA_Q8KV4_BLOCK_SCALE_SHIFT;
+  static_assert(kBlockScaleShift >= 0 && kBlockScaleShift <= 7,
+                "the block-scale shift is an E4M3 exponent offset.");
 
   static constexpr int kNumThreads = 512;
   static constexpr int kNumWarps = kNumThreads / cutlass::NumThreadsPerWarp;

@@ -16,6 +16,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 from ._build_utils import cuda_home
+from .jit import MAX_BLOCK_SCALE_SHIFT as _MAX_BLOCK_SCALE_SHIFT
 from .jit import MAX_TOPK as _MAX_TOPK
 
 __all__ = ["BatchDecodeWithPagedKVCacheWrapper", "interleave_v_scales"]
@@ -306,6 +307,9 @@ def _run_backend(
     v_scale: torch.Tensor,
     out: torch.Tensor,
     sm_scale: float,
+    k_global_scale: torch.Tensor,
+    v_global_scale: torch.Tensor,
+    block_scale_shift: int,
 ):
     return _get_cpp().run_decode(
         q,
@@ -320,6 +324,9 @@ def _run_backend(
         v_scale.view(torch.uint8),
         out,
         sm_scale,
+        k_global_scale,
+        v_global_scale,
+        block_scale_shift,
     )
 
 
@@ -336,6 +343,8 @@ class _PlanState:
     num_kv_heads: int
     sm_scale: float
     out: torch.Tensor
+    block_scale_shift: int
+    unit_scale: torch.Tensor  # fp32 1.0 used when run() gets no global scales
 
 
 class BatchDecodeWithPagedKVCacheWrapper:
@@ -357,6 +366,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         usable_sm_count: int | None = None,
         sm_scale: float | None = None,
         kv_indptr: torch.Tensor | None = None,
+        block_scale_shift: int = 0,
     ) -> None:
         """Prepare a reusable request plan outside CUDA Graph capture.
 
@@ -364,6 +374,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
         ``[batch, max_pages]`` table or as a flat ``[total_pages]`` list with ``kv_indptr``
         (``[batch + 1]`` int32) giving each request's first entry; a request must own at least
         one page. ``topk_indices`` hold logical page ids relative to the request.
+
+        ``block_scale_shift`` names the cache's block-scale convention: the kernel divides every
+        E4M3 block scale by ``2 ** block_scale_shift`` before forming ``code * scale`` and folds
+        the factor back into the scores and the output. Use 0 when ``code * scale`` already fits
+        E4M3 (products up to 448) and 3 when block scales use the full E4M3 range with a global
+        scale (products up to 6 * 448, the vLLM / TransformerEngine convention). Each value is a
+        separate compiled kernel.
         """
         for name, tensor in (
             ("topk_indices", topk_indices),
@@ -427,6 +444,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         scale = 1.0 / math.sqrt(_HEAD_DIM) if sm_scale is None else float(sm_scale)
         if not math.isfinite(scale) or scale <= 0.0:
             raise ValueError("sm_scale must be finite and positive")
+        block_scale_shift = int(block_scale_shift)
+        if not 0 <= block_scale_shift <= _MAX_BLOCK_SCALE_SHIFT:
+            raise ValueError(
+                f"block_scale_shift must be in [0, {_MAX_BLOCK_SCALE_SHIFT}]"
+            )
         from . import jit
 
         jit._validate_gqa_arch(num_q_heads // num_kv_heads, page_table.device)
@@ -456,6 +478,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 dtype=torch.bfloat16,
                 device=page_table.device,
             ),
+            block_scale_shift=block_scale_shift,
+            unit_scale=torch.ones(1, dtype=torch.float32, device=page_table.device),
         )
 
     def run(
@@ -464,6 +488,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         paged_kv_cache: tuple[torch.Tensor, torch.Tensor],
         *,
         kv_cache_sf: tuple[torch.Tensor, torch.Tensor],
+        kv_global_scale: tuple[torch.Tensor, torch.Tensor] | None = None,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run one layer using metadata and workspace prepared by :meth:`plan`.
@@ -472,6 +497,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         scales ``[physical_pages, Hkv, 128, 8]`` E4M3 views whose token rows are contiguous; page
         and head strides may be padded or interleave data and scales within a page. K scales are
         linear per token; V scales are in token-quad order (:func:`interleave_v_scales`).
+
+        ``kv_global_scale`` are the per-tensor fp32 global scales of K and V as one-element CUDA
+        tensors (``value = code * block_scale * global_scale``); omitted means 1.0. The kernels
+        read them on the device, so a captured graph follows later updates of the tensors.
         """
         state = self._plan_state
         if state is None:
@@ -482,6 +511,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
             raise ValueError("kv_cache_sf must be a (K scale, V scale) tuple")
         k_cache, v_cache = paged_kv_cache
         k_scale, v_scale = kv_cache_sf
+        if kv_global_scale is None:
+            k_global_scale = v_global_scale = state.unit_scale
+        else:
+            if not isinstance(kv_global_scale, tuple) or len(kv_global_scale) != 2:
+                raise ValueError("kv_global_scale must be a (K scale, V scale) tuple")
+            k_global_scale, v_global_scale = kv_global_scale
+            for name, tensor in (
+                ("k_global_scale", k_global_scale),
+                ("v_global_scale", v_global_scale),
+            ):
+                _check_cuda_contiguous(tensor, name=name)
+                if tensor.dtype != torch.float32 or tensor.numel() != 1:
+                    raise ValueError(f"{name} must be a one-element torch.float32 tensor")
         _check_cuda_contiguous(q, name="q", alignment=_DATA_ALIGNMENT)
         expected_q_shape = (
             state.batch_size * state.q_len_per_req,
@@ -518,6 +560,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ("v_cache", v_cache),
             ("k_scale", k_scale),
             ("v_scale", v_scale),
+            ("k_global_scale", k_global_scale),
+            ("v_global_scale", v_global_scale),
         ):
             _check_same_device(state.kv_indices, tensor, name=name)
 
@@ -541,4 +585,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             v_scale=v_scale,
             out=out_tensor,
             sm_scale=state.sm_scale,
+            k_global_scale=k_global_scale,
+            v_global_scale=v_global_scale,
+            block_scale_shift=state.block_scale_shift,
         )

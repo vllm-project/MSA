@@ -42,6 +42,7 @@ template <class Traits> struct Sm100FmhaSoftmaxTmaWarpspecialized {
     int o_event = 0;
     int selection_event = 0;
     bool grid_dependency_synchronized = false;
+    float scale_softmax_log2 = 0.f; // host scale x K global scale, read once per CTA
   };
 
   struct ScoreFragment {
@@ -515,8 +516,11 @@ template <class Traits> struct Sm100FmhaSoftmaxTmaWarpspecialized {
     if (!state.grid_dependency_synchronized) {
       cudaGridDependencySynchronize();
       state.grid_dependency_synchronized = true;
+      // Once per CTA, after the grid dependency: the global scale may be produced by the
+      // preceding kernel in the stream.
+      state.scale_softmax_log2 = params.scale_softmax_log2 * __ldg(params.k_global_scale_ptr);
     }
-    float const scale_softmax_log2 = params.scale_softmax_log2;
+    float const scale_softmax_log2 = state.scale_softmax_log2;
 
     // At most one tile holds the query's own page and carries a causal tail (the producer
     // resolved which); every other tile is fully visible.

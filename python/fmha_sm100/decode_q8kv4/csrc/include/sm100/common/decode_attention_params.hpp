@@ -72,6 +72,11 @@ struct FMHACutlassSM100Params {
   int k_scale_stride_h = 0;
   int v_scale_stride_n = 0;
   int v_scale_stride_h = 0;
+  // Per-tensor fp32 global scales, one element each: value = code x block_scale x global_scale.
+  // The kernel folds the K scale into the softmax scale and the V scale into the output scale and
+  // reads both on the device, so captured graphs follow updated scale tensors.
+  const float *k_global_scale_ptr = nullptr;
+  const float *v_global_scale_ptr = nullptr;
   // Balanced (stream-K) schedule: per work entry, the number of KV segments of its item; and one
   // self-resetting arrival counter per (q token, KV head) item for the in-kernel merge.
   int *kv_split_count_ptr = nullptr;

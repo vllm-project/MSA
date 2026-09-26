@@ -51,12 +51,14 @@ try:
         split_kv=False,
         device=None,
         gqa_ratio=16,
+        block_scale_shift=0,
     ):
         return get_fmha_fwd_variant(
             topk=int(topk),
             split_kv=bool(split_kv),
             gqa_ratio=int(gqa_ratio),
             device=None if device is None else int(device),
+            block_scale_shift=int(block_scale_shift),
         )._fn
 
     def _jit_get_plan(device=None):
