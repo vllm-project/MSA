@@ -19,7 +19,13 @@ from ._build_utils import cuda_home
 from .jit import MAX_BLOCK_SCALE_SHIFT as _MAX_BLOCK_SCALE_SHIFT
 from .jit import MAX_TOPK as _MAX_TOPK
 
-__all__ = ["BatchDecodeWithPagedKVCacheWrapper", "interleave_v_scales"]
+__all__ = [
+    "BatchDecodeWithPagedKVCacheWrapper",
+    "DecodePlan",
+    "interleave_v_scales",
+    "plan_decode",
+    "run_decode",
+]
 
 
 _HEAD_DIM = 128
@@ -331,24 +337,241 @@ def _run_backend(
 
 
 @dataclass(frozen=True)
-class _PlanState:
+class DecodePlan:
+    """Reusable schedule for one decode batch shape; the tensors arrive with every run."""
+
     backend_plan: object
-    kv_indices: torch.Tensor
-    kv_indptr: torch.Tensor
-    seq_lens: torch.Tensor
-    topk_indices: torch.Tensor
     batch_size: int
     q_len_per_req: int
     num_q_heads: int
     num_kv_heads: int
+    topk: int
+    block_scale_shift: int
+    device: torch.device
+    unit_scale: torch.Tensor  # fp32 1.0 used when a run gets no global scales
+
+
+def plan_decode(
+    *,
+    batch_size: int,
+    q_len_per_req: int,
+    topk: int,
+    device,
+    num_q_heads: int = _DEFAULT_NUM_Q_HEADS,
+    num_kv_heads: int = _DEFAULT_NUM_KV_HEADS,
+    num_kv_splits: int | None = None,
+    usable_sm_count: int | None = None,
+    block_scale_shift: int = 0,
+) -> DecodePlan:
+    """Build the reusable schedule outside CUDA Graph capture.
+
+    The schedule depends only on the batch shape: ``batch_size`` requests of ``q_len_per_req``
+    query tokens each, the head layout, and the TopK width (1..64). Lengths, page tables and
+    TopK lists are run-time inputs of :func:`run_decode`, so one plan serves every layer of a
+    step.
+
+    ``block_scale_shift`` names the cache's block-scale convention: the kernel divides every
+    E4M3 block scale by ``2 ** block_scale_shift`` before forming ``code * scale`` and folds the
+    factor back into the scores and the output. Use 0 when ``code * scale`` already fits E4M3
+    (products up to 448) and 3 when block scales use the full E4M3 range with a global scale
+    (products up to 6 * 448, the vLLM / TransformerEngine convention). Each value is a separate
+    compiled kernel.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("plan_decode() must be called outside CUDA Graph capture")
+    batch_size, q_len_per_req = _normalize_decode_shape(batch_size, q_len_per_req)
+    num_q_heads = int(num_q_heads)
+    num_kv_heads = int(num_kv_heads)
+    if num_q_heads <= 0 or num_kv_heads <= 0:
+        raise ValueError("num_q_heads and num_kv_heads must be positive")
+    if num_q_heads % num_kv_heads != 0 or num_q_heads // num_kv_heads not in (8, 16):
+        raise ValueError("Q8KV4 sparse decode requires 8 or 16 Q heads per KV head")
+    topk = int(topk)
+    if not 1 <= topk <= _MAX_TOPK:
+        raise ValueError(f"topk must be in [1, {_MAX_TOPK}]")
+    block_scale_shift = int(block_scale_shift)
+    if not 0 <= block_scale_shift <= _MAX_BLOCK_SCALE_SHIFT:
+        raise ValueError(f"block_scale_shift must be in [0, {_MAX_BLOCK_SCALE_SHIFT}]")
+    device = torch.device("cuda", _device_index(device))
+    from . import jit
+
+    jit._validate_gqa_arch(num_q_heads // num_kv_heads, device)
+    backend_plan = _prepare_decode_plan(
+        batch_size,
+        q_len_per_req,
+        device=device,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        topk=topk,
+        num_kv_splits=num_kv_splits,
+        usable_sm_count=usable_sm_count,
+    )
+    return DecodePlan(
+        backend_plan=backend_plan,
+        batch_size=batch_size,
+        q_len_per_req=q_len_per_req,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        topk=topk,
+        block_scale_shift=block_scale_shift,
+        device=device,
+        unit_scale=torch.ones(1, dtype=torch.float32, device=device),
+    )
+
+
+def _check_metadata(
+    plan: DecodePlan, tensor: torch.Tensor, *, name: str, shape: tuple[int, ...]
+) -> None:
+    _check_cuda_contiguous(tensor, name=name)
+    if tensor.dtype != torch.int32:
+        raise TypeError(f"{name} must be torch.int32")
+    if tensor.device != plan.device:
+        raise ValueError(f"{name} must be on {plan.device}")
+    if tuple(tensor.shape) != shape:
+        raise ValueError(f"{name} must have shape {list(shape)}")
+
+
+def run_decode(
+    plan: DecodePlan,
+    q: torch.Tensor,
+    paged_kv_cache: tuple[torch.Tensor, torch.Tensor],
+    *,
+    kv_cache_sf: tuple[torch.Tensor, torch.Tensor],
+    seq_lens: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    topk_indices: torch.Tensor,
+    sm_scale: float | None = None,
+    kv_global_scale: tuple[torch.Tensor, torch.Tensor] | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run one layer with a plan from :func:`plan_decode`; allocation-free when ``out`` is given.
+
+    ``seq_lens`` (``[batch]``) are the requests' KV lengths, ``kv_indices`` the flat physical
+    page list with ``kv_indptr`` (``[batch + 1]``) giving each request's first entry (a request
+    owns at least one page), and ``topk_indices`` (``[batch * q_len_per_req, Hkv, topk]``) the
+    logical page ids relative to the request; all int32 on the plan's device.
+
+    K/V data are ``[physical_pages, Hkv, 128, 64]`` uint8 (two E2M1 per byte) and the block
+    scales ``[physical_pages, Hkv, 128, 8]`` E4M3 views whose token rows are contiguous; page
+    and head strides may be padded or interleave data and scales within a page. K scales are
+    linear per token; V scales are in token-quad order (:func:`interleave_v_scales`).
+
+    ``kv_global_scale`` are the per-tensor fp32 global scales of K and V as one-element CUDA
+    tensors (``value = code * block_scale * global_scale``); omitted means 1.0. The kernels
+    read them on the device, so a captured graph follows later updates of the tensors.
+    """
+    rows = plan.batch_size * plan.q_len_per_req
+    _check_metadata(plan, seq_lens, name="seq_lens", shape=(plan.batch_size,))
+    _check_cuda_contiguous(kv_indices, name="kv_indices")
+    if kv_indices.dtype != torch.int32 or kv_indices.ndim != 1 or kv_indices.device != plan.device:
+        raise ValueError(f"kv_indices must be a flat torch.int32 tensor on {plan.device}")
+    _check_metadata(plan, kv_indptr, name="kv_indptr", shape=(plan.batch_size + 1,))
+    _check_metadata(
+        plan, topk_indices, name="topk_indices", shape=(rows, plan.num_kv_heads, plan.topk)
+    )
+    if not isinstance(paged_kv_cache, tuple) or len(paged_kv_cache) != 2:
+        raise ValueError("paged_kv_cache must be a (K, V) tuple")
+    if not isinstance(kv_cache_sf, tuple) or len(kv_cache_sf) != 2:
+        raise ValueError("kv_cache_sf must be a (K scale, V scale) tuple")
+    k_cache, v_cache = paged_kv_cache
+    k_scale, v_scale = kv_cache_sf
+    if kv_global_scale is None:
+        k_global_scale = v_global_scale = plan.unit_scale
+    else:
+        if not isinstance(kv_global_scale, tuple) or len(kv_global_scale) != 2:
+            raise ValueError("kv_global_scale must be a (K scale, V scale) tuple")
+        k_global_scale, v_global_scale = kv_global_scale
+        for name, tensor in (
+            ("k_global_scale", k_global_scale),
+            ("v_global_scale", v_global_scale),
+        ):
+            _check_cuda_contiguous(tensor, name=name)
+            if tensor.dtype != torch.float32 or tensor.numel() != 1:
+                raise ValueError(f"{name} must be a one-element torch.float32 tensor")
+    _check_cuda_contiguous(q, name="q", alignment=_DATA_ALIGNMENT)
+    expected_q_shape = (rows, plan.num_q_heads, _HEAD_DIM)
+    if q.dtype != torch.float8_e4m3fn or tuple(q.shape) != expected_q_shape:
+        raise ValueError(f"q must be torch.float8_e4m3fn with shape {expected_q_shape}")
+    for name, tensor in (("k_cache", k_cache), ("v_cache", v_cache)):
+        _check_paged_cache(
+            tensor,
+            name=name,
+            dtype=torch.uint8,
+            shape_tail=(plan.num_kv_heads, _PAGE_SIZE, _KV_DATA_ROW_BYTES),
+            row_bytes=_KV_DATA_ROW_BYTES,
+        )
+    if k_cache.shape != v_cache.shape:
+        raise ValueError("K and V cache shapes must match")
+    for name, tensor in (("k_scale", k_scale), ("v_scale", v_scale)):
+        _check_paged_cache(
+            tensor,
+            name=name,
+            dtype=torch.float8_e4m3fn,
+            shape_tail=(plan.num_kv_heads, _PAGE_SIZE, _SCALE_GROUPS),
+            row_bytes=_KV_SCALE_ROW_BYTES,
+        )
+        if tensor.shape[0] != k_cache.shape[0]:
+            raise ValueError(f"{name} must cover the same physical pages as the cache")
+    for name, tensor in (
+        ("q", q),
+        ("k_cache", k_cache),
+        ("v_cache", v_cache),
+        ("k_scale", k_scale),
+        ("v_scale", v_scale),
+        ("k_global_scale", k_global_scale),
+        ("v_global_scale", v_global_scale),
+    ):
+        if tensor.device != plan.device:
+            raise ValueError(f"{name} must be on {plan.device}")
+
+    scale = 1.0 / math.sqrt(_HEAD_DIM) if sm_scale is None else float(sm_scale)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("sm_scale must be finite and positive")
+    if out is None:
+        out = torch.empty(expected_q_shape, dtype=torch.bfloat16, device=plan.device)
+    else:
+        _check_cuda_contiguous(out, name="out", alignment=_DATA_ALIGNMENT)
+        if (
+            out.dtype != torch.bfloat16
+            or tuple(out.shape) != expected_q_shape
+            or out.device != plan.device
+        ):
+            raise ValueError(
+                f"out must be torch.bfloat16 with shape {expected_q_shape} on {plan.device}"
+            )
+    return _run_backend(
+        q,
+        k_cache,
+        v_cache,
+        plan.backend_plan,
+        seq_lens=seq_lens,
+        kv_indices=kv_indices,
+        kv_indptr=kv_indptr,
+        topk_indices=topk_indices,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        out=out,
+        sm_scale=scale,
+        k_global_scale=k_global_scale,
+        v_global_scale=v_global_scale,
+        block_scale_shift=plan.block_scale_shift,
+    )
+
+
+@dataclass(frozen=True)
+class _PlanState:
+    plan: DecodePlan
+    kv_indices: torch.Tensor
+    kv_indptr: torch.Tensor
+    seq_lens: torch.Tensor
+    topk_indices: torch.Tensor
     sm_scale: float
     out: torch.Tensor
-    block_scale_shift: int
-    unit_scale: torch.Tensor  # fp32 1.0 used when run() gets no global scales
 
 
 class BatchDecodeWithPagedKVCacheWrapper:
-    """Manage reusable metadata and workspace for Q8KV4 sparse decode."""
+    """Hold a plan together with its request metadata for Q8KV4 sparse decode."""
 
     def __init__(self) -> None:
         self._plan_state: _PlanState | None = None
@@ -373,14 +596,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         ``page_table`` maps each request's logical pages to physical pages, either as a
         ``[batch, max_pages]`` table or as a flat ``[total_pages]`` list with ``kv_indptr``
         (``[batch + 1]`` int32) giving each request's first entry; a request must own at least
-        one page. ``topk_indices`` hold logical page ids relative to the request.
-
-        ``block_scale_shift`` names the cache's block-scale convention: the kernel divides every
-        E4M3 block scale by ``2 ** block_scale_shift`` before forming ``code * scale`` and folds
-        the factor back into the scores and the output. Use 0 when ``code * scale`` already fits
-        E4M3 (products up to 448) and 3 when block scales use the full E4M3 range with a global
-        scale (products up to 6 * 448, the vLLM / TransformerEngine convention). Each value is a
-        separate compiled kernel.
+        one page. ``topk_indices`` hold logical page ids relative to the request. See
+        :func:`plan_decode` for ``block_scale_shift``.
         """
         for name, tensor in (
             ("topk_indices", topk_indices),
@@ -391,8 +608,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             _check_same_device(topk_indices, tensor, name=name)
             if tensor.dtype != torch.int32:
                 raise TypeError(f"{name} must be torch.int32")
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("plan() must be called outside CUDA Graph capture")
         if page_table.ndim == 2:
             if kv_indptr is not None:
                 raise ValueError("kv_indptr applies only to a flat [total_pages] page_table")
@@ -419,67 +634,40 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 "page_table must have shape [batch, max_pages] or be a flat [total_pages] "
                 "list with kv_indptr"
             )
-        batch_size, q_len_per_req = _normalize_decode_shape(batch_size, q_len_per_req)
-        num_q_heads = int(num_q_heads)
-        num_kv_heads = int(num_kv_heads)
-        if num_q_heads <= 0 or num_kv_heads <= 0:
-            raise ValueError("num_q_heads and num_kv_heads must be positive")
-        if num_q_heads % num_kv_heads != 0 or num_q_heads // num_kv_heads not in (
-            8,
-            16,
-        ):
-            raise ValueError("Q8KV4 sparse decode requires 8 or 16 Q heads per KV head")
-        if seq_lens.shape != (batch_size,):
-            raise ValueError("seq_lens must have shape [batch]")
         if topk_indices.ndim != 3 or not 1 <= topk_indices.shape[2] <= _MAX_TOPK:
             raise ValueError(
                 f"topk_indices must have shape [batch * q_len_per_req, num_kv_heads, topk] "
                 f"with 1 <= topk <= {_MAX_TOPK}"
             )
-        topk = int(topk_indices.shape[2])
-        expected_topk_shape = (batch_size * q_len_per_req, num_kv_heads, topk)
-        if tuple(topk_indices.shape) != expected_topk_shape:
-            raise ValueError(f"topk_indices must have shape {expected_topk_shape}")
-
         scale = 1.0 / math.sqrt(_HEAD_DIM) if sm_scale is None else float(sm_scale)
         if not math.isfinite(scale) or scale <= 0.0:
             raise ValueError("sm_scale must be finite and positive")
-        block_scale_shift = int(block_scale_shift)
-        if not 0 <= block_scale_shift <= _MAX_BLOCK_SCALE_SHIFT:
-            raise ValueError(
-                f"block_scale_shift must be in [0, {_MAX_BLOCK_SCALE_SHIFT}]"
-            )
-        from . import jit
-
-        jit._validate_gqa_arch(num_q_heads // num_kv_heads, page_table.device)
-        backend_plan = _prepare_decode_plan(
-            batch_size,
-            q_len_per_req,
+        plan = plan_decode(
+            batch_size=batch_size,
+            q_len_per_req=q_len_per_req,
+            topk=int(topk_indices.shape[2]),
             device=page_table.device,
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
-            topk=topk,
             num_kv_splits=num_kv_splits,
             usable_sm_count=usable_sm_count,
+            block_scale_shift=block_scale_shift,
+        )
+        rows = plan.batch_size * plan.q_len_per_req
+        _check_metadata(plan, seq_lens, name="seq_lens", shape=(plan.batch_size,))
+        _check_metadata(
+            plan, topk_indices, name="topk_indices", shape=(rows, plan.num_kv_heads, plan.topk)
         )
         self._plan_state = _PlanState(
-            backend_plan=backend_plan,
+            plan=plan,
             kv_indices=kv_indices,
             kv_indptr=kv_indptr,
             seq_lens=seq_lens,
             topk_indices=topk_indices,
-            batch_size=batch_size,
-            q_len_per_req=q_len_per_req,
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
             sm_scale=scale,
             out=torch.empty(
-                (batch_size * q_len_per_req, num_q_heads, _HEAD_DIM),
-                dtype=torch.bfloat16,
-                device=page_table.device,
+                (rows, plan.num_q_heads, _HEAD_DIM), dtype=torch.bfloat16, device=plan.device
             ),
-            block_scale_shift=block_scale_shift,
-            unit_scale=torch.ones(1, dtype=torch.float32, device=page_table.device),
         )
 
     def run(
@@ -490,102 +678,26 @@ class BatchDecodeWithPagedKVCacheWrapper:
         kv_cache_sf: tuple[torch.Tensor, torch.Tensor],
         kv_global_scale: tuple[torch.Tensor, torch.Tensor] | None = None,
         out: torch.Tensor | None = None,
+        topk_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run one layer using metadata and workspace prepared by :meth:`plan`.
+        """Run one layer with the metadata from :meth:`plan`; see :func:`run_decode`.
 
-        K/V data are ``[physical_pages, Hkv, 128, 64]`` uint8 (two E2M1 per byte) and the block
-        scales ``[physical_pages, Hkv, 128, 8]`` E4M3 views whose token rows are contiguous; page
-        and head strides may be padded or interleave data and scales within a page. K scales are
-        linear per token; V scales are in token-quad order (:func:`interleave_v_scales`).
-
-        ``kv_global_scale`` are the per-tensor fp32 global scales of K and V as one-element CUDA
-        tensors (``value = code * block_scale * global_scale``); omitted means 1.0. The kernels
-        read them on the device, so a captured graph follows later updates of the tensors.
+        ``topk_indices`` replaces the planned list for this call (same shape), for callers whose
+        selection changes per layer while the plan and page table are per step.
         """
         state = self._plan_state
         if state is None:
             raise RuntimeError("plan() must be called before run()")
-        if not isinstance(paged_kv_cache, tuple) or len(paged_kv_cache) != 2:
-            raise ValueError("paged_kv_cache must be a (K, V) tuple")
-        if not isinstance(kv_cache_sf, tuple) or len(kv_cache_sf) != 2:
-            raise ValueError("kv_cache_sf must be a (K scale, V scale) tuple")
-        k_cache, v_cache = paged_kv_cache
-        k_scale, v_scale = kv_cache_sf
-        if kv_global_scale is None:
-            k_global_scale = v_global_scale = state.unit_scale
-        else:
-            if not isinstance(kv_global_scale, tuple) or len(kv_global_scale) != 2:
-                raise ValueError("kv_global_scale must be a (K scale, V scale) tuple")
-            k_global_scale, v_global_scale = kv_global_scale
-            for name, tensor in (
-                ("k_global_scale", k_global_scale),
-                ("v_global_scale", v_global_scale),
-            ):
-                _check_cuda_contiguous(tensor, name=name)
-                if tensor.dtype != torch.float32 or tensor.numel() != 1:
-                    raise ValueError(f"{name} must be a one-element torch.float32 tensor")
-        _check_cuda_contiguous(q, name="q", alignment=_DATA_ALIGNMENT)
-        expected_q_shape = (
-            state.batch_size * state.q_len_per_req,
-            state.num_q_heads,
-            _HEAD_DIM,
-        )
-        if q.dtype != torch.float8_e4m3fn or tuple(q.shape) != expected_q_shape:
-            raise ValueError(
-                f"q must be torch.float8_e4m3fn with shape {expected_q_shape}"
-            )
-        for name, tensor in (("k_cache", k_cache), ("v_cache", v_cache)):
-            _check_paged_cache(
-                tensor,
-                name=name,
-                dtype=torch.uint8,
-                shape_tail=(state.num_kv_heads, _PAGE_SIZE, _KV_DATA_ROW_BYTES),
-                row_bytes=_KV_DATA_ROW_BYTES,
-            )
-        if k_cache.shape != v_cache.shape:
-            raise ValueError("K and V cache shapes must match")
-        for name, tensor in (("k_scale", k_scale), ("v_scale", v_scale)):
-            _check_paged_cache(
-                tensor,
-                name=name,
-                dtype=torch.float8_e4m3fn,
-                shape_tail=(state.num_kv_heads, _PAGE_SIZE, _SCALE_GROUPS),
-                row_bytes=_KV_SCALE_ROW_BYTES,
-            )
-            if tensor.shape[0] != k_cache.shape[0]:
-                raise ValueError(f"{name} must cover the same physical pages as the cache")
-        for name, tensor in (
-            ("q", q),
-            ("k_cache", k_cache),
-            ("v_cache", v_cache),
-            ("k_scale", k_scale),
-            ("v_scale", v_scale),
-            ("k_global_scale", k_global_scale),
-            ("v_global_scale", v_global_scale),
-        ):
-            _check_same_device(state.kv_indices, tensor, name=name)
-
-        out_tensor = state.out if out is None else out
-        _check_cuda_contiguous(out_tensor, name="out", alignment=_DATA_ALIGNMENT)
-        _check_same_device(q, out_tensor, name="out")
-        if out_tensor.dtype != torch.bfloat16 or out_tensor.shape != state.out.shape:
-            raise ValueError(
-                f"out must be torch.bfloat16 with shape {tuple(state.out.shape)}"
-            )
-        return _run_backend(
+        return run_decode(
+            state.plan,
             q,
-            k_cache,
-            v_cache,
-            state.backend_plan,
+            paged_kv_cache,
+            kv_cache_sf=kv_cache_sf,
             seq_lens=state.seq_lens,
             kv_indices=state.kv_indices,
             kv_indptr=state.kv_indptr,
-            topk_indices=state.topk_indices,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            out=out_tensor,
+            topk_indices=state.topk_indices if topk_indices is None else topk_indices,
             sm_scale=state.sm_scale,
-            k_global_scale=k_global_scale,
-            v_global_scale=v_global_scale,
-            block_scale_shift=state.block_scale_shift,
+            kv_global_scale=kv_global_scale,
+            out=state.out if out is None else out,
         )
