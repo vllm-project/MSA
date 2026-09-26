@@ -246,6 +246,8 @@ def _prepare_decode_plan(
     usable_sm_count: int | None = None,
 ):
     """Prepare the opaque reusable schedule used by the public wrapper."""
+    from . import jit
+
     batch_size, q_len_per_req = _normalize_decode_shape(batch_size, q_len_per_req)
 
     device_idx = _device_index(device)
@@ -279,6 +281,7 @@ def _prepare_decode_plan(
                 num_q_heads // num_kv_heads,
                 batch_size * q_len_per_req * num_kv_heads,
                 sm_count,
+                jit._target_arch(device_idx),
             )
             if num_kv_splits is None
             else "legacy"
@@ -286,13 +289,15 @@ def _prepare_decode_plan(
     )
 
 
-def _split_mode(gqa_ratio: int, logical_ctas: int, sm_count: int) -> str:
-    """Choose the existing direct/fixed-split or persistent stream-K schedule."""
-    # N8's shorter items do not amortize persistent scheduling once the grid fills the GPU.
-    # Underfilled grids retain stream-K to distribute their KV work over otherwise idle SMs.
-    default_mode = (
-        "legacy" if gqa_ratio == 8 and logical_ctas >= sm_count else "streamk"
-    )
+def _split_mode(gqa_ratio: int, logical_ctas: int, sm_count: int, arch: str) -> str:
+    """Choose the direct grid or the persistent stream-K schedule."""
+    # On SM100 and SM103 the N8 kernel's short items do not amortize persistent scheduling once
+    # the grid fills the GPU, so full grids take the direct grid there. SM107 keeps stream-K for
+    # every shape: with its SM count the served batch sizes leave a fractional last wave whose
+    # split outweighs the persistent schedule's cost. Underfilled grids keep stream-K everywhere
+    # to spread their KV work over otherwise idle SMs.
+    full_grid_direct = gqa_ratio == 8 and logical_ctas >= sm_count and arch != "107a"
+    default_mode = "legacy" if full_grid_direct else "streamk"
     mode = os.environ.get("MSA_Q8KV4_SPLIT_MODE", default_mode)
     if mode not in ("legacy", "streamk"):
         raise ValueError("MSA_Q8KV4_SPLIT_MODE must be 'legacy' or 'streamk'")
