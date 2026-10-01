@@ -3,8 +3,10 @@
 
 #include "prefill_attention_api.hpp"
 
-#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime_api.h>
 
 #include <cmath>
 #include <cstddef>
@@ -188,8 +190,13 @@ void prefill_run(torch::Tensor q, torch::Tensor packed_k, torch::Tensor packed_v
   TORCH_CHECK(std::isfinite(output_scale), "output_scale must be finite");
 
   c10::cuda::CUDAGuard const device_guard(q.device());
-  cudaDeviceProp const *properties = at::cuda::getCurrentDeviceProperties();
-  TORCH_CHECK(properties->major == 10 && (properties->minor == 0 || properties->minor == 3),
+  int major = 0;
+  int minor = 0;
+  C10_CUDA_CHECK(
+      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, q.get_device()));
+  C10_CUDA_CHECK(
+      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, q.get_device()));
+  TORCH_CHECK(major == 10 && (minor == 0 || minor == 3),
               "Q8KV4 sparse prefill requires an SM100-family GPU");
 
   arguments.q_ptr = reinterpret_cast<uint8_t const *>(q.data_ptr());
@@ -225,7 +232,7 @@ void prefill_run(torch::Tensor q, torch::Tensor packed_k, torch::Tensor packed_v
       static_cast<float>(softmax_scale * stage_gain * 1.4426950408889634074);
   arguments.output_scale = static_cast<float>(output_scale * stage_gain);
 
-  cudaStream_t const stream = at::cuda::getCurrentCUDAStream().stream();
+  cudaStream_t const stream = c10::cuda::getCurrentCUDAStream().stream();
   cudaError_t const status = launch_prefill_attention(arguments, stream);
   TORCH_CHECK(status == cudaSuccess,
               "Q8KV4 sparse prefill launch failed: ", cudaGetErrorString(status));
