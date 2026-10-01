@@ -208,12 +208,31 @@ def _namespace() -> _jit_cache.Namespace:
     return _jit_cache.Namespace(_cache_root(), _cuda_home())
 
 
+# Compile and link rules of every library; part of each recipe, so changing them rebuilds.
+_NINJA_RULES = """rule nvcc_compile
+  command = $nvcc $nvcc_flags -MMD -MF $out.d -c $in -o $out
+  description = Compiling $in
+  depfile = $out.d
+  deps = gcc
+
+rule nvcc_link
+  command = $nvcc -shared $in -o $out -lcuda
+  description = Linking $out
+"""
+
+
 def _recipe(name: str, nvcc_flags: str, templates=(), **key) -> _jit_cache.Recipe:
-    """One library's cache recipe; the files it compiles from are checked per record."""
+    """One library's cache recipe (compiler, flags, build rules, ``key``); the files it compiles
+    from are checked per record."""
     return _jit_cache.Recipe(
         _namespace(),
         name,
-        {"nvcc": str(_cuda_home() / "bin/nvcc"), "nvcc_flags": nvcc_flags, **key},
+        {
+            "nvcc": str(_cuda_home() / "bin/nvcc"),
+            "nvcc_flags": nvcc_flags,
+            "rules": _NINJA_RULES,
+            **key,
+        },
         templates=templates,
     )
 
@@ -298,16 +317,7 @@ def _write_ninja(
 nvcc = {nvcc}
 nvcc_flags = {_nvcc_flags(dequant_mode, arch, block_scale_shift)}
 
-rule nvcc_compile
-  command = $nvcc $nvcc_flags -MMD -MF $out.d -c $in -o $out
-  description = Compiling $in
-  depfile = $out.d
-  deps = gcc
-
-rule nvcc_link
-  command = $nvcc -shared $in -o $out -lcuda
-  description = Linking $out
-
+{_NINJA_RULES}
 {builds}
 build {output}: nvcc_link {" ".join(str(obj) for obj in objects)}
 """

@@ -16,8 +16,9 @@ Layout, under a placement-only root::
 
 An object is loaded only while those modules are unchanged. They are the import closure, within
 cute/, of the module that defines the kernel (``save_aot(..., sources=...)``; without it, every
-cute/src module loaded at compile time), so editing one kernel recompiles only the kernels that
-import it. A missing, unreadable or mismatched entry is a miss, never an error.
+cute/src module loaded at compile time), plus the module that calls ``save_aot``: the compile call
+site, whose tensor layouts and options shape the code as well. Editing one kernel recompiles only
+the kernels that import it. A missing, unreadable or mismatched entry is a miss, never an error.
 
 Environment variables:
     MM_SPARSE_ATTN_AOT_CACHE: Override the cache root
@@ -218,10 +219,11 @@ def _atomic_write(path: str, text: str) -> None:
 
 def save_aot(key: tuple, compiled, sources=None) -> None:
     """Export ``compiled`` for ``key``. ``sources`` names what generates the kernel (its class,
-    module or module name, or .py paths under cute/); their cute/ import closure is what the
-    entry checks on later loads."""
+    module or module name, or .py paths under cute/); their cute/ import closure and the calling
+    module are what the entry checks on later loads."""
     if _AOT_DISABLE:
         return
+    caller = Path(sys._getframe(1).f_code.co_filename).resolve()
     if not hasattr(compiled, "export_to_c"):
         return
     base = _key_to_path(key)
@@ -235,8 +237,10 @@ def save_aot(key: tuple, compiled, sources=None) -> None:
     try:
         t0 = time.time()
         files = _source_files(sources) if sources is not None else _loaded_cute_modules()
-        inputs = {str(path.relative_to(_CUTE_ROOT)): _file_hash(path)
-                  for path in _import_closure(files)}
+        closure = _import_closure(files)
+        if caller.is_file() and caller.is_relative_to(_CUTE_ROOT) and caller not in closure:
+            closure.append(caller)  # the call site itself, not everything it imports
+        inputs = {str(path.relative_to(_CUTE_ROOT)): _file_hash(path) for path in closure}
         compiled.export_to_c(tmp_path, function_name=func_name)
         with contextlib.suppress(FileNotFoundError):  # no reader pairs the old entry with it
             os.unlink(base + ".json")

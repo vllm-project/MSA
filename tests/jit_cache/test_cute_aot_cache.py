@@ -5,6 +5,7 @@
 from are unchanged: the import closure, within cute/, of the module that defines it."""
 
 import importlib
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -77,3 +78,19 @@ def test_unreadable_entries_are_misses(package):
     Path(aot_cache._key_to_path(key) + ".json").write_text("{not json")
     assert aot_cache.aot_object_path(key) == ""
     assert aot_cache.try_load_aot(key) is None
+
+
+def test_the_compile_call_site_is_an_input(package, monkeypatch):
+    """The module that calls save_aot builds the tensors and options cute.compile sees."""
+    frontend = package / "frontend.py"
+    frontend.write_text("def compile_a(aot, key, compiled):\n"
+                        "    aot.save_aot(key, compiled, sources=['src/kernel_a.py'])\n")
+    spec = importlib.util.spec_from_file_location("frontend", frontend)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    key = ("kernel_a", 7)
+    module.compile_a(aot_cache, key, _Compiled())
+    assert aot_cache.aot_object_path(key)
+    frontend.write_text(frontend.read_text() + "# alignment changed\n")
+    _fresh(monkeypatch)
+    assert aot_cache.aot_object_path(key) == ""
