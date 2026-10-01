@@ -123,6 +123,25 @@ See:
 
 - [`python/fmha_sm100/decode_q8kv4/README.md`](python/fmha_sm100/decode_q8kv4/README.md)
 
+### Warmup
+
+Native kernels are JIT-compiled on first use (about a minute each) and cached under
+`~/.cache/minfer/fmha_sm100/csrc_<digest>/`, keyed by the sources and the toolchain, so a
+kept cache never serves stale kernels. A serving engine should build the kernels of its
+configuration up front, in parallel, instead of compiling them one at a time during its first
+batches. `warmup` derives them from the same planner and dispatch code `fmha_sm100` runs, split
+by the KV-cache and index-cache dtypes (an NVFP4 deployment builds no FP8 or BF16 variants):
+
+```python
+from fmha_sm100 import warmup
+
+warmup(kv_cache_dtype="nvfp4", index_cache_dtype="nvfp4", num_q_heads=16,
+       num_kv_heads=1, topk=16, decode_query_lens=(1, 2))   # per-rank heads
+```
+
+`python -m fmha_sm100.msa_warmup --kv-cache-dtype nvfp4 ... [--dry-run]` does the same for
+an image build. CuTe-DSL kernels compile in seconds on first use and are not included.
+
 ## Test
 
 ```bash
@@ -133,9 +152,13 @@ python -m pytest tests/smoke -q
 python -m pytest tests/integration -q
 python tests/integration/test_proxy_kv_e2e.py
 
-# Large regression suites.
+# Large regression suites. test_correctness.py pre-builds the kernels it needs in parallel
+# (tests/regression/fmha_variants.txt; --jit-jobs N, --update-variant-manifest).
 python tests/regression/test_correctness.py
 python tests/regression/test_sparse_attn.py
+
+# Warmup: plans split by cache dtype, and no build after warmup on the serving paths.
+python -m pytest tests/warmup -q
 
 # Q8KV4 NVFP4 sparse decode: smoke set, full matrices, FP16 dequant fallback.
 python -m pytest tests/q8kv4 -q -m "not full"
@@ -186,13 +209,14 @@ python/fmha_sm100/                  Python package
   sparse.py                         Lazy shim that loads the cute/ stack
   sparse_fmha_adapter.py            Bridge: fmha_sm100 API → sparse_atten_func
   q8kv4_decode_adapter.py           Bridge: fmha_sm100 API → decode_q8kv4 (NVFP4 sparse decode)
+  msa_warmup.py                     warmup(): parallel build of one serving configuration's kernels
   decode_q8kv4/                     Q8KV4 paged sparse decode (own csrc + JIT, see its README)
   csrc/                             CUDA kernels + Jinja templates (JIT-compiled)
     include/                        Vendored FlashInfer / CUTLASS-derived / TRT-LLM headers
   cutlass/                          NVIDIA CUTLASS git submodule (include/ + tools/util/include/)
   cute/                             CuTe-DSL sparse attention (loaded via sys.path)
 tests/                              Correctness tests
-  smoke/  integration/  regression/  q8kv4/
+  smoke/  integration/  regression/  q8kv4/  warmup/
 scripts/                            Warmup + cache-management helpers
 benchmarks/                         bench_sparse_attention_ops.py, bench_q8kv4_decode.py
 ```
