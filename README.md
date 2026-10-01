@@ -123,14 +123,31 @@ See:
 
 - [`python/fmha_sm100/decode_q8kv4/README.md`](python/fmha_sm100/decode_q8kv4/README.md)
 
-### Warmup
+### JIT cache
 
 Native kernels are JIT-compiled on first use (about a minute each) and cached under
-`~/.cache/minfer/fmha_sm100/csrc_<digest>/`, keyed by the sources and the toolchain, so a
-kept cache never serves stale kernels. A serving engine should build the kernels of its
-configuration up front, in parallel, instead of compiling them one at a time during its first
-batches. `warmup` derives them from the same planner and dispatch code `fmha_sm100` runs, split
-by the KV-cache and index-cache dtypes (an NVFP4 deployment builds no FP8 or BF16 variants):
+`~/.cache/minfer/fmha_sm100/` (`MINFER_FMHA_CACHE_DIR`); CuTe-DSL kernels are exported under
+`~/.cache/minfer/mm_sparse_attn/` (`MM_SPARSE_ATTN_AOT_CACHE`). Both roots only place the cache:
+
+```
+<root>/v2/<toolchain>/        one namespace per toolchain (manifest.json: nvcc, CUDA, TVM-FFI, ...)
+  <name>-<recipe>/            one directory per build recipe (flags, defines, template parameters)
+    entry.json                per library: every file the compiler read and its content hash
+    <name>-<inputs>.so        immutable libraries
+```
+
+A library is served while the files it was compiled from are unchanged, by content, not
+timestamp. Editing a header rebuilds only the kernels that include it, the other kernels stay
+cached, and returning to earlier sources (another branch) finds the libraries built from them
+again. CuTe-DSL kernels are checked against the Python modules they are generated from. Nothing
+needs to be cleared by hand; a new toolchain simply gets its own namespace.
+
+### Warmup
+
+A serving engine should build the kernels of its configuration up front, in parallel, instead
+of compiling them one at a time during its first batches. `warmup` derives them from the same
+planner and dispatch code `fmha_sm100` runs, split by the KV-cache and index-cache dtypes (an
+NVFP4 deployment builds no FP8 or BF16 variants):
 
 ```python
 from fmha_sm100 import warmup
