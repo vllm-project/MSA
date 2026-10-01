@@ -4,7 +4,7 @@
 """Per-variant lazy JIT compilation for FMHA varlen kernels.
 
 Each FMHA variant (dtype x tile x sparse x page x split_kv x pack_factor) is compiled
-independently on first use and cached to ~/.cache/minfer/fmha_sm100/.
+independently on first use and cached to ~/.cache/minfer/fmha_sm100/csrc_<digest>/.
 
 To recompile after kernel changes: scripts/clear_fmha_cache.sh
 """
@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import jinja2
@@ -186,6 +187,25 @@ def _variant_key_from_runtime(dtype_code, qo_tile_size, single_wg,
     return variant_name, params
 
 
+def _variant_params_from_name(variant_name):
+    """Inverse of ``_variant_key_from_runtime``: the build params of a variant name."""
+    kv_idx = next((i for i, (_, p) in enumerate(_FMHA_SM100_KV_DTYPE)
+                   if p["kv_suffix"] and variant_name.endswith(p["kv_suffix"])), 0)
+    suffix = _FMHA_SM100_KV_DTYPE[kv_idx][1]["kv_suffix"]
+    fields = variant_name[:len(variant_name) - len(suffix)].split("_")
+    if len(fields) != len(_FMHA_SM100_DISPATCH):
+        raise ValueError(f"Not an FMHA variant name: {variant_name!r}")
+    params = {}
+    for (_, dim_values), field in zip(_FMHA_SM100_DISPATCH, fields):
+        params.update(dim_values[int(field)][1])
+    params.update(_FMHA_SM100_KV_DTYPE[kv_idx][1])
+    if _FMHA_SM100_IMPOSSIBLE(params):
+        raise ValueError(f"Impossible FMHA variant: {variant_name!r}")
+    params["func_name"] = "fmha_sm100_" + variant_name
+    params["variant_name"] = variant_name
+    return params
+
+
 def _get_tvm_ffi_include():
     """Find TVM-FFI include directory."""
     try:
@@ -214,6 +234,37 @@ def _get_cuda_home():
             return p
     raise RuntimeError("Cannot find CUDA toolkit. Set CUDA_HOME.")
 
+
+def _csrc_digest():
+    """Digest of the build inputs of every artifact under the cache: all of csrc/, the CUTLASS
+    version, the TVM-FFI version and the selected nvcc.
+
+    Artifacts are named only by their variant, so without this a cache built from older sources
+    would keep serving stale kernels; with it a cache can be kept (and shared across machines)
+    and rebuilds only when the sources or the toolchain change.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(_FMHA_VARLEN_DIR.rglob("*")):
+        if path.is_file() and "__pycache__" not in path.parts:
+            digest.update(str(path.relative_to(_FMHA_VARLEN_DIR)).encode())
+            digest.update(path.read_bytes())
+    version_header = _CUTLASS_INCLUDE / "cutlass" / "version.h"
+    if version_header.is_file():
+        digest.update(version_header.read_bytes())
+    try:
+        import tvm_ffi
+        digest.update(getattr(tvm_ffi, "__version__", "unknown").encode())
+    except ImportError:
+        pass
+    try:
+        digest.update(str(Path(_get_cuda_home(), "bin", "nvcc").resolve()).encode())
+    except RuntimeError:  # no toolkit: nothing can be built, the key only has to be stable
+        pass
+    return digest.hexdigest()[:16]
+
+
+# Every csrc artifact lives under a directory keyed by its build inputs.
+CACHE_BASE = CACHE_BASE / f"csrc_{_csrc_digest()}"
 
 _ALL_VARIANTS_SO = CACHE_BASE / "_all_variants" / "all_variants.so"
 
@@ -282,6 +333,7 @@ class FMHAVariantManager:
         self._all_module_checked = False
         self._inst_template = None
         self._run_template = None
+        self._requested = set()
 
     def _load_templates(self):
         if self._inst_template is None:
@@ -303,6 +355,7 @@ class FMHAVariantManager:
         variant_name, params = _variant_key_from_runtime(
             dtype_code, qo_tile_size, single_wg,
             sparse_mode, page_size, split_kv, pack_factor, kv_dtype)
+        self._requested.add(variant_name)
 
         cached = self._loaded.get(variant_name)
         if cached is not None:
@@ -340,6 +393,26 @@ class FMHAVariantManager:
                 _release_file_lock(lock_fd)
             self._loaded[variant_name] = _VariantWrapper(fn)
             return self._loaded[variant_name]
+
+    def is_cached(self, variant_name):
+        """Whether a variant loads without compiling (all_variants.so or its own .so)."""
+        self._ensure_all_module()
+        if self._all_module is not None:
+            try:
+                getattr(self._all_module, f"run_{variant_name}")
+                return True
+            except AttributeError:
+                pass
+        return (CACHE_BASE / variant_name / f"{variant_name}.so").exists()
+
+    def compile_locked(self, variant_name, params):
+        """Compile one variant under its cache lock (the lock ``get_variant`` takes)."""
+        cache_dir = CACHE_BASE / variant_name
+        lock_fd = _acquire_file_lock(cache_dir / ".compile.lock")
+        try:
+            self._compile_only(variant_name, params)
+        finally:
+            _release_file_lock(lock_fd)
 
     def _compile_only(self, variant_name, params):
         """Compile a variant without loading. Safe to call from subprocesses."""
@@ -400,8 +473,9 @@ build {so_path}: nvcc_link {inst_obj} {run_obj}
         (cache_dir / "build.ninja").write_text(ninja_content)
 
     def _run_ninja(self, cache_dir):
+        # The kernel instantiation and the host launcher are independent objects.
         result = subprocess.run(
-            ["ninja", "-j1"],
+            ["ninja", "-j2"],
             cwd=str(cache_dir),
             capture_output=True,
             text=True,
@@ -415,6 +489,37 @@ build {so_path}: nvcc_link {inst_obj} {run_obj}
 
 
 _variant_manager = FMHAVariantManager()
+
+
+def requested_fmha_variants():
+    """Names of the variants this process has asked ``get_fmha_variant`` for, sorted."""
+    return sorted(_variant_manager._requested)
+
+
+def prebuild_fmha_variants(variant_names, max_workers=None):
+    """Compile the named variants that are not cached yet, in parallel.
+
+    Lazy JIT builds one variant at a time when a call first needs it (``ninja -j1``, about a
+    minute each), so a test sweep over a cold cache spends most of its time compiling serially.
+    This builds every missing variant at once, one ninja per variant, into the same per-variant
+    cache and under the same locks as ``get_fmha_variant``, so concurrent processes stay safe.
+    Returns the names that were compiled.
+    """
+    manager = _variant_manager
+    manager._load_templates()
+    missing = []
+    for name in dict.fromkeys(variant_names):
+        params = _variant_params_from_name(name)
+        if not manager.is_cached(name):
+            missing.append((name, params))
+    if not missing:
+        return []
+    workers = max_workers or min(len(missing), os.cpu_count() or 8)
+    logger.info("Pre-building %d FMHA variants with %d workers", len(missing), workers)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        # Each worker waits on its own ninja subprocess, so threads suffice.
+        list(pool.map(lambda item: manager.compile_locked(*item), missing))
+    return [name for name, _ in missing]
 
 
 def get_fmha_variant(dtype_code, qo_tile_size, single_wg,
