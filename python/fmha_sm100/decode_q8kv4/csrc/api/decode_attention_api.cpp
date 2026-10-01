@@ -39,14 +39,15 @@ void initialize() {
     if (!Py_IsInitialized()) {
       Py_Initialize();
     }
-    PyGILState_STATE gstate = PyGILState_Ensure();
-    PyObject *modules = PySys_GetObject("modules");
-    constexpr char kModuleName[] = "fmha_sm100.decode_q8kv4";
-    if (!modules || !PyDict_GetItemString(modules, kModuleName)) {
+    // Importing the package registers the JIT callbacks. It may be vendored
+    // under another top-level package (vllm.third_party.fmha_sm100), so look
+    // for the registered callback instead of the module name.
+    if (!tvm::ffi::Function::GetGlobal("fmha_sm100.decode_q8kv4.jit_get_plan")) {
+      PyGILState_STATE gstate = PyGILState_Ensure();
       int const status = PyRun_SimpleString("import fmha_sm100.decode_q8kv4");
+      PyGILState_Release(gstate);
       TORCH_CHECK(status == 0, "failed to import fmha_sm100.decode_q8kv4");
     }
-    PyGILState_Release(gstate);
     g_initialized = true;
   });
 }
