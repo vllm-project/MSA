@@ -5,10 +5,11 @@
 
 from __future__ import annotations
 
-import hashlib
+import importlib.util
 import logging
 import os
 import sys
+import sysconfig
 import time
 from dataclasses import dataclass
 from functools import lru_cache
@@ -17,6 +18,7 @@ from pathlib import Path
 import jinja2
 from torch.utils import cpp_extension
 
+from .. import _jit_cache
 from ..decode_q8kv4._build_utils import cuda_home as _cuda_home
 from ..decode_q8kv4._build_utils import cutlass_root as _cutlass_root
 from ..decode_q8kv4._build_utils import require_cuda_version
@@ -59,28 +61,6 @@ def _torch_arch(arch: str) -> str:
     return _resolve_torch_arch(arch, component="Q8KV4 prefill attention")
 
 
-@lru_cache(maxsize=1)
-def _source_digest() -> str:
-    import torch
-
-    digest = hashlib.sha256()
-    for path in sorted(_CSRC.rglob("*")):
-        if path.is_file():
-            digest.update(str(path.relative_to(_ROOT)).encode())
-            digest.update(path.read_bytes())
-    digest.update(Path(__file__).read_bytes())
-    digest.update(sys.version.encode())
-    digest.update(torch.__version__.encode())
-    digest.update(str(torch._C._GLIBCXX_USE_CXX11_ABI).encode())
-    digest.update(str(_cuda_home()).encode())
-    digest.update(str(_cuda_version()).encode())
-    digest.update(str(_cutlass_root()).encode())
-    version_header = _cutlass_root() / "include/cutlass/version.h"
-    if version_header.is_file():
-        digest.update(version_header.read_bytes())
-    return digest.hexdigest()[:16]
-
-
 def _cache_root() -> Path:
     """Share the package JIT cache location; fall back to the torch extension dir."""
     explicit = os.environ.get("MINFER_FMHA_CACHE_DIR") or os.environ.get(
@@ -100,6 +80,20 @@ def _write_text_if_changed(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+@lru_cache(maxsize=1)
+def _namespace() -> _jit_cache.Namespace:
+    """The cache namespace of the selected toolchain (see ``fmha_sm100._jit_cache``)."""
+    return _jit_cache.Namespace(_cache_root(), _cuda_home())
+
+
+def _import_extension(module_name: str, library: Path):
+    """Import a built extension the way ``cpp_extension.load`` does, without running ninja."""
+    spec = importlib.util.spec_from_file_location(module_name, library)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 @dataclass(frozen=True)
 class JitSpec:
     """One compile-time configuration: the target architecture and the block-scale shift."""
@@ -115,44 +109,102 @@ class JitSpec:
 
     @property
     def uri(self) -> str:
-        return (
-            f"{self.variant_name}_shift{self.block_scale_shift}_{self.target_arch}_"
-            f"{_source_digest()}"
+        return f"{self.variant_name}_shift{self.block_scale_shift}_{self.target_arch}"
+
+    @property
+    def module_name(self) -> str:
+        return f"_fmha_sm100_{self.uri}"
+
+    def _template_params(self) -> dict:
+        return {
+            "q_heads_per_kv": self.q_heads_per_kv,
+            "head_dim": self.head_dim,
+            "page_size": self.page_size,
+            "q_stages": self.q_stages,
+            "score_stages": self.score_stages,
+        }
+
+    def _load_arguments(self, cache_dir: Path) -> dict:
+        shift_define = f"-DFMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT={self.block_scale_shift}"
+        return {
+            "sources": [
+                str(_API / "prefill_attention_api.cpp"),
+                str(_API / "prefill_attention_binding.cpp"),
+                str(cache_dir / "prefill_attention_inst.cu"),
+            ],
+            "extra_include_paths": [
+                str(path)
+                for path in (
+                    _API,
+                    _INCLUDE,
+                    _cutlass_root() / "include",
+                    _cutlass_root() / "tools/util/include",
+                )
+            ],
+            "extra_cflags": ["-O3", "-DNDEBUG", "-std=c++20", shift_define],
+            "extra_cuda_cflags": [
+                "-O3",
+                "-DNDEBUG",
+                "-lineinfo",
+                "-std=c++20",
+                "--expt-relaxed-constexpr",
+                "--expt-extended-lambda",
+                "-static-global-template-stub=false",
+                "-Xptxas=-O3",
+                shift_define,
+            ],
+            "extra_ldflags": ["-lcuda", f"-Wl,-rpath,{_cuda_home() / 'lib64'}"],
+        }
+
+    def recipe(self) -> _jit_cache.Recipe:
+        """The extension's cache recipe. The key holds the torch and Python builds the
+        extension links against, so their headers are left out of the recorded inputs."""
+        import torch
+
+        arguments = self._load_arguments(Path("<build>"))
+        return _jit_cache.Recipe(
+            _namespace(),
+            self.uri,
+            {
+                "load": arguments,
+                "torch_cuda_arch": _torch_arch(self.target_arch),
+                "params": self._template_params(),
+                "torch": torch.__version__,
+                "cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
+                "python": sys.version,
+            },
+            templates=(_TEMPLATES / "prefill_attention_inst.cu.jinja",),
+            covered=(
+                os.path.realpath(Path(torch.__file__).parent) + os.sep,
+                os.path.realpath(sysconfig.get_paths()["include"]) + os.sep,
+            ),
         )
 
     def build_and_load(self):
         if not 0 <= self.block_scale_shift <= MAX_BLOCK_SCALE_SHIFT:
             raise ValueError(f"block_scale_shift must be in [0, {MAX_BLOCK_SCALE_SHIFT}]")
-        shift_define = f"-DFMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT={self.block_scale_shift}"
-        cache_dir = _cache_root() / self.uri
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        recipe = self.recipe()
+        library = recipe.lookup()
+        if library is not None:
+            return _import_extension(self.module_name, library)
+        built = {}
+
+        def builder(cache_dir: Path) -> Path:
+            built["module"] = self._compile(cache_dir)
+            return cache_dir / f"{self.module_name}.so"
+
+        library = recipe.build(builder)
+        # cpp_extension.load already imported what this process built; a library another
+        # process published while this one waited for the lock is imported here.
+        return built.get("module") or _import_extension(self.module_name, library)
+
+    def _compile(self, cache_dir: Path):
         template = jinja2.Template(
             (_TEMPLATES / "prefill_attention_inst.cu.jinja").read_text(encoding="utf-8")
         )
-        generated_source = cache_dir / "prefill_attention_inst.cu"
         _write_text_if_changed(
-            generated_source,
-            template.render(
-                q_heads_per_kv=self.q_heads_per_kv,
-                head_dim=self.head_dim,
-                page_size=self.page_size,
-                q_stages=self.q_stages,
-                score_stages=self.score_stages,
-            ),
+            cache_dir / "prefill_attention_inst.cu", template.render(**self._template_params())
         )
-
-        module_name = f"_fmha_sm100_{self.uri}"
-        sources = [
-            _API / "prefill_attention_api.cpp",
-            _API / "prefill_attention_binding.cpp",
-            generated_source,
-        ]
-        include_paths = [
-            _API,
-            _INCLUDE,
-            _cutlass_root() / "include",
-            _cutlass_root() / "tools/util/include",
-        ]
         started_at = time.time()
         previous_cuda_home = cpp_extension.CUDA_HOME
         previous_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
@@ -160,25 +212,8 @@ class JitSpec:
         os.environ["TORCH_CUDA_ARCH_LIST"] = _torch_arch(self.target_arch)
         try:
             extension = cpp_extension.load(
-                name=module_name,
-                sources=[str(path) for path in sources],
-                extra_include_paths=[str(path) for path in include_paths],
-                extra_cflags=["-O3", "-DNDEBUG", "-std=c++20", shift_define],
-                extra_cuda_cflags=[
-                    "-O3",
-                    "-DNDEBUG",
-                    "-lineinfo",
-                    "-std=c++20",
-                    "--expt-relaxed-constexpr",
-                    "--expt-extended-lambda",
-                    "-static-global-template-stub=false",
-                    "-Xptxas=-O3",
-                    shift_define,
-                ],
-                extra_ldflags=[
-                    "-lcuda",
-                    f"-Wl,-rpath,{_cuda_home() / 'lib64'}",
-                ],
+                name=self.module_name,
+                **self._load_arguments(cache_dir),
                 build_directory=str(cache_dir),
                 verbose=False,
                 with_cuda=True,
