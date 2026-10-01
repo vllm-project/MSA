@@ -377,9 +377,11 @@ CUTLASS_DEVICE void run_softmax_warpgroup(Storage &storage, PrefillArguments con
   } else {
     if (valid_page) {
       cute::wait_barrier(storage.v_tma_full, 0);
+      // V rows past the KV length are zeroed: see dequant_fp4_tile_to_fp8_smem.
       dequant_fp4_tile_to_fp8_smem<kPageSize, kHeadDim, 16, /*TokenQuadScales=*/true>(
           &storage.v_raw[0][0], &storage.v_scale[0][0],
-          reinterpret_cast<uint8_t *>(storage.v.begin()), group_thread);
+          reinterpret_cast<uint8_t *>(storage.v.begin()), group_thread,
+          storage.work_tile.valid_cols);
     } else {
       clear_fp8_tile_smem<kPageSize, kHeadDim>(reinterpret_cast<uint8_t *>(storage.v.begin()),
                                                group_thread);

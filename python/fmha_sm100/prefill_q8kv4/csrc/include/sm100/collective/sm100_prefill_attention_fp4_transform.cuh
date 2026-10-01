@@ -72,10 +72,16 @@ CUTLASS_DEVICE void dequant_store_fp8_smem(
 
 // Scales are linear (byte token * 8 + group, the K layout) or, with TokenQuadScales, in the
 // token-quad order (byte (token / 4) * 32 + group * 4 + token % 4) that vLLM writes for V.
+//
+// Rows [valid_rows, NumRows) are past the request's KV length and are dequantized with a zero
+// scale, so they come out as exact zeros. For V this is required: those tokens have P = 0, but the
+// PV MMA still multiplies them, and the cache bytes there are unspecified (vLLM reuses blocks
+// across cache groups of different formats), so a NaN block scale (0x7F / 0xFF) would give
+// 0 x NaN = NaN.
 template <int NumRows, int HeadDim, int ScaleGroupSize, bool TokenQuadScales>
 CUTLASS_DEVICE void dequant_fp4_tile_to_fp8_smem(
     uint8_t const* packed_fp4, uint8_t const* scale,
-    uint8_t* output_smem, int thread_idx) {
+    uint8_t* output_smem, int thread_idx, int valid_rows = NumRows) {
   static_assert(NumRows == 128);
   static_assert(HeadDim == 128);
   static_assert(ScaleGroupSize == 16);
@@ -122,25 +128,29 @@ CUTLASS_DEVICE void dequant_fp4_tile_to_fp8_smem(
           ? (row_in_iteration / 4) * 32 + scale_group * 4 + row_in_iteration % 4
           : row_in_iteration * kScaleRowStride + scale_group;
   uint8_t const* current_scale = scale + scale_offset;
+  // Scale byte of the row `iterations_ahead` iterations past the current one, 0 past valid_rows.
+  int row = row_in_iteration;
+  auto row_scale = [&](int iterations_ahead) -> uint8_t {
+    return row + iterations_ahead * kRowsPerIteration < valid_rows
+               ? current_scale[iterations_ahead * kScaleIterationStride]
+               : uint8_t{0};
+  };
 
-  Fp4DequantInput input_a = load_fp4_dequant_input(
-      current_data, current_scale[0]);
+  Fp4DequantInput input_a = load_fp4_dequant_input(current_data, row_scale(0));
   Fp4DequantInput input_b = load_fp4_dequant_input(
-      current_data + kDataIterationStride,
-      current_scale[kScaleIterationStride]);
+      current_data + kDataIterationStride, row_scale(1));
   Fp4DequantInput input_c = load_fp4_dequant_input(
-      current_data + 2 * kDataIterationStride,
-      current_scale[2 * kScaleIterationStride]);
+      current_data + 2 * kDataIterationStride, row_scale(2));
 
   CUTLASS_PRAGMA_UNROLL
   for (int iteration = 0; iteration < kRowIterations - 3; ++iteration) {
     Fp4DequantInput input_d = load_fp4_dequant_input(
-        current_data + 3 * kDataIterationStride,
-        current_scale[3 * kScaleIterationStride]);
+        current_data + 3 * kDataIterationStride, row_scale(3));
     dequant_store_fp8_smem(input_a, output_address);
     output_address += kLinearRowStep;
     current_data += kDataIterationStride;
     current_scale += kScaleIterationStride;
+    row += kRowsPerIteration;
     input_a = input_b;
     input_b = input_c;
     input_c = input_d;
