@@ -10,7 +10,8 @@ descriptor construction. Non-TMA store/layout helpers are re-exported from
 
 import ctypes
 
-from cutlass import Int32, Int64
+from cutlass import Int32, Int64, const_expr
+import cutlass.cute as cute
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 import cutlass._mlir.dialects.cute as cute_ir
@@ -113,18 +114,33 @@ def tma_gather4(
 
 
 @dsl_user_op
-def prefetch_tma_desc_raw(tma_desc_ptr, *, loc=None, ip=None):
+def prefetch_tma_desc_raw(tma_desc_ptr, *, use_generic_ptr: bool = False, loc=None, ip=None):
     """Prefetch a raw TMA descriptor pointer into the descriptor cache."""
-    ptr_i64 = tma_desc_ptr.toint().ir_value(loc=loc, ip=ip)
-    ptr_i64_align_ty = cute_ir.ConstrainedIntType.get(128, ptr_i64.type.width)
-    ptr_i64_align = cute_ir.assume(ptr_i64_align_ty, ptr_i64, loc=loc, ip=ip)
-    ptr_ty = cute_ir.PtrType.get(
-        cute_nvgpu_ir.TmaDescriptorTiledType.get(),
-        cute_ir.AddressSpace.generic,
-        128,
-    )
-    desc_ptr = cute_ir.inttoptr(ptr_ty, ptr_i64_align, loc=loc, ip=ip)
-    cute_nvgpu_gen.arch_prefetch_tma_desc(desc_ptr.value, loc=loc, ip=ip)
+    if const_expr(use_generic_ptr):
+        llvm_ptr = tma_desc_ptr.to_llvm_ptr(loc=loc, ip=ip)
+        generic_ptr = llvm.addrspacecast(
+            llvm.PointerType.get(cute.AddressSpace.generic),
+            llvm_ptr,
+            loc=loc,
+            ip=ip,
+        )
+        cute.arch.prefetch(
+            generic_ptr,
+            tensormap=True,
+            loc=loc,
+            ip=ip,
+        )
+    else:
+        ptr_i64 = tma_desc_ptr.toint().ir_value(loc=loc, ip=ip)
+        ptr_i64_align_ty = cute_ir.ConstrainedIntType.get(128, ptr_i64.type.width)
+        ptr_i64_align = cute_ir.assume(ptr_i64_align_ty, ptr_i64, loc=loc, ip=ip)
+        ptr_ty = cute_ir.PtrType.get(
+            cute_nvgpu_ir.TmaDescriptorTiledType.get(),
+            cute_ir.AddressSpace.generic,
+            128,
+        )
+        desc_ptr = cute_ir.inttoptr(ptr_ty, ptr_i64_align, loc=loc, ip=ip)
+        cute_nvgpu_gen.arch_prefetch_tma_desc(desc_ptr.value, loc=loc, ip=ip)
 
 
 @dsl_user_op

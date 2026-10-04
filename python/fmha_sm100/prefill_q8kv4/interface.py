@@ -200,6 +200,10 @@ def run_prefill(
         out = torch.empty((total_q, num_q_heads, _HEAD_DIM), dtype=torch.bfloat16, **options)
 
     _, combine = _sparse_stack()
+    from ..sparse_fmha_adapter import _supports_blackwell_prefill
+
+    if _supports_blackwell_prefill(q.device, topk=topk):
+        from src.blackwell_prefill.combine import combine
     load_extension(q.device, block_scale_shift).run(
         q,
         k_cache,

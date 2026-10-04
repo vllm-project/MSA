@@ -33,6 +33,11 @@ from .rubin_softmax_helpers import (
 )
 
 
+# P448 convention used by the Blackwell sparse-prefill forward kernel.
+FP8_PROBABILITY_SCALE = 448.0
+LOG2_FP8_PROBABILITY_SCALE = math.log2(FP8_PROBABILITY_SCALE)
+
+
 @dataclass
 class Softmax(ParamsBase):
     scale_log2: Float32
@@ -354,9 +359,17 @@ class SoftmaxSm100(Softmax):
         self,
         acc_S_row: cute.Tensor,
         row_max: Float32,
+        fp8_probability: cutlass.Constexpr[bool] = False,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         row_max_scaled = row_max * self.scale_log2
+        if cutlass.const_expr(fp8_probability):
+            # Negating this fused offset matches the FlashInfer P448 bias.
+            row_max_scaled, _ = cute.arch.fma_packed_f32x2(
+                (row_max, row_max),
+                (self.scale_log2, self.scale_log2),
+                (-Float32(LOG2_FP8_PROBABILITY_SCALE), -Float32(LOG2_FP8_PROBABILITY_SCALE)),
+            )
         for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
             acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
                 (acc_S_row[i], acc_S_row[i + 1]),
@@ -372,6 +385,7 @@ class SoftmaxSm100(Softmax):
         ex2_emu_freq: cutlass.Constexpr[int] = 0,
         ex2_emu_res: cutlass.Constexpr[int] = 4,
         ex2_emu_start_frg: cutlass.Constexpr[int] = 0,
+        use_fma_subtract: cutlass.Constexpr[bool] = False,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         frg_tile = 32
@@ -399,7 +413,8 @@ class SoftmaxSm100(Softmax):
                         )
                     else:
                         acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
-                            acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
+                            acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j],
+                            use_fma_subtract=use_fma_subtract,
                         )
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)

@@ -218,6 +218,7 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
         phase: Int32,
         try_acquire_token: Optional[Boolean] = None,
         *,
+        explicit_tx_count: bool = False,
         loc=None,
         ip=None,
     ):
@@ -230,12 +231,22 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
             loc=loc,
             ip=ip,
         )
-        if_generate(
-            self.is_leader_cta,
-            lambda: self.sync_object_full.arrive(index, self.producer_mask, loc=loc, ip=ip),
-            loc=loc,
-            ip=ip,
-        )
+        if const_expr(explicit_tx_count):
+            if_generate(
+                self.is_leader_cta,
+                lambda: self.sync_object_full.arrive_and_expect_tx(
+                    index, self.sync_object_full.tx_count, loc=loc, ip=ip
+                ),
+                loc=loc,
+                ip=ip,
+            )
+        else:
+            if_generate(
+                self.is_leader_cta,
+                lambda: self.sync_object_full.arrive(index, self.producer_mask, loc=loc, ip=ip),
+                loc=loc,
+                ip=ip,
+            )
 
     @dsl_user_op
     def consumer_wait_w_index_phase(

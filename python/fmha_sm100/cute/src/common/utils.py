@@ -1001,7 +1001,7 @@ def ex2_emulation(x: Float32, *, poly_degree: int = 3, loc=None, ip=None) -> Flo
 
 @dsl_user_op
 def ex2_emulation_2(
-    x: Float32, y: Float32, *, poly_degree: int = 3, loc=None, ip=None
+    x: Float32, y: Float32, *, poly_degree: int = 3, use_fma_subtract: bool = False, loc=None, ip=None
 ) -> Tuple[Float32, Float32]:
     # We assume x <= 127.0 and y <= 127.0
     fp32_round_int = float(2**23 + 2**22)
@@ -1010,10 +1010,16 @@ def ex2_emulation_2(
     xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
-    xy_rounded_back = sub_packed_f32x2(
-        xy_rounded, (fp32_round_int, fp32_round_int)
-    )
-    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    if const_expr(use_fma_subtract):
+        xy_rounded_back = cute.arch.add_packed_f32x2(
+            xy_rounded, (-fp32_round_int, -fp32_round_int)
+        )
+        xy_frac = cute.arch.fma_packed_f32x2(xy_rounded_back, (-1.0, -1.0), xy_clamped)
+    else:
+        xy_rounded_back = sub_packed_f32x2(
+            xy_rounded, (fp32_round_int, fp32_round_int)
+        )
+        xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
     xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, POLY_EX2[poly_degree], loc=loc, ip=ip)
     x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)

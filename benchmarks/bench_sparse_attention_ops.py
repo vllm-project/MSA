@@ -58,6 +58,7 @@ DTYPE = "fp8"
 CSV_FILE = None
 DRY_RUN_MS = 200
 REPEAT_MS = 2000
+INCLUDE_PLAN = False
 
 
 def parse_int_list(value: str):
@@ -169,11 +170,14 @@ def bench_dense(b, h_q, h_k, q_len, k_len, d, output_mode, causal, dtype_str,
     qo_lens = torch.full((b,), q_len, dtype=torch.int32)
     kv_lens = torch.full((b,), k_len, dtype=torch.int32)
 
-    plan_info = fmha_sm100_plan(qo_lens, kv_lens, h_q,
-        num_kv_splits=num_kv_splits,
-        output_maxscore=True,
-        num_kv_heads=h_k,
-    )
+    def make_plan():
+        return fmha_sm100_plan(qo_lens, kv_lens, h_q,
+            num_kv_splits=num_kv_splits,
+            output_maxscore=True,
+            num_kv_heads=h_k,
+        )
+
+    plan_info = make_plan()
 
     out = torch.empty_like(q).to(torch.bfloat16)
 
@@ -184,7 +188,7 @@ def bench_dense(b, h_q, h_k, q_len, k_len, d, output_mode, causal, dtype_str,
     skip_maxscore = maxscore_elems >= (1 << 31)
     want_maxscore = output_mode in ("maxscore", "full") and not skip_maxscore
     fun = lambda: fmha_sm100(q, k, v,
-        plan_info=plan_info, out=out,
+        plan_info=make_plan() if INCLUDE_PLAN else plan_info, out=out,
         output_maxscore=want_maxscore,
         output_o=output_mode in ("o", "full") or skip_maxscore,
     )
@@ -234,12 +238,15 @@ def bench_paged(b, h_q, h_k, q_len, k_len, d, output_mode, causal, dtype_str,
     qo_offset_val = k_len - q_len if causal else 0
     qo_offset_tensor = torch.full((b,), qo_offset_val, dtype=torch.int32) if causal else None
 
-    plan_info = fmha_sm100_plan(qo_lens, kv_lens, h_q,
-        qo_offset=qo_offset_tensor,
-        page_size=page_size,
-        output_maxscore=True,
-        num_kv_heads=h_k,
-    )
+    def make_plan():
+        return fmha_sm100_plan(qo_lens, kv_lens, h_q,
+            qo_offset=qo_offset_tensor,
+            page_size=page_size,
+            output_maxscore=True,
+            num_kv_heads=h_k,
+        )
+
+    plan_info = make_plan()
 
     out = torch.empty_like(q).to(torch.bfloat16)
 
@@ -248,7 +255,7 @@ def bench_paged(b, h_q, h_k, q_len, k_len, d, output_mode, causal, dtype_str,
     skip_maxscore = maxscore_elems >= (1 << 31)
     want_maxscore = output_mode in ("maxscore", "full") and not skip_maxscore
     fun = lambda: fmha_sm100(q, k_cache, v_cache,
-        plan_info=plan_info, kv_indices=kv_indices, out=out,
+        plan_info=make_plan() if INCLUDE_PLAN else plan_info, kv_indices=kv_indices, out=out,
         output_maxscore=want_maxscore,
         output_o=output_mode in ("o", "full") or skip_maxscore,
     )
@@ -381,18 +388,21 @@ def bench_sparse(b, h_q, h_k, q_len, k_len, d, output_mode, causal, dtype_str,
     selected_blocks = torch.arange(actual_block_num, device=device, dtype=torch.int32)
     kv_block_indexes[:, :, :actual_block_num] = selected_blocks.view(1, 1, -1)
 
-    plan_info = fmha_sm100_plan(qo_lens, kv_lens, h_q,
-        qo_offset=qo_offset_tensor,
-        page_size=page_size,
-        kv_block_num=kv_block_num,
-        num_kv_heads=h_k,
-    )
+    def make_plan():
+        return fmha_sm100_plan(qo_lens, kv_lens, h_q,
+            qo_offset=qo_offset_tensor,
+            page_size=page_size,
+            kv_block_num=kv_block_num,
+            num_kv_heads=h_k,
+        )
+
+    plan_info = make_plan()
 
     out = torch.empty_like(q).to(torch.bfloat16)
 
     fun = lambda: fmha_sm100(
         q, k_cache, v_cache,
-        plan_info=plan_info,
+        plan_info=make_plan() if INCLUDE_PLAN else plan_info,
         kv_indices=kv_indices, out=out,
         kv_block_indexes=kv_block_indexes,
     )
@@ -535,7 +545,7 @@ NVFP4_SECTIONS = {"sparse_prefill"}
 
 
 def main():
-    global GPU_ID, DTYPE, CSV_FILE, DRY_RUN_MS, REPEAT_MS
+    global GPU_ID, DTYPE, CSV_FILE, DRY_RUN_MS, REPEAT_MS, INCLUDE_PLAN
 
     parser = argparse.ArgumentParser(description="MiniMax sparse attention sweep benchmark")
     parser.add_argument("--gpu", type=int, default=0)
@@ -558,6 +568,8 @@ def main():
     parser.add_argument("--blk-kv", type=int, default=128)
     parser.add_argument("--dry-run-ms", type=int, default=200)
     parser.add_argument("--repeat-ms", type=int, default=2000)
+    parser.add_argument("--include-plan", action="store_true",
+                        help="Include FP8/BF16 plan construction in the existing CUDA-event timed callback")
     args = parser.parse_args()
 
     if args.head_dim != 128:
@@ -569,6 +581,7 @@ def main():
     DTYPE = args.dtype
     DRY_RUN_MS = args.dry_run_ms
     REPEAT_MS = args.repeat_ms
+    INCLUDE_PLAN = args.include_plan
     torch.cuda.set_device(GPU_ID)
 
     if args.output:

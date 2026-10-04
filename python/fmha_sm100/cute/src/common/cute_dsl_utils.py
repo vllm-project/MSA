@@ -21,7 +21,9 @@ except ImportError:
 import cutlass
 import cutlass.cute as cute
 from cutlass.base_dsl.typing import JitArgument
-from cutlass.cutlass_dsl import NumericMeta
+from cutlass import Int32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import NumericMeta, dsl_user_op
 from cutlass.cute.runtime import from_dlpack
 
 StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
@@ -188,3 +190,28 @@ def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
     patterns are not interchangeable.
     """
     return tuple(s == 0 for s in tensor.stride())
+
+
+@dsl_user_op
+def exit_thread_if(predicate: Int32, *, loc=None, ip=None) -> None:
+    """Exit on a CTA-uniform predicate before allocating kernel resources."""
+
+    llvm.inline_asm(
+        None,
+        [Int32(predicate).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .pred p;\n\tsetp.ne.s32 p, $0, 0;\n\t@p exit;\n\t}\n",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+def compile_with_timing(*args, **kwargs):
+    """Compile one CuTe program and log host-side latency at DEBUG."""
+    started_at = time.perf_counter()
+    compiled = cute.compile(*args, **kwargs)
+    logger.debug("Compiled in %.1fs", time.perf_counter() - started_at)
+    return compiled
