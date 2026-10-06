@@ -252,27 +252,29 @@ def bind_indexer_module_loader(loader) -> None:
 def _topk_select(scores: torch.Tensor, lengths: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     """Write 15 score-ranked pages and the forced local page for every row.
 
-    ``scores`` is ``[rows, max_pages]``; ``lengths[row]`` counts the row's
-    candidates including its local page, which lands in the last slot. Ranked
-    pages are score-descending with ties broken toward the lower page. Rows with
-    at most 16 candidates emit ``0 .. lengths[row] - 1`` followed by ``-1``.
+    ``scores`` is ``[rows, max_pages]``, or a ``[groups, rows_per_group,
+    max_pages]`` view (a strided subset of the rows), ranked in row order;
+    ``lengths[row]`` counts the row's candidates including its local page,
+    which lands in the last slot. Ranked pages are score-descending with ties
+    broken toward the lower page. Rows with at most 16 candidates emit
+    ``0 .. lengths[row] - 1`` followed by ``-1``.
     """
 
     _indexer_module_loader("indexer_topk_select").indexer_topk_select(
         scores,
         lengths,
-        out.view(scores.shape[0], _TOP_K),
+        out.view(lengths.shape[0], _TOP_K),
         _stream_ptr(scores.device),
     )
     return out
 
 
-def _decode_num_valid_pages(seq_lens: torch.Tensor, max_pages: int, num_heads: int) -> torch.Tensor:
-    """Candidate pages per (MTP token, head) row, including the token's local page."""
+def _decode_num_valid_pages(
+    seq_lens: torch.Tensor, max_pages: int, num_heads: int, query_len: int = _DECODE_QUERY_LENGTH
+) -> torch.Tensor:
+    """Candidate pages per (query, head) row, including the query's local page."""
 
-    query_offsets = torch.arange(
-        -_DECODE_QUERY_LENGTH, 0, dtype=torch.int32, device=seq_lens.device
-    )
+    query_offsets = torch.arange(-query_len, 0, dtype=torch.int32, device=seq_lens.device)
     positions = seq_lens[:, None] + query_offsets[None, :]
     lengths = torch.div(positions, _PAGE_SIZE, rounding_mode="floor").add_(1)
     lengths.clamp_(min=1, max=max_pages)
@@ -290,8 +292,8 @@ class _BatchDecodeIndexerBase:
     streams.
 
     Wrappers with ``_supports_query_len`` also plan requests of fewer queries
-    (``query_len``): ``q`` then holds only those, and they take the last
-    ``query_len`` of the eight slots, whose leading results are not meaningful.
+    (``query_len``): ``q`` and the output then hold only those, which take the
+    last ``query_len`` of the eight slots.
     """
 
     def __init__(
@@ -451,12 +453,13 @@ class _BatchDecodeIndexerBase:
         self._query_len = query_len
         self._plan_scheduler(block_table, seq_lens)
 
-        tokens = batch_size * _DECODE_QUERY_LENGTH
+        tokens = batch_size * query_len
         score_shape = (batch_size, _DECODE_QUERY_LENGTH * self._num_heads, max_pages)
         if (
             self._scores is None
             or self._scores.shape != score_shape
             or self._scores.device != device
+            or self._topk_indices.shape[0] != tokens
         ):
             self._scores = torch.empty(score_shape, dtype=torch.float32, device=device)
             self._num_valid_pages = torch.empty(
@@ -465,7 +468,9 @@ class _BatchDecodeIndexerBase:
             self._topk_indices = torch.empty(
                 (tokens, self._num_heads, _TOP_K), dtype=torch.int32, device=device
             )
-        self._num_valid_pages.copy_(_decode_num_valid_pages(seq_lens, max_pages, self._num_heads))
+        self._num_valid_pages.copy_(
+            _decode_num_valid_pages(seq_lens, max_pages, self._num_heads, query_len)
+        )
 
     def _run_scores(self, q: torch.Tensor, k_cache: torch.Tensor) -> torch.Tensor:
         """Write historical page scores; the local page and later pages stay untouched."""
@@ -485,14 +490,16 @@ class _BatchDecodeIndexerBase:
         *,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return ``[batch * 8, num_heads, 16]`` logical page indices for one layer."""
+        """Return ``[batch * query_len, num_heads, 16]`` logical page indices for one layer."""
 
         scores = self._run_scores(q, k_cache)
         if out is None:
             out = self._topk_indices
         else:
             _check_topk_output(out, self._topk_indices.shape[0], self._num_heads, scores.device)
-        return _topk_select(scores.view(-1, scores.shape[-1]), self._num_valid_pages, out)
+        # The rows of the queries q holds, which fill the last slots of the eight.
+        query_rows = scores[:, (_DECODE_QUERY_LENGTH - self._query_len) * self._num_heads :]
+        return _topk_select(query_rows, self._num_valid_pages, out)
 
 
 class BatchDecodeIndexerQ8KV8Wrapper(_BatchDecodeIndexerBase):
@@ -521,7 +528,7 @@ class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
     on CUDA 13.4 or newer use the public QMUL4 instruction on SM100/SM103, and
     older ones select the exact FP16 dequantization. Requests may carry fewer than
     eight queries (``plan(..., query_len=n)``), so a caller needs no zero-padded
-    copy of its queries.
+    copy of its queries and gets ``[batch * n, num_heads, 16]`` back.
 
     Example::
 

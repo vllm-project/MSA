@@ -498,7 +498,7 @@ def test_decode_concurrent_streams_do_not_alias(fmt, num_heads):
 @pytest.mark.parametrize("query_len", (1, 2, 4, 7))
 @pytest.mark.parametrize("batch,max_pages", [(1, 1), (5, 6), (129, 4)])
 def test_decode_short_queries_match_zero_padded(num_heads, query_len, batch, max_pages):
-    """Fewer than eight queries per request score exactly like a zero-padded tile."""
+    """Fewer than eight queries per request match the real rows of a zero-padded tile."""
 
     seed = 100 * batch + 10 * query_len + num_heads
     padded_q, k, block_table, seq_lens = _make_decode(
@@ -519,8 +519,12 @@ def test_decode_short_queries_match_zero_padded(num_heads, query_len, batch, max
     real = slice(pad * num_heads, None)
     scores = _run_decode_scores(wrapper, q, k.cache)
     assert torch.equal(scores[:, real], expected_scores[:, real])
-    topk = wrapper.run(q, k.cache).view(batch, MTP, num_heads, TOP_K)
-    assert torch.equal(topk[:, pad:], expected_topk[:, pad:])
+    out = torch.full((batch * query_len, num_heads, TOP_K), -777, dtype=torch.int32, device="cuda")
+    topk = wrapper.run(q, k.cache, out=out)
+    assert topk.data_ptr() == out.data_ptr()
+    expected = expected_topk[:, pad:].reshape(batch * query_len, num_heads, TOP_K)
+    assert torch.equal(out, expected)
+    assert torch.equal(wrapper.run(q, k.cache), expected)
 
 
 def test_decode_compile_is_shape_independent_and_workspace_is_released():
@@ -960,6 +964,24 @@ def test_topk_select_contract(max_cols):
     baseline = out.clone()
     for _ in range(3):
         assert torch.equal(_topk_select(scores, lengths, out), baseline)
+
+
+def test_topk_select_strided_row_groups():
+    """A [groups, rows, cols] view ranks the same rows as their contiguous copy."""
+
+    generator = _generator(5)
+    groups, rows, skip, cols = 7, 3, 5, 300
+    full = torch.randn((groups, skip + rows + 2, cols + 9), generator=generator, device="cuda")
+    view = full[:, skip : skip + rows, :cols]
+    lengths = torch.randint(
+        1, cols + 1, (groups * rows,), generator=generator, device="cuda", dtype=torch.int32
+    )
+    out = torch.empty((groups * rows, TOP_K), dtype=torch.int32, device="cuda")
+    _topk_select(view, lengths, out)
+    expected = torch.empty_like(out)
+    _topk_select(view.reshape(groups * rows, cols).contiguous(), lengths, expected)
+    assert torch.equal(out, expected)
+    _assert_topk_contract(view.reshape(groups * rows, cols), lengths, out)
 
 
 def test_topk_select_exact_ties():
