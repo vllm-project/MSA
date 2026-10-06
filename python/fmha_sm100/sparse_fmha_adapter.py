@@ -28,105 +28,14 @@ _MM_SPARSE_DIR = os.path.join(
 if os.path.isdir(_MM_SPARSE_DIR) and _MM_SPARSE_DIR not in sys.path:
     sys.path.insert(0, os.path.abspath(_MM_SPARSE_DIR))
 
-from interface import sparse_atten_func, sparse_atten_nvfp4_kv_func
+from interface import (
+    sparse_atten_func, sparse_atten_nvfp4_kv_func, _supports_blackwell_prefill,
+)
 from sparse_index_utils import build_k2q_csr
 from src.sm100.prepare_scheduler import SPARSE_SCHEDULE_MODEL
 from src.common.aot_cache import aot_object_path
 
 from . import q8kv4_prefill_adapter
-
-
-def _blackwell_prefill_enabled():
-    value = os.environ.get("FMHA_SM100_BLACKWELL_PREFILL", "1")
-    if value not in ("0", "1"):
-        raise ValueError("FMHA_SM100_BLACKWELL_PREFILL must be 0 or 1")
-    return value == "1"
-
-
-def _supports_blackwell_prefill(device, *, topk, page_size=128, usable_sm_count=-1):
-    return (
-        _blackwell_prefill_enabled()
-        and topk == 16
-        and page_size == 128
-        and usable_sm_count <= 0
-        and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
-    )
-
-
-def _can_run_blackwell_prefill(q, k, v, plan, page_table, *, q_offset_override=None,
-            q_scale=None, k_scale=None, v_scale=None, o_scale=None, out=None):
-    if not q.is_cuda or q.ndim != 3 or q.shape[-1] != 128 or q.shape[0] == 0:
-        return False
-    if not _supports_blackwell_prefill(q.device, topk=plan["kv_block_num"],
-                             page_size=plan["page_size"],
-                             usable_sm_count=int(plan.get("usable_SM_count", -1))):
-        return False
-    if not plan.get("causal") or not plan.get("blackwell_default_causal_offset", False):
-        return False
-    if q_offset_override is not None or any(x is not None for x in (q_scale, k_scale, v_scale, o_scale)):
-        return False
-    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn) or not q.is_contiguous():
-        return False
-    if k.ndim != 4 or k.shape != v.shape or k.shape[-2:] != (128, 128) or k.shape[1] <= 0:
-        return False
-    if k.dtype != v.dtype or not (
-        k.dtype == q.dtype
-        or (q.dtype == torch.bfloat16 and k.dtype == torch.float8_e4m3fn)
-    ):
-        return False
-    if any(t.device != q.device or t.stride(-1) != 1
-           or t.data_ptr() % 16 for t in (q, k, v)):
-        return False
-    if q.dtype == torch.float8_e4m3fn and not (k.is_contiguous() and v.is_contiguous()):
-        return False
-    ratio, remainder = divmod(q.shape[1], k.shape[1])
-    allowed = (8, 16) if q.dtype == torch.bfloat16 else (1, 2, 4, 8, 16)
-    if remainder or ratio not in allowed:
-        return False
-    if page_table is None or page_table.dtype != torch.int32 or page_table.device != q.device:
-        return False
-    if not page_table.is_contiguous() or page_table.data_ptr() % 16:
-        return False
-    if out is not None and (out.shape != q.shape or out.dtype != torch.bfloat16
-                            or out.device != q.device or not out.is_contiguous()):
-        return False
-    return True
-
-
-def _prepare_blackwell_metadata(
-    q2k, cu_seqlens_q, cu_seqlens_k, *, total_k, total_rows,
-    max_seqlen_q, max_seqlen_k, qhead_per_kv=16,
-):
-    # Rebuild CSR and the forward schedule from this layer's current TopK.
-    return build_k2q_csr(
-        q2k, cu_seqlens_q, cu_seqlens_k, 128,
-        total_k=total_k, total_rows=total_rows,
-        max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
-        qhead_per_kv=int(qhead_per_kv), return_schedule=True,
-    )
-
-
-def _run_blackwell_prefill(q, k, v, plan, q2k, page_table, *, sm_scale=None, out=None):
-    from src.blackwell_prefill.atten_fwd_sm100 import run_pagekv
-    from src.blackwell_prefill.combine import combine
-
-    row_ptr, q_indices, schedule = _prepare_blackwell_metadata(
-        q2k, plan["cu_seqlens_q"], plan["cu_seqlens_k"],
-        total_k=plan["total_k"], total_rows=plan["total_rows"],
-        max_seqlen_q=plan["max_seqlen_q"], max_seqlen_k=plan["max_seqlen_k"],
-        qhead_per_kv=q.shape[1] // k.shape[1],
-    )
-    partial = torch.empty((16, *q.shape), dtype=torch.bfloat16, device=q.device)
-    stats = torch.empty((16, *q.shape[:2]), dtype=torch.float32, device=q.device)
-    if out is None:
-        out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
-    run_pagekv(q, k, v, page_table, plan["cu_seqlens_q"], plan["cu_seqlens_k"],
-               row_ptr, q_indices, schedule, partial, stats,
-               softmax_scale=q.shape[-1] ** -0.5 if sm_scale is None else float(sm_scale),
-               max_seqlen_q=plan["max_seqlen_q"])
-    combine(partial, stats, out, None, cu_seqlens=plan["cu_seqlens_q"],
-            split_counts=schedule.split_counts, use_pdl=True, raw_partial_stats=False)
-    return out
 
 
 def _compute_aot_kernel_paths(head_dim, n_block_size, qhead_per_kv, topk,
@@ -280,11 +189,6 @@ def sparse_fmha_plan(
         "blk_kv": blk_kv,
         "kv_block_num": kv_block_num,
         "causal": causal,
-        # nv_dev's PageKV launcher derives bottom-right causal alignment from
-        # the sequence lengths. Other offsets retain the existing dev route.
-        "blackwell_default_causal_offset": qo_offset is None or torch.equal(
-            qo_segment_lens + qo_offset, kv_segment_lens
-        ),
         "batch": batch,
         "MM-SA-Nv":True,
         "usable_SM_count":usable_SM_count,
@@ -481,14 +385,6 @@ def sparse_fmha(
                 kv_indices, kv_segment_lens, page_size, batch,
             )
 
-    if not is_nvfp4 and _can_run_blackwell_prefill(
-        q, k, v, plan_info, page_table, q_offset_override=q_offset_override,
-        q_scale=q_scale, k_scale=k_scale, v_scale=v_scale, o_scale=o_scale, out=out,
-    ):
-        return _run_blackwell_prefill(
-            q, k, v, plan_info, q2k, page_table, sm_scale=sm_scale, out=out,
-        ), None
-
     # build_k2q_csr(return_schedule=True) builds schedule using hardware SM count internally
     # (build_k2q_csr_native.cu), which ignores usable_SM_count. When SM-limited, skip its
     # schedule and let prepare_scheduler build one that respects usable_SM_count.
@@ -547,9 +443,14 @@ def sparse_fmha(
         seqused_k=seqused_k,
         schedule=schedule,
         usable_SM_count=usable_SM_count,
+        out=out if (
+            out is not None and out.dtype == torch.bfloat16
+            and out.shape == q.shape and out.device == q.device
+            and out.is_contiguous() and out.data_ptr() % 16 == 0
+        ) else None,
     )
 
-    if out is not None:
+    if out is not None and result is not out:
         out.copy_(result)
         return out, None
     return result, None

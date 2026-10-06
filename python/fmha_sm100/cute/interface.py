@@ -606,6 +606,90 @@ def _validate_fwd_schedule(
         raise ValueError("schedule.qsplit_indices and schedule.split_counts must be contiguous")
 
 
+def _blackwell_prefill_enabled():
+    value = os.environ.get("FMHA_SM100_BLACKWELL_PREFILL", "1")
+    if value not in ("0", "1"):
+        raise ValueError("FMHA_SM100_BLACKWELL_PREFILL must be 0 or 1")
+    return value == "1"
+
+
+def _supports_blackwell_prefill(device, *, topk, page_size=128, usable_sm_count=-1):
+    return (
+        _blackwell_prefill_enabled()
+        and topk == 16
+        and page_size == 128
+        and usable_sm_count <= 0
+        and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
+    )
+
+
+def _try_blackwell_sparse_prefill(
+    q, k, v, k2q_row_ptr, k2q_q_indices, *,
+    topK, blk_kv, causal, softmax_scale, partial_dtype,
+    return_softmax_lse, return_temperature_lse, cu_seqlens_q, cu_seqlens_k,
+    page_table, seqused_k, schedule, usable_SM_count, max_seqlen_q,
+    qk_dtype, pv_dtype, output_scale, out, enable_fp16_softmax, enable_2x_fp8,
+):
+    """Use the port only for supported modes; None selects the existing backend.
+
+    Reuse the caller's CSR and schedule. Do not rebuild metadata or inspect
+    device tensor values on the host, so dispatch remains graph-capture safe.
+    """
+    if not _supports_blackwell_prefill(
+        q.device, topk=topK, page_size=blk_kv, usable_sm_count=usable_SM_count,
+    ):
+        return None
+    if (not causal or schedule is None or page_table is None
+            or partial_dtype != torch.bfloat16
+            or return_softmax_lse or return_temperature_lse
+            or output_scale is not None
+            or enable_fp16_softmax or enable_2x_fp8
+            or qk_dtype != q.dtype or pv_dtype != q.dtype):
+        return None
+    if not q.is_contiguous() or q.shape[0] == 0:
+        return None
+    if k.ndim != 4 or k.shape != v.shape or k.shape[-2:] != (128, 128):
+        return None
+    if k.dtype != v.dtype or not (
+        k.dtype == q.dtype
+        or (q.dtype == torch.bfloat16 and k.dtype == torch.float8_e4m3fn)
+    ):
+        return None
+    if any(t.stride(-1) != 1 or t.data_ptr() % 16 for t in (q, k, v)):
+        return None
+    if q.dtype == torch.float8_e4m3fn and not (k.is_contiguous() and v.is_contiguous()):
+        return None
+    allowed = (8, 16) if q.dtype == torch.bfloat16 else (1, 2, 4, 8, 16)
+    if q.shape[1] // k.shape[1] not in allowed:
+        return None
+    if not page_table.is_contiguous() or page_table.data_ptr() % 16:
+        return None
+    if out is not None and (
+        out.shape != q.shape or out.dtype != torch.bfloat16
+        or out.device != q.device or not out.is_contiguous() or out.data_ptr() % 16
+    ):
+        return None
+    _validate_fwd_schedule(schedule, q=q, k2q_q_indices=k2q_q_indices, head_kv=k.shape[1])
+
+    from src.blackwell_prefill.atten_fwd_sm100 import run_pagekv
+    from src.blackwell_prefill.combine import combine as blackwell_combine
+
+    partial = torch.empty((topK, *q.shape), dtype=torch.bfloat16, device=q.device)
+    stats = torch.empty((topK, *q.shape[:2]), dtype=torch.float32, device=q.device)
+    if out is None:
+        out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+    run_pagekv(
+        q, k, v, page_table, cu_seqlens_q, cu_seqlens_k,
+        k2q_row_ptr, k2q_q_indices, schedule, partial, stats,
+        softmax_scale=softmax_scale, max_seqlen_q=max_seqlen_q, seqused_k=seqused_k,
+    )
+    blackwell_combine(
+        partial, stats, out, None, cu_seqlens=cu_seqlens_q,
+        split_counts=schedule.split_counts, use_pdl=True, raw_partial_stats=False,
+    )
+    return out
+
+
 def sparse_atten_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -732,6 +816,10 @@ def sparse_atten_func(
     -----
     ``Hq / Hkv`` must be one of ``1, 2, 4, 8, 16``.  Current kernels support
     head dimension 128 only.
+    Eligible SM100/SM103 paged causal calls with a supplied schedule use the
+    Blackwell port. Set FMHA_SM100_BLACKWELL_PREFILL=0 to use the original
+    backend. Other modes retain the original backend, including LSE returns,
+    output scaling, alternate partial dtypes, and calls without a schedule.
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -765,6 +853,21 @@ def sparse_atten_func(
     )
     max_seqlen_q = int(max_seqlen_q)
     max_seqlen_k = int(max_seqlen_k)
+
+    port_out = _try_blackwell_sparse_prefill(
+        q, k, v, k2q_row_ptr, k2q_q_indices,
+        topK=int(topK), blk_kv=int(blk_kv), causal=bool(causal),
+        softmax_scale=float(softmax_scale), partial_dtype=partial_dtype,
+        return_softmax_lse=return_softmax_lse,
+        return_temperature_lse=return_temperature_lse,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        page_table=page_table, seqused_k=seqused_k, schedule=schedule,
+        usable_SM_count=int(usable_SM_count), max_seqlen_q=max_seqlen_q,
+        qk_dtype=qk_dtype, pv_dtype=pv_dtype, output_scale=output_scale, out=out,
+        enable_fp16_softmax=enable_fp16_softmax, enable_2x_fp8=enable_2x_fp8,
+    )
+    if port_out is not None:
+        return port_out
 
     return _sparse_atten_csr_varlen_forward(
         q,

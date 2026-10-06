@@ -3133,6 +3133,7 @@ def _compile_kernel(
     lse_partial: torch.Tensor,
     softmax_scale: float,
     max_seqlen_q: int,
+    seqused_k: Optional[torch.Tensor] = None,
 ) -> object:
     scheduler_metadata = schedule.scheduler_metadata
     work_count = schedule.work_count
@@ -3168,6 +3169,7 @@ def _compile_kernel(
         v_cache.dtype,
         torch.bfloat16,
         True,
+        seqused_k is not None,
     )
     compiled = _COMPILE_CACHE.get(key)
     if compiled is not None:
@@ -3184,7 +3186,7 @@ def _compile_kernel(
         n_block_size=_BLOCK_KV,
         paged_kv=True,
         page_size=_PAGE_SIZE,
-        has_seqused_k=False,
+        has_seqused_k=seqused_k is not None,
         causal=True,
         use_prepare_scheduler=True,
         qk_dtype=mma_dtype,
@@ -3205,7 +3207,7 @@ def _compile_kernel(
         _to_cute_tensor(q_flat),
         None if q_gather4_desc is None else _to_cute_tensor(q_gather4_desc),
         _to_cute_tensor(page_table),
-        None,
+        None if seqused_k is None else to_cute_tensor(seqused_k, assumed_align=4),
         _to_cute_tensor(cu_seqlens_q),
         _to_cute_tensor(cu_seqlens_k),
         None,
@@ -3241,6 +3243,7 @@ def run_pagekv(
     *,
     softmax_scale: float,
     max_seqlen_q: int,
+    seqused_k: Optional[torch.Tensor] = None,
 ) -> None:
     """Compile and launch the Blackwell sparse-prefill forward kernel."""
 
@@ -3276,6 +3279,7 @@ def run_pagekv(
         lse_partial=lse_partial,
         softmax_scale=softmax_scale,
         max_seqlen_q=max_seqlen_q,
+        seqused_k=seqused_k,
     )
     with torch.cuda.nvtx.range("Fwd_PageKV_SparseAttn"):
         compiled(
@@ -3291,7 +3295,7 @@ def run_pagekv(
             q_flat,
             q_gather4_desc,
             page_table,
-            None,
+            seqused_k,
             cu_seqlens_q,
             cu_seqlens_k,
             None,
