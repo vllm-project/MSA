@@ -164,6 +164,9 @@ class Q8KV4DecodeIndexerSm100:
             raise TypeError("out must be Float32")
 
         batch_size = mPageTable.shape[0]
+        # q holds 1..8 queries per request; they fill the last slots of its
+        # eight, so the TMA box starts that many rows before the request.
+        query_rows = mQ.shape[0] // batch_size * self.num_heads
         physical_pages = mKCache.shape[0]
         # Each page is contiguous; vLLM may pad the stride between pages.
         page_stride = mKCache.stride[0]
@@ -184,7 +187,7 @@ class Q8KV4DecodeIndexerSm100:
         mQ_krb = cute.make_tensor(
             mQ.iterator,
             cute.make_layout(
-                (self.head_dim, self.num_queries * batch_size),
+                (self.head_dim, query_rows * batch_size),
                 stride=(1, self.head_dim),
             ),
         )
@@ -289,6 +292,7 @@ class Q8KV4DecodeIndexerSm100:
             mOut_pqb,
             mScheduler,
             batch_size,
+            query_rows,
             sPacked_layout,
             sScale_layout,
             tK_layout,
@@ -316,6 +320,7 @@ class Q8KV4DecodeIndexerSm100:
         mOut_pqb: cute.Tensor,
         mScheduler: cute.Tensor,
         batch_size: Int32,
+        query_rows: Int32,
         sPacked_layout: cute.ComposedLayout,
         sScale_layout: cute.Layout,
         tK_layout: cute.ComposedLayout,
@@ -459,13 +464,6 @@ class Q8KV4DecodeIndexerSm100:
                 cute.flat_divide(mKScale, (self.scale_row_bytes, self.scale_rows)), 0, 2
             ),
         )
-        tQsQ, tQgQ = cpasync.tma_partition(
-            tma_atom_Q,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sQ_tma, 0, 2),
-            cute.group_modes(cute.flat_divide(mQ_krb, (self.head_dim, self.num_queries)), 0, 2),
-        )
 
         tCrQ = tiled_mma.make_fragment_B(sQ)
         acc_shape = tiled_mma.partition_shape_C((self.m_tile, self.n_tile))
@@ -587,9 +585,27 @@ class Q8KV4DecodeIndexerSm100:
                 if segment_pages > pages_remaining:  # noqa: PLR1730
                     segment_pages = pages_remaining
                 q_empty = q_producer.acquire_and_advance()
+                # Rows before the request belong to the previous one, or are
+                # out of bounds and zero-filled for the first: they only fill
+                # the unused leading slots.
+                q_row = (current_batch + Int32(1)) * query_rows - Int32(self.num_queries)
+                tQsQ, tQgQ = cpasync.tma_partition(
+                    tma_atom_Q,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sQ_tma, 0, 2),
+                    cute.group_modes(
+                        cute.flat_divide(
+                            cute.domain_offset((0, q_row), mQ_krb),
+                            (self.head_dim, self.num_queries),
+                        ),
+                        0,
+                        2,
+                    ),
+                )
                 cute.copy(
                     tma_atom_Q,
-                    tQgQ[(None, 0, current_batch)],
+                    tQgQ[(None, 0, 0)],
                     tQsQ,
                     tma_bar_ptr=q_empty.barrier,
                 )

@@ -20,6 +20,8 @@ struct IndexerGemmArguments {
   float *output_ptr = nullptr;
   size_t scheduler_temp_storage_bytes = 0;
   int batch = 0;
+  // Queries per request in q, 1..8; they score the last query_length slots.
+  int query_length = 8;
   int max_pages = 0;
   int physical_pages = 0;
   int64_t page_stride_bytes = 0;

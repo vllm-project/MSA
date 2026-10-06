@@ -82,10 +82,19 @@ struct IndexerGemmCollective : IndexerGemmConfig<Traits, SchedulerCounterOffset>
           params.page_table_ptr + static_cast<size_t>(batch_idx) * params.max_pages;
 
       if (local_pages > 0 && thread_idx < (Traits::kQueryLength * Traits::kHeadDim) / 16) {
-        size_t const query_offset =
-            static_cast<size_t>(batch_idx) * Traits::kQueryLength * Traits::kHeadDim;
-        reinterpret_cast<uint4 *>(storage.q_tile)[thread_idx] =
-            reinterpret_cast<uint4 const *>(params.q_ptr + query_offset)[thread_idx];
+        // A request's query_length queries take the last slots of the tile;
+        // the leading slots score zeros and are never read back.
+        constexpr int kChunksPerQuery = Traits::kHeadDim / 16;
+        int const slot =
+            thread_idx / kChunksPerQuery - (Traits::kQueryLength - params.query_length);
+        uint4 chunk = make_uint4(0u, 0u, 0u, 0u);
+        if (slot >= 0) {
+          size_t const query_offset =
+              (static_cast<size_t>(batch_idx) * params.query_length + slot) * Traits::kHeadDim;
+          chunk = reinterpret_cast<uint4 const *>(params.q_ptr + query_offset)[thread_idx %
+                                                                               kChunksPerQuery];
+        }
+        reinterpret_cast<uint4 *>(storage.q_tile)[thread_idx] = chunk;
       }
 
       int const initial_pages = min(local_pages, Traits::kMaxPagesPerCta);

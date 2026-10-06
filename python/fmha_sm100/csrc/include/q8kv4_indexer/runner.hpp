@@ -31,7 +31,8 @@ template <class Traits> struct IndexerGemmRunner {
     return arguments.q_ptr != nullptr && arguments.k_cache_ptr != nullptr &&
            arguments.page_table_ptr != nullptr && arguments.kv_lengths_ptr != nullptr &&
            arguments.scheduler_workspace_ptr != nullptr && arguments.output_ptr != nullptr &&
-           arguments.batch > 0 && arguments.max_pages > 0 &&
+           arguments.batch > 0 && arguments.query_length > 0 &&
+           arguments.query_length <= Traits::kQueryLength && arguments.max_pages > 0 &&
            arguments.max_pages <= Traits::kMaximumPages && arguments.physical_pages > 0 &&
            arguments.page_stride_bytes >= Traits::kPageBytes &&
            arguments.page_stride_bytes % 16 == 0 && arguments.sm_count > 0;
@@ -75,6 +76,7 @@ template <class Traits> struct IndexerGemmRunner {
       return status;
     }
     params.q_ptr = static_cast<uint8_t const *>(arguments.q_ptr);
+    params.query_length = arguments.query_length;
     params.output_ptr = arguments.output_ptr;
     params.sm_count = arguments.sm_count;
 

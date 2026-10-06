@@ -494,6 +494,35 @@ def test_decode_concurrent_streams_do_not_alias(fmt, num_heads):
         assert torch.equal(out, expected)
 
 
+@pytest.mark.parametrize("num_heads", DECODE_HEADS["q8kv4"])
+@pytest.mark.parametrize("query_len", (1, 2, 4, 7))
+@pytest.mark.parametrize("batch,max_pages", [(1, 1), (5, 6), (129, 4)])
+def test_decode_short_queries_match_zero_padded(num_heads, query_len, batch, max_pages):
+    """Fewer than eight queries per request score exactly like a zero-padded tile."""
+
+    seed = 100 * batch + 10 * query_len + num_heads
+    padded_q, k, block_table, seq_lens = _make_decode(
+        "q8kv4", batch, max_pages, seed, num_heads=num_heads
+    )
+    pad = MTP - query_len
+    tiles = padded_q.view(batch, MTP, num_heads, HEAD_DIM)
+    tiles[:, :pad] = torch.zeros((), device="cuda").to(torch.float8_e4m3fn)
+    q = tiles[:, pad:].reshape(batch * query_len, num_heads, HEAD_DIM).clone()
+
+    padded = BatchDecodeIndexerQ8KV4Wrapper(num_heads=num_heads)
+    padded.plan(block_table, seq_lens)
+    expected_scores = _run_decode_scores(padded, padded_q, k.cache).clone()
+    expected_topk = padded.run(padded_q, k.cache).view(batch, MTP, num_heads, TOP_K)
+
+    wrapper = BatchDecodeIndexerQ8KV4Wrapper(num_heads=num_heads)
+    wrapper.plan(block_table, seq_lens, query_len=query_len)
+    real = slice(pad * num_heads, None)
+    scores = _run_decode_scores(wrapper, q, k.cache)
+    assert torch.equal(scores[:, real], expected_scores[:, real])
+    topk = wrapper.run(q, k.cache).view(batch, MTP, num_heads, TOP_K)
+    assert torch.equal(topk[:, pad:], expected_topk[:, pad:])
+
+
 def test_decode_compile_is_shape_independent_and_workspace_is_released():
     """Batch, page-table width, and lengths reuse one compiled kernel per format and heads."""
 
@@ -636,6 +665,15 @@ def test_decode_rejects_invalid_inputs(fmt):
         wrapper.run(q, k.cache.transpose(0, 1).contiguous().transpose(0, 1))
     with pytest.raises(ValueError, match="out must have shape"):
         wrapper.run(q, k.cache, out=torch.empty((4 * MTP, TOP_K), dtype=torch.int32, device="cuda"))
+    bad_query_lens = (0, 9, True) if fmt == "q8kv4" else (1, 7)
+    for query_len in bad_query_lens:
+        with pytest.raises(ValueError, match="supports query_len"):
+            wrapper.plan(block_table, seq_lens, query_len=query_len)
+    if fmt == "q8kv4":
+        wrapper.plan(block_table, seq_lens, query_len=2)
+        with pytest.raises(ValueError, match="q must have shape"):
+            wrapper.run(q, k.cache)
+        wrapper.plan(block_table, seq_lens)
     other = DECODE_FORMATS[1 - DECODE_FORMATS.index(fmt)]
     _, other_k, _, _ = _make_decode(other, 4, 3, 3)
     with pytest.raises((TypeError, ValueError)):

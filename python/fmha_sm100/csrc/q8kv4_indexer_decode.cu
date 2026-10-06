@@ -186,9 +186,12 @@ void q8kv4_indexer_run(TensorView q, TensorView k_cache, TensorView page_table, 
   int const max_pages = static_cast<int>(page_table.size(1));
   TVM_FFI_ICHECK(sm_count > 0 && sm_count <= std::numeric_limits<int>::max())
       << "sm_count must be positive and fit in int32";
-  TVM_FFI_ICHECK(q.ndim() == 3 && q.size(0) == static_cast<int64_t>(batch) * Traits::kQueryLength &&
-                 q.size(1) == 1 && q.size(2) == Traits::kHeadDim)
-      << "q must have shape [batch * 8, 1, 128]";
+  // q holds 1..8 queries per request, which score the last slots of the eight.
+  int64_t const query_length = q.ndim() == 3 ? q.size(0) / batch : 0;
+  TVM_FFI_ICHECK(q.ndim() == 3 && query_length >= 1 && query_length <= Traits::kQueryLength &&
+                 q.size(0) == static_cast<int64_t>(batch) * query_length && q.size(1) == 1 &&
+                 q.size(2) == Traits::kHeadDim)
+      << "q must have shape [batch * query_length, 1, 128] with query_length in [1, 8]";
   TVM_FFI_ICHECK(k_cache.ndim() == 3 && k_cache.size(0) > 0 &&
                  k_cache.size(0) <= std::numeric_limits<int>::max() &&
                  k_cache.size(1) == Traits::kPageTokens &&
@@ -214,6 +217,7 @@ void q8kv4_indexer_run(TensorView q, TensorView k_cache, TensorView page_table, 
   arguments.scheduler_workspace_ptr = reinterpret_cast<int32_t *>(tensor_data<uint8_t>(workspace));
   arguments.output_ptr = tensor_data<float>(output);
   arguments.batch = batch;
+  arguments.query_length = static_cast<int>(query_length);
   arguments.max_pages = max_pages;
   arguments.physical_pages = static_cast<int>(k_cache.size(0));
   arguments.page_stride_bytes = k_cache.stride(0);

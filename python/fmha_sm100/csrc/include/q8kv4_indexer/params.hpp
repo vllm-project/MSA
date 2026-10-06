@@ -21,6 +21,7 @@ struct alignas(128) IndexerGemmParams {
   int32_t *scheduler_workspace_ptr = nullptr;
   float *output_ptr = nullptr;
   int batch = 0;
+  int query_length = 0;
   int max_pages = 0;
   int sm_count = 0;
 };
