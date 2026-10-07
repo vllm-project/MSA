@@ -280,12 +280,15 @@ template <class Traits> struct Sm100FmhaFwdQ8Kv4KernelTmaWarpspecialized {
       return attr_status;
     }
 
-    cudaLaunchAttribute attrs[1]{};
+    cudaLaunchAttribute attrs[2]{};
     constexpr int kClusterSize = 1;
     attrs[0].id = cudaLaunchAttributeClusterDimension;
     attrs[0].val.clusterDim.x = kClusterSize;
     attrs[0].val.clusterDim.y = 1;
     attrs[0].val.clusterDim.z = 1;
+    // Every warp that reads the predecessor's outputs waits for its grid first.
+    attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[1].val.programmaticStreamSerializationAllowed = 1;
 
     cudaLaunchConfig_t launch_config{};
     launch_config.gridDim = get_grid_shape(params);
@@ -293,7 +296,7 @@ template <class Traits> struct Sm100FmhaFwdQ8Kv4KernelTmaWarpspecialized {
     launch_config.dynamicSmemBytes = get_smem_size();
     launch_config.stream = stream;
     launch_config.attrs = attrs;
-    launch_config.numAttrs = 1;
+    launch_config.numAttrs = 2;
 
     cudaError_t launch_status =
         cudaLaunchKernelEx(&launch_config, sm100_fmha_fwd_device_kernel<Traits>, params);

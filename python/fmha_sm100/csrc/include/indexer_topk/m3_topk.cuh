@@ -208,6 +208,11 @@ __global__ __launch_bounds__(kThreads) void m3_topk_kernel(
     int sel[kRowsPerBlock][kSelK];
   } u;
   const int tid = static_cast<int>(threadIdx.x);
+  // With a PDL launch (decode) the predecessor writes the scores and may still
+  // read `out_ids`; every successor waits for this grid before reading
+  // `out_ids`. Both calls are no-ops for a plain launch.
+  cudaGridDependencySynchronize();
+  cudaTriggerProgrammaticLaunchCompletion();
 
   if (n_max - 1 <= kThreads) {
     // ---- warp family: one warp per row, no block barrier anywhere ----
@@ -273,10 +278,24 @@ inline int m3_occ() {
 // wants the packed grid back.
 inline void m3_launch(const float* scores, const int* row_n, int* out, int n_max,
                       int row_stride, int rows, int rows_per_group,
-                      int64_t group_stride, cudaStream_t st) {
-  m3_topk_kernel<<<rows, kThreads, 0, st>>>(scores, row_n, out, n_max,
-                                            row_stride, rows, rows_per_group,
-                                            group_stride);
+                      int64_t group_stride, bool pdl, cudaStream_t st) {
+  if (!pdl) {
+    m3_topk_kernel<<<rows, kThreads, 0, st>>>(scores, row_n, out, n_max,
+                                              row_stride, rows, rows_per_group,
+                                              group_stride);
+    return;
+  }
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(rows);
+  config.blockDim = dim3(kThreads);
+  config.stream = st;
+  cudaLaunchAttribute attribute{};
+  attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attribute.val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = &attribute;
+  config.numAttrs = 1;
+  cudaLaunchKernelEx(&config, m3_topk_kernel, scores, row_n, out, n_max, row_stride,
+                     rows, rows_per_group, group_stride);
 }
 
 }  // namespace m3

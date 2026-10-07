@@ -303,6 +303,7 @@ class Q8KV4DecodeIndexerSm100:
             block=(self.threads_per_cta, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=True,
         )
 
     @cute.kernel
@@ -470,6 +471,10 @@ class Q8KV4DecodeIndexerSm100:
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.acc_stages))
 
         pipeline.pipeline_init_wait()
+        # PDL: the predecessor writes q and the current pages of the index
+        # cache. The top-k kernel that consumes the scores waits for this grid.
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
         thr_mma = tiled_mma.get_slice(0)
         tmem_ptr = tmem.retrieve_ptr(Float32)
         tCtAcc_staged = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)

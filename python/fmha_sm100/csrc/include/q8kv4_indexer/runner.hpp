@@ -150,18 +150,20 @@ template <class Traits> struct IndexerGemmRunner {
 
   static cudaError_t run(IndexerGemmParams const &params, cudaStream_t stream) {
     dim3 const grid(params.sm_count * 4, 1, 1);
-    cudaLaunchAttribute attributes[1]{};
+    cudaLaunchAttribute attributes[2]{};
     attributes[0].id = cudaLaunchAttributeClusterDimension;
     attributes[0].val.clusterDim.x = 1;
     attributes[0].val.clusterDim.y = 1;
     attributes[0].val.clusterDim.z = 1;
+    attributes[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attributes[1].val.programmaticStreamSerializationAllowed = 1;
     cudaLaunchConfig_t launch_config{};
     launch_config.gridDim = grid;
     launch_config.blockDim = dim3(InlineKernel::kThreadCount, 1, 1);
     launch_config.dynamicSmemBytes = InlineKernel::kSharedStorageBytes;
     launch_config.stream = stream;
     launch_config.attrs = attributes;
-    launch_config.numAttrs = 1;
+    launch_config.numAttrs = 2;
     cudaError_t const launch_status =
         params.batch <= Traits::kPrepareThreads
             ? cudaLaunchKernelEx(&launch_config, indexer_gemm_kernel<Traits, kInlineCounterOffset>,

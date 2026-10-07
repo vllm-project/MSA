@@ -443,6 +443,9 @@ CUTLASS_DEVICE void run_fwd_mainloop_device(Sm100FmhaFwdKernelParams<Traits> con
     }
     __syncthreads();
     if (thread_idx == 0) {
+      // A CTA without work items never waited: finish only after the predecessor
+      // does, so that waiting for this grid still orders everything before it.
+      cudaGridDependencySynchronize();
       cudaTriggerProgrammaticLaunchCompletion();
     }
   }

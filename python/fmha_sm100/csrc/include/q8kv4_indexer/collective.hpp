@@ -50,9 +50,6 @@ struct IndexerGemmCollective : IndexerGemmConfig<Traits, SchedulerCounterOffset>
     int const warp_idx = thread_idx / cutlass::NumThreadsPerWarp;
     int const lane_idx = thread_idx % cutlass::NumThreadsPerWarp;
 
-    if (thread_idx == 0) {
-      claim_work(params, storage);
-    }
     if (thread_idx >= 1 && thread_idx <= Traits::kMaxPagesPerCta) {
       init_barrier(storage.page_barriers + thread_idx - 1, 1);
     }
@@ -60,8 +57,15 @@ struct IndexerGemmCollective : IndexerGemmConfig<Traits, SchedulerCounterOffset>
       init_barrier(storage.page_consumed_barriers + thread_idx - Traits::kMaxPagesPerCta - 1,
                    Traits::kScoreWarps);
     }
-
     cutlass::arch::fence_barrier_init();
+
+    // PDL: the predecessor writes q and the current pages of the index cache.
+    // The top-k kernel that consumes the scores waits for this grid itself.
+    cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion();
+    if (thread_idx == 0) {
+      claim_work(params, storage);
+    }
     __syncthreads();
 
     int page_ticket_base = 0;

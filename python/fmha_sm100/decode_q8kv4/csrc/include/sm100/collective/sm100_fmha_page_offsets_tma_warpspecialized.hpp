@@ -24,6 +24,7 @@ template <class Traits> struct Sm100FmhaPageOffsetsTmaWarpspecialized {
   struct State {
     int group_event = 0;
     int selection_event = 0;
+    bool grid_dependency_synchronized = false;
   };
 
   CUTLASS_DEVICE static uint64_t *page_offsets_full_barrier(Storage &storage, int stage) {
@@ -81,6 +82,11 @@ template <class Traits> struct Sm100FmhaPageOffsetsTmaWarpspecialized {
   CUTLASS_DEVICE void run_tile(Storage &storage, Params const &params, int batch_idx,
                                int kv_head_idx, int q_token_idx, int lane_idx, State &state,
                                int kv_tile_begin = 0, int kv_tile_end = INT_MAX) const {
+    // PDL: the predecessor (the indexer's top-k) writes the selection lists.
+    if (!state.grid_dependency_synchronized) {
+      cudaGridDependencySynchronize();
+      state.grid_dependency_synchronized = true;
+    }
     // Producer of the per-item selection: load the list once, derive the selection, publish it
     // for the other warps, then reuse the same entries for the physical-page lookups.
     Sm100FmhaSelectionLanes const lanes = fmha_fwd_load_selection_lanes<Traits>(
