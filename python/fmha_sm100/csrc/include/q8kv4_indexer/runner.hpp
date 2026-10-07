@@ -149,14 +149,6 @@ template <class Traits> struct IndexerGemmRunner {
   }
 
   static cudaError_t run(IndexerGemmParams const &params, cudaStream_t stream) {
-    int const counter_offset =
-        params.batch <= Traits::kPrepareThreads ? kInlineCounterOffset : kDynamicCounterOffset;
-    reset_indexer_gemm_scheduler_counter<<<1, 1, 0, stream>>>(params.scheduler_workspace_ptr +
-                                                              counter_offset);
-    cudaError_t status = cudaGetLastError();
-    if (status != cudaSuccess) {
-      return status;
-    }
     dim3 const grid(params.sm_count * 4, 1, 1);
     cudaLaunchAttribute attributes[1]{};
     attributes[0].id = cudaLaunchAttributeClusterDimension;

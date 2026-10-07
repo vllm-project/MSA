@@ -76,8 +76,6 @@ __global__ void __launch_bounds__(256)
   }
 }
 
-__global__ void reset_indexer_gemm_scheduler_counter(int32_t *counter) { *counter = 0; }
-
 template <class Traits, int SchedulerCounterOffset>
 __global__ void __launch_bounds__(Traits::kThreads)
     indexer_gemm_kernel(const __grid_constant__ IndexerGemmParams params) {

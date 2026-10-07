@@ -290,6 +290,14 @@ struct IndexerGemmCollective : IndexerGemmConfig<Traits, SchedulerCounterOffset>
       page_ticket_base += local_pages;
       __syncthreads();
     }
+
+    // Every CTA claims until its first claim past the work count, so a launch
+    // makes exactly work_count + gridDim.x claims. The CTA that made the last
+    // one resets the counter for the next launch, which needs no reset kernel.
+    if (thread_idx == 0 && storage.work_tile_id == params.scheduler_workspace_ptr[params.batch] +
+                                                       static_cast<int>(gridDim.x) - 1) {
+      params.scheduler_workspace_ptr[SchedulerCounterOffset] = 0;
+    }
   }
 };
 

@@ -527,6 +527,76 @@ def test_decode_short_queries_match_zero_padded(num_heads, query_len, batch, max
     assert torch.equal(wrapper.run(q, k.cache), expected)
 
 
+def _one_head_work_counter(wrapper, batch: int) -> int:
+    """The one-head kernel's work counter: int32 129 of the workspace for the
+    inline scheduler (batch <= 128), int32 0 for the CUB-scan one."""
+
+    words = wrapper._workspace[: 130 * 4].view(torch.int32)
+    return int(words[129 if batch <= 128 else 0])
+
+
+@pytest.mark.parametrize("num_heads", DECODE_HEADS["q8kv4"])
+def test_decode_back_to_back_launches_of_one_plan(num_heads):
+    """A plan serves many layers in a row, eagerly and in a CUDA graph. The
+    one-head kernel's launches share a work counter that each must leave at
+    zero for the next; poisoned scores make a skipped work tile change the
+    top-k. Covers the inline (batch <= 128) and CUB-scan schedulers, a batch
+    without history pages and a short query length."""
+
+    layers = 60
+    # More than 16 pages, so the top-k depends on the scores.
+    cases = [
+        (1, 40, None, 8),
+        (128, 24, None, 8),
+        (129, 24, None, 1),
+        (1025, 20, None, 8),
+        # Every request inside its first page: no work tile at all.
+        (64, 2, torch.full((64,), 100, dtype=torch.int32, device="cuda"), 8),
+    ]
+    workspace = torch.empty(
+        BatchDecodeIndexerQ8KV4Wrapper.workspace_size(1025, num_heads=num_heads),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    wrapper = BatchDecodeIndexerQ8KV4Wrapper(workspace, num_heads=num_heads)
+    for seed, (batch, max_pages, seq_lens, query_len) in enumerate(cases):
+        padded_q, k, block_table, seq_lens = _make_decode(
+            "q8kv4", batch, max_pages, 500 + seed, num_heads=num_heads, seq_lens=seq_lens
+        )
+        q = padded_q.view(batch, MTP, num_heads, HEAD_DIM)[:, MTP - query_len :]
+        q = q.reshape(batch * query_len, num_heads, HEAD_DIM).contiguous()
+        wrapper.plan(block_table, seq_lens, query_len=query_len)
+        expected = wrapper.run(q, k.cache).clone()
+        outs = torch.empty(
+            (layers, *expected.shape), dtype=torch.int32, device="cuda"
+        )
+
+        def step():
+            for layer in range(layers):
+                wrapper._scores.fill_(POISON)
+                wrapper.run(q, k.cache, out=outs[layer])
+
+        def check():
+            assert all(torch.equal(out, expected) for out in outs)
+            # Each launch leaves the counter at zero, not only a correct result
+            # (a reset that comes too early repeats work and still gets it right).
+            if num_heads == 1:
+                assert _one_head_work_counter(wrapper, batch) == 0
+
+        for _ in range(3):
+            outs.fill_(-777)
+            _timed(f"q8kv4-h{num_heads}-b{batch}-{layers}-layers", step)
+            check()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            step()
+        for _ in range(5):
+            outs.fill_(-777)
+            _timed(f"q8kv4-h{num_heads}-b{batch}-graph", graph.replay)
+            check()
+
+
 def test_decode_compile_is_shape_independent_and_workspace_is_released():
     """Batch, page-table width, and lengths reuse one compiled kernel per format and heads."""
 
