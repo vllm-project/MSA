@@ -50,6 +50,15 @@ struct IndexerGemmCollective : IndexerGemmConfig<Traits, SchedulerCounterOffset>
     int const warp_idx = thread_idx / cutlass::NumThreadsPerWarp;
     int const lane_idx = thread_idx % cutlass::NumThreadsPerWarp;
 
+    // Claim before the PDL wait. Only this kernel touches the counter, and the
+    // previous launch has finished: this grid launches once its predecessor
+    // triggers, and every kernel in between waits for its own predecessor
+    // first. Claims made as CTAs arrive spread the work tiles over the SMs;
+    // claiming after the wait sent every resident CTA to the counter at once
+    // and made a one-request 128k decode ~2 us slower.
+    if (thread_idx == 0) {
+      claim_work(params, storage);
+    }
     if (thread_idx >= 1 && thread_idx <= Traits::kMaxPagesPerCta) {
       init_barrier(storage.page_barriers + thread_idx - 1, 1);
     }
@@ -60,17 +69,15 @@ struct IndexerGemmCollective : IndexerGemmConfig<Traits, SchedulerCounterOffset>
     cutlass::arch::fence_barrier_init();
 
     // PDL: the predecessor writes q and the current pages of the index cache.
-    // The top-k kernel that consumes the scores waits for this grid itself.
     cudaGridDependencySynchronize();
-    cudaTriggerProgrammaticLaunchCompletion();
-    if (thread_idx == 0) {
-      claim_work(params, storage);
-    }
     __syncthreads();
 
     int page_ticket_base = 0;
     while (true) {
       if (storage.work_tile_id >= params.scheduler_workspace_ptr[params.batch]) {
+        // The CTA's last scores are stored. The top-k that reads them waits for
+        // this grid, so it may start launching now.
+        cudaTriggerProgrammaticLaunchCompletion();
         break;
       }
       int const batch_idx = storage.batch_idx;

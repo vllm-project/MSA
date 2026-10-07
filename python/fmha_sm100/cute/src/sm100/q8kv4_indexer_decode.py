@@ -471,10 +471,8 @@ class Q8KV4DecodeIndexerSm100:
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.acc_stages))
 
         pipeline.pipeline_init_wait()
-        # PDL: the predecessor writes q and the current pages of the index
-        # cache. The top-k kernel that consumes the scores waits for this grid.
+        # PDL: the predecessor writes q and the current pages of the index cache.
         cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
         thr_mma = tiled_mma.get_slice(0)
         tmem_ptr = tmem.retrieve_ptr(Float32)
         tCtAcc_staged = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
@@ -678,6 +676,7 @@ class Q8KV4DecodeIndexerSm100:
             current_batch = batch_idx
             logical_page = logical_page_begin
             global_page = global_page_begin
+            last_global_page = global_page_begin + num_pages - Int32(1)
             pages_remaining = num_pages
             local_block = Int32(0)
             if (
@@ -717,6 +716,10 @@ class Q8KV4DecodeIndexerSm100:
                             row_max = cute.arch.fmax(
                                 row_max, sPartialMax[partial_stage, partial_idx, query_idx]
                             )
+                        if global_page == last_global_page:
+                            # The CTA's last scores: the top-k that reads them
+                            # waits for this grid, so it may start launching.
+                            cute.arch.griddepcontrol_launch_dependents()
                         if logical_page < local_block:
                             mOut_pqb[logical_page, query_idx, current_batch] = row_max
                     global_page += Int32(1)

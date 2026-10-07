@@ -279,19 +279,13 @@ inline int m3_occ() {
 inline void m3_launch(const float* scores, const int* row_n, int* out, int n_max,
                       int row_stride, int rows, int rows_per_group,
                       int64_t group_stride, bool pdl, cudaStream_t st) {
-  if (!pdl) {
-    m3_topk_kernel<<<rows, kThreads, 0, st>>>(scores, row_n, out, n_max,
-                                              row_stride, rows, rows_per_group,
-                                              group_stride);
-    return;
-  }
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(rows);
   config.blockDim = dim3(kThreads);
   config.stream = st;
   cudaLaunchAttribute attribute{};
   attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attribute.val.programmaticStreamSerializationAllowed = 1;
+  attribute.val.programmaticStreamSerializationAllowed = pdl;
   config.attrs = &attribute;
   config.numAttrs = 1;
   cudaLaunchKernelEx(&config, m3_topk_kernel, scores, row_n, out, n_max, row_stride,
