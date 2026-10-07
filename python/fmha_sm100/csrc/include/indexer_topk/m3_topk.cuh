@@ -278,7 +278,7 @@ inline int m3_occ() {
 // wants the packed grid back.
 inline void m3_launch(const float* scores, const int* row_n, int* out, int n_max,
                       int row_stride, int rows, int rows_per_group,
-                      int64_t group_stride, bool pdl, cudaStream_t st) {
+                      int64_t group_stride, cudaStream_t st, bool pdl = true) {
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(rows);
   config.blockDim = dim3(kThreads);

@@ -22,8 +22,8 @@ template <typename T> T *tensor_data(TensorView tensor) {
 // page, which is written to the final slot without being ranked. ``scores`` is
 // ``[rows, cols]`` or a ``[groups, rows_per_group, cols]`` view whose rows are
 // ranked in order, so a caller can select a strided subset of a score matrix.
-// ``use_pdl`` launches with programmatic stream serialization (the decode
-// chain); the prefill indexer launches normally.
+// ``use_pdl`` launches with programmatic stream serialization; the Python
+// wrapper defaults it to true and the prefill indexer turns it off.
 void indexer_topk_select(TensorView scores, TensorView lengths, TensorView output,
                          bool use_pdl, int64_t stream_ptr) {
   CHECK_CUDA(scores);
@@ -63,7 +63,7 @@ void indexer_topk_select(TensorView scores, TensorView lengths, TensorView outpu
   m3::m3_launch(tensor_data<float const>(scores), tensor_data<int const>(lengths),
                 tensor_data<int>(output), static_cast<int>(cols), static_cast<int>(row_stride),
                 static_cast<int>(rows), static_cast<int>(rows_per_group), group_stride,
-                use_pdl, reinterpret_cast<cudaStream_t>(stream_ptr));
+                reinterpret_cast<cudaStream_t>(stream_ptr), use_pdl);
   cudaError_t const status = cudaGetLastError();
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "indexer_topk_select launch failed: " << cudaGetErrorString(status);

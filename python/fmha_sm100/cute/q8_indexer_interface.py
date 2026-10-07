@@ -250,7 +250,7 @@ def bind_indexer_module_loader(loader) -> None:
 
 
 def _topk_select(
-    scores: torch.Tensor, lengths: torch.Tensor, out: torch.Tensor, *, use_pdl: bool = False
+    scores: torch.Tensor, lengths: torch.Tensor, out: torch.Tensor, *, use_pdl: bool = True
 ) -> torch.Tensor:
     """Write 15 score-ranked pages and the forced local page for every row.
 
@@ -259,8 +259,9 @@ def _topk_select(
     ``lengths[row]`` counts the row's candidates including its local page,
     which lands in the last slot. Ranked pages are score-descending with ties
     broken toward the lower page. Rows with at most 16 candidates emit
-    ``0 .. lengths[row] - 1`` followed by ``-1``. ``use_pdl`` launches it with
-    programmatic dependent launch, chained to the decode indexer before it.
+    ``0 .. lengths[row] - 1`` followed by ``-1``. It launches with programmatic
+    dependent launch (it waits for the scores' producer on the device) unless
+    ``use_pdl`` is False.
     """
 
     _indexer_module_loader("indexer_topk_select").indexer_topk_select(
@@ -503,7 +504,7 @@ class _BatchDecodeIndexerBase:
             _check_topk_output(out, self._topk_indices.shape[0], self._num_heads, scores.device)
         # The rows of the queries q holds, which fill the last slots of the eight.
         query_rows = scores[:, (_DECODE_QUERY_LENGTH - self._query_len) * self._num_heads :]
-        return _topk_select(query_rows, self._num_valid_pages, out, use_pdl=True)
+        return _topk_select(query_rows, self._num_valid_pages, out)
 
 
 class BatchDecodeIndexerQ8KV8Wrapper(_BatchDecodeIndexerBase):
@@ -793,7 +794,8 @@ class BatchPrefillIndexerQ8KV8Wrapper:
             out = state.topk_indices
         else:
             _check_topk_output(out, state.total_q, state.num_heads, scores.device)
-        return _topk_select(scores, state.num_valid_pages, out)
+        # The prefill chain runs eagerly and is not PDL-chained.
+        return _topk_select(scores, state.num_valid_pages, out, use_pdl=False)
 
 
 __all__ = [
