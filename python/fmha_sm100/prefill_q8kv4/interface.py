@@ -154,9 +154,9 @@ def run_prefill(
     ``out_mxfp8`` (``(data, scale)``, see the combine's ``o_mxfp8``) also writes the output as
     MXFP8 for an MXFP8 GEMM: E4M3 ``[total_q, heads, 128]`` + 128x4-swizzled UE8M0 scales,
     bitwise what quantizing the BF16 output would give. With ``out_mxfp8`` and no ``out``,
-    the BF16 output is not written and ``None`` is returned in its place. The splits are
-    then merged by the SM100 combine, which carries the MXFP8 epilogue, also where the
-    Blackwell prefill port's combine would otherwise run.
+    the BF16 output is not written and ``None`` is returned in its place. Both split
+    combines (the Blackwell prefill port's and the SM100 one) carry the MXFP8 epilogue, so
+    the combine choice is the same with and without ``out_mxfp8``.
     """
     if len(paged_kv_cache) != 2 or len(kv_cache_sf) != 2:
         raise ValueError("paged_kv_cache and kv_cache_sf must be (K, V) pairs")
@@ -210,8 +210,7 @@ def run_prefill(
     _, combine = _sparse_stack()
     from ..sparse_fmha_adapter import _supports_blackwell_prefill
 
-    # The MXFP8 output is an epilogue of the SM100 combine only.
-    if out_mxfp8 is None and _supports_blackwell_prefill(q.device, topk=topk):
+    if _supports_blackwell_prefill(q.device, topk=topk):
         from src.blackwell_prefill.combine import combine
     load_extension(q.device, block_scale_shift).run(
         q,

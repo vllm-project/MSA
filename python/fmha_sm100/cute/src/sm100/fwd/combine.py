@@ -1226,18 +1226,9 @@ class SparseAttentionForwardCombine:
             and offset + seqlen == total_q
             and m_block == (max_idx - 1) // self.tile_m
         ):
-            pad_rows = (total_q + Int32(127)) // Int32(128) * Int32(128) - total_q
-            words_per_row = padded_sf_cols // Int32(4)
-            n_words = pad_rows * words_per_row
-            base = mO_mxfp8_scale.iterator.toint()
-            i = tidx
-            while i < n_words:
-                r = total_q + i // words_per_row
-                c = (i % words_per_row) * Int32(4)
-                mx.st_global_u32(
-                    base + Int64(mx.sf_offset_128x4(r, c, padded_sf_cols)), cutlass.Uint32(0)
-                )
-                i = i + Int32(self.num_threads)
+            mx.zero_padding_scales(
+                mO_mxfp8_scale.iterator.toint(), total_q, padded_sf_cols, tidx, self.num_threads
+            )
 
     @cute.jit
     def load_O_partial(
@@ -1384,8 +1375,16 @@ def combine(
         if o_q.stride(2) != 1 or o_q.stride(1) != D or o_q.data_ptr() % 16 or o_q.stride(0) % 16:
             raise ValueError("o_mxfp8 data rows must be contiguous and 16-byte aligned")
         sf_numel = (total_q + 127) // 128 * 128 * ((nheads * D // 32 + 3) // 4 * 4)
-        if o_sf.dtype != torch.uint8 or o_sf.ndim != 1 or o_sf.numel() < sf_numel or not o_sf.is_contiguous():
-            raise ValueError(f"o_mxfp8 scale must be a contiguous uint8 [>= {sf_numel}] tensor")
+        if (
+            o_sf.dtype != torch.uint8
+            or o_sf.ndim != 1
+            or o_sf.numel() < sf_numel
+            or not o_sf.is_contiguous()
+            or o_sf.data_ptr() % 16
+        ):
+            raise ValueError(
+                f"o_mxfp8 scale must be a contiguous 16-byte aligned uint8 [>= {sf_numel}] tensor"
+            )
         if D % 32:
             raise ValueError("o_mxfp8 needs head_dim % 32 == 0")
         o_q = o_q.view(torch.uint8)

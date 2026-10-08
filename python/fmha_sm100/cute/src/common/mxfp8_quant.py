@@ -237,3 +237,81 @@ def quantize_store_bf16x32(w: cute.Tensor, q_addr: Int64) -> Uint32:
     st_global_v4_u32(q_addr, q[0], q[1], q[2], q[3])
     st_global_v4_u32(q_addr + Int64(16), q[4], q[5], q[6], q[7])
     return e
+
+
+@dsl_user_op
+def st_global_v2_u32(addr: Int64, a: Uint32, b: Uint32, *, loc=None, ip=None):
+    _asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Uint32(a).ir_value(loc=loc, ip=ip),
+            Uint32(b).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.v2.b32 [$0], {$1, $2};",
+        "l,r,r",
+        side_effects=True,
+    )
+
+
+@cute.jit
+def quantize_bf16x8_lane_of_4(w0: Uint32, w1: Uint32, w2: Uint32, w3: Uint32):
+    """MXFP8 of a 32-value block spread over 4 adjacent lanes, 8 values per lane (``w0..w3``:
+    BF16x2 words in column order). Returns this lane's 8 E4M3 bytes as 2 words (value 0
+    lowest) and the block's UE8M0 scale. Every lane of the warp must call it."""
+    local = bf16x2_max(
+        bf16x2_max(bf16x2_abs(w0), bf16x2_abs(w1)), bf16x2_max(bf16x2_abs(w2), bf16x2_abs(w3))
+    )
+    # max.bf16x2 is exact and NaN-ignoring, so reducing across the lanes in BF16 gives the
+    # same amax as FlashInfer's fp32 reduction.
+    local = bf16x2_max(local, Uint32(cute.arch.shuffle_sync_bfly(local, offset=1)))
+    local = bf16x2_max(local, Uint32(cute.arch.shuffle_sync_bfly(local, offset=2)))
+    e = f32_to_ue8m0_ceil(bf16x2_max_to_f32(local) * Float32(INV_E4M3_MAX))
+    inv2 = ue8m0_to_inv_scale_bf16x2(e)
+    return (
+        bf16x2x2_to_e4m3x4_scaled(w0, w1, inv2),
+        bf16x2x2_to_e4m3x4_scaled(w2, w3, inv2),
+        e,
+    )
+
+
+@cute.jit
+def pack_scales_x4_lanes_by_4(e: Uint32) -> Uint32:
+    """The scales of 4 consecutive blocks held by lanes L, L + 4, L + 8, L + 12 packed into lane
+    L (little endian, block 0 lowest): the 4 contiguous bytes of a 4-column group in the 128x4
+    layout. Every lane of the warp must call it; only lane L's result is meaningful."""
+    e1 = Uint32(cute.arch.shuffle_sync_down(e, offset=4))
+    e2 = Uint32(cute.arch.shuffle_sync_down(e, offset=8))
+    e3 = Uint32(cute.arch.shuffle_sync_down(e, offset=12))
+    return Uint32(e) | (e1 << Uint32(8)) | (e2 << Uint32(16)) | (e3 << Uint32(24))
+
+
+@cute.jit
+def zero_padding_scales(
+    base: Int64,
+    rows: Int32,
+    padded_cols: Int32,
+    tidx: Int32,
+    num_threads: cutlass.Constexpr[int],
+):
+    """Zero the scales of the padding rows [rows, round_up(rows, 128)) (the quantizer's padding).
+
+    In a 128-row tile the 16 bytes at ``group * 512 + i * 16`` hold rows i, i + 32, i + 64 and
+    i + 96 of a 4-column group: a chunk whose four rows are all padding is cleared with one
+    16-byte store, and consecutive threads clear consecutive chunks. ``base`` must be 16-byte
+    aligned."""
+    tail = rows % Int32(128)
+    if tail != Int32(0):
+        tile = base + Int64(rows // Int32(128)) * Int64(128) * Int64(padded_cols)
+        chunks = (padded_cols // Int32(4)) * Int32(32)
+        c = tidx
+        while c < chunks:
+            i = c % Int32(32)
+            addr = tile + Int64((c // Int32(32)) * Int32(512) + i * Int32(16))
+            if i >= tail:
+                st_global_v4_u32(addr, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+            else:
+                for j in cutlass.range_constexpr(1, 4):
+                    if i + Int32(32 * j) >= tail:
+                        st_global_u32(addr + Int64(4 * j), Uint32(0))
+            c = c + Int32(num_threads)

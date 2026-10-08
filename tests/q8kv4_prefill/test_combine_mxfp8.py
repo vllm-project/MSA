@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 # SPDX-License-Identifier: MIT
 
-"""The combine's MXFP8 output is, bit for bit, FlashInfer's MXFP8 quantization of its BF16 output
-(E4M3 data, 128x4-swizzled UE8M0 scales with the padding rows zeroed)."""
+"""The combines' MXFP8 output is, bit for bit, FlashInfer's MXFP8 quantization of their BF16 output
+(E4M3 data, 128x4-swizzled UE8M0 scales with the padding rows zeroed): the SM100 combine and the
+Blackwell prefill port's combine, which run_prefill keeps with and without ``out_mxfp8``."""
 
 import pytest
 import torch
@@ -14,7 +15,14 @@ from .runners import plan_wrapper
 
 flashinfer = pytest.importorskip("flashinfer")
 
-HEADS, HEAD_DIM, SPLITS = 64, 128, 16
+HEAD_DIM, SPLITS = 128, 16
+
+
+def _combine(impl: str):
+    combine = _sparse_stack()[1]
+    if impl == "blackwell":
+        from src.blackwell_prefill.combine import combine
+    return combine
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -36,8 +44,11 @@ def _values(rows: int, cols: int, gen: torch.Generator) -> torch.Tensor:
 
 @pytest.mark.parametrize("num_tokens", [1, 129, 1000])
 @pytest.mark.parametrize("store_bf16", [False, True])
-def test_mxfp8_output_matches_bf16_then_quantize(device, num_tokens, store_bf16):
-    combine = _sparse_stack()[1]
+@pytest.mark.parametrize("heads", [16, 64])
+@pytest.mark.parametrize("impl", ["sm100", "blackwell"])
+def test_mxfp8_output_matches_bf16_then_quantize(device, num_tokens, store_bf16, heads, impl):
+    HEADS = heads
+    combine = _combine(impl)
     gen = torch.Generator(device="cuda").manual_seed(num_tokens)
     first = max(1, num_tokens // 2)
     lens = [first, num_tokens - first] if num_tokens > 1 else [1]
@@ -69,7 +80,7 @@ def test_mxfp8_output_matches_bf16_then_quantize(device, num_tokens, store_bf16)
 
 
 @pytest.mark.parametrize("case", SMOKE_CASES[1:], ids=lambda case: case.name)
-def test_run_prefill_mxfp8_output_is_opt_in(device, case):
+def test_run_prefill_mxfp8_output_is_opt_in(device, case, monkeypatch):
     """``run_prefill(out_mxfp8=...)`` writes FlashInfer's MXFP8 quantization of the BF16 output it
     computes in the same call; without ``out_mxfp8`` the call is unchanged (and with only
     ``out_mxfp8`` no BF16 output is written)."""
@@ -101,6 +112,21 @@ def test_run_prefill_mxfp8_output_is_opt_in(device, case):
                        device=device)
         return q.view(torch.float8_e4m3fn), s
 
+    # The opt-in path keeps the Blackwell combine wherever the default path uses it.
+    from fmha_sm100.sparse_fmha_adapter import _supports_blackwell_prefill
+
+    _sparse_stack()
+    import src.blackwell_prefill.combine as blackwell_combine
+
+    calls = []
+    blackwell = blackwell_combine.combine
+
+    def spy(*args, **kwargs):
+        calls.append("o_mxfp8" in kwargs)
+        return blackwell(*args, **kwargs)
+
+    monkeypatch.setattr(blackwell_combine, "combine", spy)
+
     default = run().clone()
     both = mxfp8_buffers()
     out = run(out=torch.empty_like(default), out_mxfp8=both)
@@ -114,3 +140,5 @@ def test_run_prefill_mxfp8_output_is_opt_in(device, case):
     assert run(out_mxfp8=only) is None
     assert torch.equal(_bits(only[0]), _bits(both[0]))
     assert torch.equal(only[1], both[1])
+    if _supports_blackwell_prefill(inputs.q.device, topk=state.topk):
+        assert calls == [False, True, True]
