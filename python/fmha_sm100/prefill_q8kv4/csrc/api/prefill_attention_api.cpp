@@ -196,8 +196,8 @@ void prefill_run(torch::Tensor q, torch::Tensor packed_k, torch::Tensor packed_v
       cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, q.get_device()));
   C10_CUDA_CHECK(
       cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, q.get_device()));
-  TORCH_CHECK(major == 10 && (minor == 0 || minor == 3),
-              "Q8KV4 sparse prefill requires an SM100-family GPU");
+  TORCH_CHECK(major == 10 && (minor == 0 || minor == 3 || minor == 7),
+              "Q8KV4 sparse prefill requires an SM100, SM103 or SM107 GPU");
 
   arguments.q_ptr = reinterpret_cast<uint8_t const *>(q.data_ptr());
   arguments.kv_indices_ptr = kv_indices.data_ptr<int32_t>();

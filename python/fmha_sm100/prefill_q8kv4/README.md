@@ -1,9 +1,10 @@
 # Q8KV4 paged sparse prefill
 
-Prefill attention for the MiniMax sparse-attention (MSA) NVFP4 KV cache on SM100 and SM103: E4M3
-queries, E2M1 keys and values with E4M3 block scales, TopK-selected pages, chunked prefill with
-bottom-right causal alignment. `fmha_sm100_plan` / `fmha_sm100` route NVFP4 sparse prefill here
-automatically for E4M3 queries; this page documents that routing and the package's own API.
+Prefill attention for the MiniMax sparse-attention (MSA) NVFP4 KV cache on SM100, SM103 and
+SM107: E4M3 queries, E2M1 keys and values with E4M3 block scales, TopK-selected pages, chunked
+prefill with bottom-right causal alignment. `fmha_sm100_plan` / `fmha_sm100` route NVFP4 sparse
+prefill here automatically for E4M3 queries; this page documents that routing and the package's
+own API.
 
 The kernel is KV-stationary: one CTA takes one (KV head, page) pair and the queries whose TopK
 lists select that page, dequantizes the page to E4M3 once, and writes one split (normalized output
@@ -13,9 +14,13 @@ sparse prefill.
 
 ## Requirements
 
-- CUDA Toolkit 13.4 or newer (the dequantization uses the QMUL4 instruction; there is no
-  fallback path) and an SM100 or SM103 GPU.
-- CUTLASS headers: the repository submodule (4.8) or any newer release through `CUTLASS_ROOT`.
+- CUDA Toolkit 13.4 or newer and an SM100, SM103 or SM107 GPU. The dequantization uses the
+  QMUL4 instruction where the toolchain accepts it for the target (SM100 and SM103; the JIT
+  probes `nvcc` once per toolchain and architecture) and an exact packed-FP16 path otherwise
+  (SM107, which has no QMUL4). Both paths produce the same E4M3 values.
+  `FMHA_SM100_PREFILL_Q8KV4_DISABLE_QMUL4=1` compiles the FP16 path on any GPU.
+- CUTLASS headers: the repository submodule (4.8) or any newer release through `CUTLASS_ROOT`;
+  SM107 needs 4.8 or newer.
 - The CuTe-DSL sparse stack (`nvidia-cutlass-dsl`, `quack-kernels`) for the CSR builder and the
   combine.
 - The kernel is JIT-compiled on first use into `MINFER_FMHA_CACHE_DIR` (or
@@ -40,10 +45,11 @@ uint8 `[pages, 2 * Hkv, 128, 72]` NVFP4 cache of per-head K/V slots; `k_scale` /
 `v_scale` are one-element fp32 CUDA tensors. A sparse prefill plan (batches whose longest query
 chunk exceeds 32 tokens, or `sparse_kernel_mode="prefill"`) is marked for this kernel when the
 batch fits it: page size 128, 16 Q heads per KV head, 4, 8, 16 or 32 blocks, causal, no max-score
-output, an SM100/SM103 device and a CUDA 13.4+ toolkit. `fmha_sm100` then runs uint8 caches on it
-when Q is E4M3 (contiguous) and the global scales are one-element fp32 tensors; `q_scale` folds
-into the softmax scale, `o_scale` into the output, and `qo_offset` / `q_offset_override` move the
-causal alignment. BF16 Q, dense caches and batches that do not fit keep the CuTe-DSL NVFP4 kernel;
+output, an SM100/SM103/SM107 device and a CUDA 13.4+ toolkit. `fmha_sm100` then runs uint8
+caches on it when Q is E4M3 (contiguous) and the global scales are one-element fp32 tensors;
+`q_scale` folds into the softmax scale, `o_scale` into the output, and `qo_offset` /
+`q_offset_override` move the causal alignment. BF16 Q, dense caches and batches that do not fit
+keep the CuTe-DSL NVFP4 kernel;
 `prefill_backend="q8kv4"` raises instead of falling back, `"cute_dsl"` never plans this kernel,
 and `kv_dtype="fp8"` skips it for FP8 caches. Mixed batches (`split_prefill_decode`) route their
 prefill part here and their decode part to the Q8KV4 decode kernel.

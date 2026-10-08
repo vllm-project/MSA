@@ -12,50 +12,16 @@
 
 namespace fmha_sm100::prefill_q8kv4::detail {
 
-CUTLASS_DEVICE void dequant_e2m1x8_uniform_scale(
-    uint32_t& output_lo, uint32_t& output_hi,
-    uint32_t packed_fp4, uint32_t scale_e4m3x4) {
-  ::fmha_sm100::prefill_q8kv4::sm100::common::
-      nvfp4_to_e4m3x4(
-      output_lo, static_cast<uint16_t>(packed_fp4), scale_e4m3x4);
-  ::fmha_sm100::prefill_q8kv4::sm100::common::
-      nvfp4_to_e4m3x4(
-      output_hi, static_cast<uint16_t>(packed_fp4 >> 16), scale_e4m3x4);
-}
-
 struct Fp4DequantInput {
   uint32_t packed_fp4;
-  uint32_t scale_e4m3x4;
+  uint32_t scale_word;
 };
-
-// One E4M3 block scale replicated into the four lanes of a QMUL4 operand. With block-scale
-// staging the scale is divided by 2^shift first: exact through f16, rounded back to E4M3 (scales
-// below 2^(shift - 6) become subnormal, below 2^(shift - 10) zero), the decode kernel's rounding.
-CUTLASS_DEVICE uint32_t replicate_block_scale(uint8_t scale_e4m3) {
-#if FMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT == 0
-  return static_cast<uint32_t>(scale_e4m3) * 0x01010101u;
-#else
-  constexpr uint32_t kStageF16x2 =
-      ((15u - FMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT) << 10) * 0x00010001u;
-  uint16_t const pair = static_cast<uint16_t>(scale_e4m3 * 0x0101u);
-  uint16_t staged;
-  asm("{\n"
-      ".reg .b32 f16x2;\n"
-      "cvt.rn.f16x2.e4m3x2 f16x2, %1;\n"
-      "mul.rn.f16x2 f16x2, f16x2, %2;\n"
-      "cvt.rn.satfinite.e4m3x2.f16x2 %0, f16x2;\n"
-      "}\n"
-      : "=h"(staged)
-      : "h"(pair), "r"(kStageF16x2));
-  return static_cast<uint32_t>(staged) * 0x00010001u;
-#endif
-}
 
 CUTLASS_DEVICE Fp4DequantInput load_fp4_dequant_input(
     uint8_t const* packed_fp4, uint8_t scale_e4m3) {
   return {
       *reinterpret_cast<uint32_t const*>(packed_fp4),
-      replicate_block_scale(scale_e4m3),
+      ::fmha_sm100::prefill_q8kv4::sm100::common::make_dequant_scale_word(scale_e4m3),
   };
 }
 
@@ -63,8 +29,8 @@ CUTLASS_DEVICE void dequant_store_fp8_smem(
     Fp4DequantInput const& input, uint32_t output_address) {
   uint32_t output_lo;
   uint32_t output_hi;
-  dequant_e2m1x8_uniform_scale(
-      output_lo, output_hi, input.packed_fp4, input.scale_e4m3x4);
+  ::fmha_sm100::prefill_q8kv4::sm100::common::dequant_e2m1x8_uniform_scale(
+      output_lo, output_hi, input.packed_fp4, input.scale_word);
   asm volatile("st.shared.v2.b32 [%0], {%1, %2};"
                :
                : "r"(output_address), "r"(output_lo), "r"(output_hi));

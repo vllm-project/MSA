@@ -1,16 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 # SPDX-License-Identifier: MIT
 
-"""Public-toolchain discovery for the Q8KV4 decode JIT (CUDA, CUTLASS, target arch)."""
+"""Public-toolchain discovery shared by the Q8KV4 JITs (CUDA, CUTLASS, target arch, QMUL4)."""
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
+import logging
 import os
 import re
 import shutil
 import subprocess
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]  # python/fmha_sm100
 FMHA_SM100_DECODE_Q8KV4_ARCH = "FMHA_SM100_DECODE_Q8KV4_ARCH"
@@ -72,13 +78,6 @@ def target_arch(
     # Preserve the historical offline default. Reproducible AOT builds should
     # always set the op's architecture variable (``env_var``) explicitly.
     return "103a"
-
-
-def torch_cuda_arch(arch: str, *, component: str = "MM-Sparse") -> str:
-    """Return the torch cpp-extension spelling for a normalized target."""
-
-    normalized = normalize_target_arch(arch, component=component)
-    return "10.0a" if normalized == "100a" else "10.3a"
 
 
 def _unique_paths(candidates: list[Path]) -> tuple[Path, ...]:
@@ -202,8 +201,103 @@ def cutlass_version() -> tuple[int, int]:
     return versions["CUTLASS_MAJOR"], versions["CUTLASS_MINOR"]
 
 
+# The public QMUL4 PTX form (E2M1 codes times E4M3 block scales to E4M3). Toolchains that reject it
+# for the target architecture, such as every ptxas for SM107, get the packed-FP16 dequant path.
+QMUL4_PROBE_SOURCE = r"""
+#include <cstdint>
+
+__global__ void qmul4_probe(uint32_t* output) {
+  uint32_t result;
+  uint16_t packed_e2m1 = 0;
+  uint32_t scale_e4m3 = 0;
+  asm volatile(
+      "mul.rn.satfinite.e4m3x4.e2m1x4.e4m3x4 %0, %1, %2;"
+      : "=r"(result)
+      : "h"(packed_e2m1), "r"(scale_e4m3));
+  output[0] = result;
+}
+""".lstrip()
+
+
+def _write_text_if_changed(path: Path, content: str) -> None:
+    if path.is_file() and path.read_text(encoding="utf-8") == content:
+        return
+    path.write_text(content, encoding="utf-8")
+
+
+@contextmanager
+def build_lock(cache_dir: Path):
+    """Keep a cache directory immutable while another rank builds or loads in it."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with (cache_dir / "build.lock").open("a") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def supports_qmul4(arch: str, *, probe_root: Path) -> bool:
+    """Return whether the selected NVCC accepts the public QMUL4 PTX form for ``arch``.
+
+    The probe compiles once per toolchain and architecture; its verdict is cached under
+    ``probe_root``.
+    """
+
+    nvcc = cuda_home() / "bin/nvcc"
+    probe_key = hashlib.sha256()
+    probe_key.update(str(nvcc.resolve()).encode())
+    probe_key.update(str(cuda_version()).encode())
+    probe_key.update(arch.encode())
+    probe_key.update(QMUL4_PROBE_SOURCE.encode())
+    probe_dir = probe_root / probe_key.hexdigest()[:16]
+    with build_lock(probe_dir):
+        return _probe_qmul4(nvcc, arch, probe_dir)
+
+
+def _probe_qmul4(nvcc: Path, arch: str, probe_dir: Path) -> bool:
+    result_path = probe_dir / "qmul4.result"
+    if result_path.is_file():
+        return result_path.read_text(encoding="utf-8").strip() == "supported"
+
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    source_path = probe_dir / "qmul4_probe.cu"
+    object_path = probe_dir / f"qmul4_probe.{os.getpid()}.o"
+    _write_text_if_changed(source_path, QMUL4_PROBE_SOURCE)
+    result = subprocess.run(
+        [
+            str(nvcc),
+            "-std=c++20",
+            f"-gencode=arch=compute_{arch},code=sm_{arch}",
+            "-c",
+            str(source_path),
+            "-o",
+            str(object_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    supported = result.returncode == 0
+    if supported:
+        object_path.unlink(missing_ok=True)
+    else:
+        logger.info(
+            "Selected NVCC does not accept QMUL4 for SM%s; using FP16 dequant fallback",
+            arch,
+        )
+    _write_text_if_changed(
+        result_path,
+        "supported\n" if supported else "unsupported\n",
+    )
+    return supported
+
+
 __all__ = [
     "FMHA_SM100_DECODE_Q8KV4_ARCH",
+    "QMUL4_PROBE_SOURCE",
+    "build_lock",
+    "supports_qmul4",
     "cutlass_version",
     "cuda_home",
     "cuda_version",
@@ -211,5 +305,4 @@ __all__ = [
     "normalize_target_arch",
     "require_cuda_version",
     "target_arch",
-    "torch_cuda_arch",
 ]

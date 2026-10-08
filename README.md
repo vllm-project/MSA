@@ -25,7 +25,7 @@ share one Python package:
 
 ## Requirements
 
-- **GPU**: NVIDIA SM100 (B200) or SM103 (B300); the Q8KV4 NVFP4 decode kernel also builds for SM107.
+- **GPU**: NVIDIA SM100 (B200) or SM103 (B300); the Q8KV4 NVFP4 decode and prefill kernels also build for SM107.
 - **Toolchain**: CUDA Toolkit with `nvcc` on `PATH` (or `CUDA_HOME` / `CUDA_PATH` set).
 - **Python**: ≥ 3.10.
 - **OS**: Linux x86_64 (aarch64 untested; JIT builds may need small Makefile edits on WSL).

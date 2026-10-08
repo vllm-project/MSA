@@ -12,7 +12,7 @@ import sys
 import sysconfig
 import time
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache
 from pathlib import Path
 
 import jinja2
@@ -21,14 +21,21 @@ from torch.utils import cpp_extension
 from .. import _jit_cache
 from ..decode_q8kv4._build_utils import cuda_home as _cuda_home
 from ..decode_q8kv4._build_utils import cutlass_root as _cutlass_root
+from ..decode_q8kv4._build_utils import cutlass_version as _cutlass_version
 from ..decode_q8kv4._build_utils import require_cuda_version
+from ..decode_q8kv4._build_utils import supports_qmul4
 from ..decode_q8kv4._build_utils import target_arch as _resolve_target_arch
-from ..decode_q8kv4._build_utils import torch_cuda_arch as _resolve_torch_arch
 
 logger = logging.getLogger(__name__)
 
 # Offline builds (build.py) select the target architecture with this variable.
 FMHA_SM100_PREFILL_Q8KV4_ARCH = "FMHA_SM100_PREFILL_Q8KV4_ARCH"
+# Set to 1 to compile the packed-FP16 dequant path even when the toolchain accepts QMUL4: the path
+# SM107 takes, so the two can be compared on one GPU.
+DISABLE_QMUL4_ENV = "FMHA_SM100_PREFILL_Q8KV4_DISABLE_QMUL4"
+_SUPPORTED_ARCHES = ("100a", "103a", "107a")
+_QMUL4_DEQUANT = "qmul4"
+_FP16_DEQUANT = "fp16"
 
 _ROOT = Path(__file__).resolve().parent
 _CSRC = _ROOT / "csrc"
@@ -44,21 +51,41 @@ MAX_BLOCK_SCALE_SHIFT = 7
 def _cuda_version() -> tuple[int, int]:
     return require_cuda_version(
         (13, 4),
-        component="Q8KV4 prefill attention with QMUL4",
+        component="Q8KV4 prefill attention",
     )
 
 
 @lru_cache(maxsize=None)
 def _target_arch(device=None) -> str:
-    return _resolve_target_arch(
+    arch = _resolve_target_arch(
         device,
         component="Q8KV4 prefill attention",
+        supported_arches=_SUPPORTED_ARCHES,
         env_var=FMHA_SM100_PREFILL_Q8KV4_ARCH,
     )
+    if arch == "107a" and _cutlass_version() < (4, 8):
+        raise RuntimeError(
+            "Q8KV4 prefill attention on SM107 requires CUTLASS 4.8 or newer; set "
+            f"CUTLASS_ROOT (found {_cutlass_version()} at {_cutlass_root()})"
+        )
+    return arch
 
 
-def _torch_arch(arch: str) -> str:
-    return _resolve_torch_arch(arch, component="Q8KV4 prefill attention")
+def _qmul4_disabled() -> bool:
+    value = os.environ.get(DISABLE_QMUL4_ENV, "").strip().lower() or "0"
+    if value not in ("0", "1", "false", "true"):
+        raise ValueError(f"{DISABLE_QMUL4_ENV} must be 0 or 1, got {value!r}")
+    return value in ("1", "true")
+
+
+@cache
+def _dequant_mode(arch: str) -> str:
+    """QMUL4 where the toolchain accepts it for ``arch``, the packed-FP16 path otherwise."""
+
+    probe_root = _cache_root() / "capability_probes"
+    if _qmul4_disabled() or not supports_qmul4(arch, probe_root=probe_root):
+        return _FP16_DEQUANT
+    return _QMUL4_DEQUANT
 
 
 def _cache_root() -> Path:
@@ -96,10 +123,11 @@ def _import_extension(module_name: str, library: Path):
 
 @dataclass(frozen=True)
 class JitSpec:
-    """One compile-time configuration: the target architecture and the block-scale shift."""
+    """One compile-time configuration: target architecture, block-scale shift, dequant path."""
 
     target_arch: str
     block_scale_shift: int = 0
+    dequant_mode: str = _QMUL4_DEQUANT
     variant_name: str = "prefill_attention_q8kv4"
     q_heads_per_kv: int = 16
     head_dim: int = 128
@@ -109,7 +137,10 @@ class JitSpec:
 
     @property
     def uri(self) -> str:
-        return f"{self.variant_name}_shift{self.block_scale_shift}_{self.target_arch}"
+        return (
+            f"{self.variant_name}_shift{self.block_scale_shift}_{self.dequant_mode}_"
+            f"{self.target_arch}"
+        )
 
     @property
     def module_name(self) -> str:
@@ -126,6 +157,7 @@ class JitSpec:
 
     def _load_arguments(self, cache_dir: Path) -> dict:
         shift_define = f"-DFMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT={self.block_scale_shift}"
+        has_qmul4 = int(self.dequant_mode == _QMUL4_DEQUANT)
         return {
             "sources": [
                 str(_API / "prefill_attention_api.cpp"),
@@ -151,7 +183,11 @@ class JitSpec:
                 "--expt-extended-lambda",
                 "-static-global-template-stub=false",
                 "-Xptxas=-O3",
+                # An explicit gencode keeps torch from adding its own arch list, which does not
+                # know SM107.
+                f"-gencode=arch=compute_{self.target_arch},code=sm_{self.target_arch}",
                 shift_define,
+                f"-DFMHA_SM100_PREFILL_Q8KV4_HAS_QMUL4={has_qmul4}",
             ],
             "extra_ldflags": ["-lcuda", f"-Wl,-rpath,{_cuda_home() / 'lib64'}"],
         }
@@ -167,7 +203,7 @@ class JitSpec:
             self.uri,
             {
                 "load": arguments,
-                "torch_cuda_arch": _torch_arch(self.target_arch),
+                "target_arch": self.target_arch,
                 "params": self._template_params(),
                 "torch": torch.__version__,
                 "cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
@@ -207,9 +243,7 @@ class JitSpec:
         )
         started_at = time.time()
         previous_cuda_home = cpp_extension.CUDA_HOME
-        previous_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
         cpp_extension.CUDA_HOME = str(_cuda_home())
-        os.environ["TORCH_CUDA_ARCH_LIST"] = _torch_arch(self.target_arch)
         try:
             extension = cpp_extension.load(
                 name=self.module_name,
@@ -220,10 +254,6 @@ class JitSpec:
             )
         finally:
             cpp_extension.CUDA_HOME = previous_cuda_home
-            if previous_arch_list is None:
-                os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
-            else:
-                os.environ["TORCH_CUDA_ARCH_LIST"] = previous_arch_list
         logger.info(
             "Compiled fmha_sm100.prefill_q8kv4 in %.1fs",
             time.time() - started_at,
@@ -234,12 +264,21 @@ class JitSpec:
 def gen_jit_spec(device=None, block_scale_shift: int = 0) -> JitSpec:
     """Return the compile-time configuration for a device and block-scale shift."""
 
-    return JitSpec(target_arch=_target_arch(device), block_scale_shift=int(block_scale_shift))
+    arch = _target_arch(device)
+    return JitSpec(
+        target_arch=arch,
+        block_scale_shift=int(block_scale_shift),
+        dequant_mode=_dequant_mode(arch),
+    )
 
 
 @lru_cache(maxsize=None)
 def _load_extension_for_arch(arch: str, block_scale_shift: int = 0):
-    return JitSpec(target_arch=arch, block_scale_shift=block_scale_shift).build_and_load()
+    return JitSpec(
+        target_arch=arch,
+        block_scale_shift=block_scale_shift,
+        dequant_mode=_dequant_mode(arch),
+    ).build_and_load()
 
 
 def load_extension(device=None, block_scale_shift: int = 0):
@@ -249,6 +288,7 @@ def load_extension(device=None, block_scale_shift: int = 0):
 
 
 __all__ = [
+    "DISABLE_QMUL4_ENV",
     "FMHA_SM100_PREFILL_Q8KV4_ARCH",
     "MAX_BLOCK_SCALE_SHIFT",
     "JitSpec",

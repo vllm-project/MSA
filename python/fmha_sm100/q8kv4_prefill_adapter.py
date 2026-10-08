@@ -5,7 +5,7 @@
 
 ``fmha_sm100_plan`` marks a sparse prefill plan (``MM-SA-Nv``) for the Q8KV4 kernel whenever the
 batch fits it: page size 128, 16 Q heads per KV head, 4/8/16/32 blocks, causal, no max-score
-output, an SM100/SM103 device and a CUDA 13.4+ toolkit (QMUL4). ``fmha_sm100`` then serves NVFP4
+output, an SM100/SM103/SM107 device and a CUDA 13.4+ toolkit. ``fmha_sm100`` then serves NVFP4
 (uint8) caches with it when the call fits too (E4M3 Q); every other call keeps the CuTe-DSL
 NVFP4 kernel. Both run on the same k2q CSR, schedule and split combine.
 """
@@ -24,7 +24,7 @@ PLAN_KEY = "q8kv4_prefill"
 _PAGE_SIZE = 128
 _HEAD_DIM = 128
 _GQA_RATIO = 16
-_SUPPORTED_ARCHES = ((10, 0), (10, 3))
+_SUPPORTED_ARCHES = ((10, 0), (10, 3), (10, 7))
 
 
 def plan_options(kwargs: dict) -> str:
@@ -37,11 +37,15 @@ def plan_options(kwargs: dict) -> str:
 
 def _toolchain_blocker(device: torch.device) -> str | None:
     if torch.cuda.get_device_capability(device) not in _SUPPORTED_ARCHES:
-        return f"device capability {torch.cuda.get_device_capability(device)} (kernel: SM100/SM103)"
+        return (
+            f"device capability {torch.cuda.get_device_capability(device)} "
+            "(kernel: SM100/SM103/SM107)"
+        )
     try:
         from .prefill_q8kv4 import jit
 
         jit._cuda_version()
+        jit._target_arch(device)
     except RuntimeError as error:
         return str(error)
     return None

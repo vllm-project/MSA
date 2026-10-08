@@ -1048,9 +1048,9 @@ def fmha_sm100_plan(
     prefill_backend : str, optional
         ``"auto"`` (default) plans sparse NVFP4 prefill on the Q8KV4 kernel when the batch fits
         it (page size 128, 16 Q heads per KV head, 4/8/16/32 blocks, causal, no max-score
-        output, SM100/SM103 with a CUDA 13.4+ toolkit) and keeps the CuTe-DSL NVFP4 kernel
-        otherwise; ``"q8kv4"`` requires the Q8KV4 kernel and raises when the batch or a later
-        call does not fit; ``"cute_dsl"`` never plans it.
+        output, SM100/SM103/SM107 with a CUDA 13.4+ toolkit) and keeps the CuTe-DSL NVFP4
+        kernel otherwise; ``"q8kv4"`` requires the Q8KV4 kernel and raises when the batch or a
+        later call does not fit; ``"cute_dsl"`` never plans it.
     kv_dtype : str, optional
         ``"fp8"`` skips the Q8KV4 plans (they only serve NVFP4 caches); ``"nvfp4"`` or
         ``None`` allows them.
