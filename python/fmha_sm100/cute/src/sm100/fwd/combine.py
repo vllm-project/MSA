@@ -1334,13 +1334,18 @@ def combine(
     has_lse = lse_out is not None
     has_split_counts = split_counts is not None
     has_output_scale = output_scale is not None
-    min_blocks_per_mp = 3 if has_output_scale and use_pdl else 0
-    # Rubin (SM107) takes a 3-stage O_partial ring: 4 stages with the
-    # min_blocks_per_mp=3 PDL launch hit unspecified launch failures once K1
-    # needs more than one wave, and 3 stages measured fastest.
-    # Blackwell keeps stages=2 (see the occupancy note below).
     capability = torch.cuda.get_device_capability(o_out.device)
-    stages = 3 if capability == (10, 7) else 2
+    is_sm107 = capability == (10, 7)
+    # min_blocks_per_mp > 1 makes the DSL set a preferred shared-memory
+    # carveout sized against the portable 228 KB per SM. On SM107 the DSL
+    # also opts the kernel into the oversized shared-memory mode, and the GPU
+    # front end rejects a launch (Xid 13) whose occupancy needs more shared
+    # memory than that carveout target; the 3-stage ring at 3 CTAs per SM
+    # does. Rubin therefore leaves the register budget to ptxas.
+    min_blocks_per_mp = 3 if has_output_scale and use_pdl and not is_sm107 else 0
+    # Rubin (SM107) takes a 3-stage O_partial ring; Blackwell keeps stages=2
+    # (see the occupancy note below).
+    stages = 3 if is_sm107 else 2
 
     key = (
         "combine",
