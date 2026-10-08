@@ -316,12 +316,14 @@ def _run_backend(
     topk_indices: torch.Tensor,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
-    out: torch.Tensor,
+    out: torch.Tensor | None,
     sm_scale: float,
     k_global_scale: torch.Tensor,
     v_global_scale: torch.Tensor,
     block_scale_shift: int,
+    out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
+    mxfp8_data, mxfp8_scale = (None, None) if out_mxfp8 is None else out_mxfp8
     return _get_cpp().run_decode(
         q,
         k,
@@ -338,6 +340,8 @@ def _run_backend(
         k_global_scale,
         v_global_scale,
         block_scale_shift,
+        out_mxfp8=None if mxfp8_data is None else mxfp8_data.view(torch.uint8),
+        out_mxfp8_scale=mxfp8_scale,
     )
 
 
@@ -449,7 +453,8 @@ def run_decode(
     sm_scale: float | None = None,
     kv_global_scale: tuple[torch.Tensor, torch.Tensor] | None = None,
     out: torch.Tensor | None = None,
-) -> torch.Tensor:
+    out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor | None:
     """Run one layer with a plan from :func:`plan_decode`; allocation-free when ``out`` is given.
 
     ``seq_lens`` (``[batch]``) are the requests' KV lengths, ``kv_indices`` the flat physical
@@ -465,6 +470,13 @@ def run_decode(
     ``kv_global_scale`` are the per-tensor fp32 global scales of K and V as one-element CUDA
     tensors (``value = code * block_scale * global_scale``); omitted means 1.0. The kernels
     read them on the device, so a captured graph follows later updates of the tensors.
+
+    ``out_mxfp8`` (``(data, scale)``) also writes the output as MXFP8 for an MXFP8 GEMM: ``data``
+    is float8_e4m3fn (or uint8) ``[rows, num_q_heads * 128]`` (or ``[rows, num_q_heads, 128]``)
+    and ``scale`` a flat uint8 buffer of at least ``round_up(rows, 128) * num_q_heads * 4``
+    UE8M0 scales in FlashInfer's 128x4 swizzled layout, padding rows zeroed: bit for bit
+    ``mxfp8_quantize(out.view(rows, -1), is_sf_swizzled_layout=True)`` of the BF16 output. With
+    ``out_mxfp8`` and no ``out``, the BF16 output is not written and ``None`` is returned.
     """
     rows = plan.batch_size * plan.q_len_per_req
     _check_metadata(plan, seq_lens, name="seq_lens", shape=(plan.batch_size,))
@@ -533,9 +545,35 @@ def run_decode(
     scale = 1.0 / math.sqrt(_HEAD_DIM) if sm_scale is None else float(sm_scale)
     if not math.isfinite(scale) or scale <= 0.0:
         raise ValueError("sm_scale must be finite and positive")
-    if out is None:
+    if out_mxfp8 is not None:
+        if not isinstance(out_mxfp8, tuple) or len(out_mxfp8) != 2:
+            raise ValueError("out_mxfp8 must be a (data, scale) tuple")
+        mxfp8_data, mxfp8_scale = out_mxfp8
+        row_values = plan.num_q_heads * _HEAD_DIM
+        padded_rows = (rows + 127) // 128 * 128
+        _check_cuda_contiguous(mxfp8_data, name="out_mxfp8 data", alignment=_DATA_ALIGNMENT)
+        _check_cuda_contiguous(mxfp8_scale, name="out_mxfp8 scale", alignment=_DATA_ALIGNMENT)
+        if (
+            mxfp8_data.dtype not in (torch.float8_e4m3fn, torch.uint8)
+            or mxfp8_data.shape[0] != rows
+            or mxfp8_data.numel() != rows * row_values
+            or mxfp8_data.device != plan.device
+        ):
+            raise ValueError(
+                f"out_mxfp8 data must be float8_e4m3fn [{rows}, {row_values}] on {plan.device}"
+            )
+        if (
+            mxfp8_scale.dtype != torch.uint8
+            or mxfp8_scale.numel() < padded_rows * (row_values // 32)
+            or mxfp8_scale.device != plan.device
+        ):
+            raise ValueError(
+                "out_mxfp8 scale must be uint8 with at least "
+                f"{padded_rows * (row_values // 32)} elements on {plan.device}"
+            )
+    if out is None and out_mxfp8 is None:
         out = torch.empty(expected_q_shape, dtype=torch.bfloat16, device=plan.device)
-    else:
+    elif out is not None:
         _check_cuda_contiguous(out, name="out", alignment=_DATA_ALIGNMENT)
         if (
             out.dtype != torch.bfloat16
@@ -561,6 +599,7 @@ def run_decode(
         k_global_scale=k_global_scale,
         v_global_scale=v_global_scale,
         block_scale_shift=plan.block_scale_shift,
+        out_mxfp8=out_mxfp8,
     )
 
 
@@ -684,7 +723,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         kv_global_scale: tuple[torch.Tensor, torch.Tensor] | None = None,
         out: torch.Tensor | None = None,
         topk_indices: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor | None:
         """Run one layer with the metadata from :meth:`plan`; see :func:`run_decode`.
 
         ``topk_indices`` replaces the planned list for this call (same shape), for callers whose
@@ -704,5 +744,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             topk_indices=state.topk_indices if topk_indices is None else topk_indices,
             sm_scale=state.sm_scale,
             kv_global_scale=kv_global_scale,
-            out=state.out if out is None else out,
+            out=state.out if out is None and out_mxfp8 is None else out,
+            out_mxfp8=out_mxfp8,
         )

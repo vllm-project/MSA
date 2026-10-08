@@ -583,7 +583,8 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
                             at::Tensor seq_lens, at::Tensor kv_indices, at::Tensor kv_indptr,
                             at::Tensor topk_indices, at::Tensor k_scale, at::Tensor v_scale,
                             at::Tensor out, float sm_scale, at::Tensor k_global_scale,
-                            at::Tensor v_global_scale, int block_scale_shift) {
+                            at::Tensor v_global_scale, int block_scale_shift,
+                            at::Tensor out_mxfp8, at::Tensor out_mxfp8_scale) {
   c10::cuda::CUDAGuard device_guard(q.device());
   int device = q.get_device();
   int64_t nnz_qo = q.size(0);
@@ -612,6 +613,25 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
   TORCH_CHECK(block_scale_shift >= 0 && block_scale_shift <= kMaxBlockScaleShift,
               "block_scale_shift must be in [0, ", kMaxBlockScaleShift, "]");
   float const stage_gain = static_cast<float>(1 << block_scale_shift);
+  TORCH_CHECK(out.defined() || out_mxfp8.defined(), "run_decode needs out and/or out_mxfp8");
+  TORCH_CHECK(out_mxfp8.defined() == out_mxfp8_scale.defined(),
+              "out_mxfp8 and out_mxfp8_scale go together");
+  if (out_mxfp8.defined()) {
+    int64_t const row_values = static_cast<int64_t>(num_qo_heads) * head_dim_vo;
+    int64_t const padded_rows = (nnz_qo + 127) / 128 * 128;
+    TORCH_CHECK(out_mxfp8.is_cuda() && out_mxfp8.get_device() == device &&
+                    out_mxfp8.is_contiguous() && out_mxfp8.element_size() == 1 &&
+                    out_mxfp8.size(0) == nnz_qo && out_mxfp8.numel() == nnz_qo * row_values &&
+                    reinterpret_cast<uintptr_t>(out_mxfp8.data_ptr()) % 16 == 0,
+                "out_mxfp8 must be a contiguous 16-byte-aligned one-byte CUDA tensor of ", nnz_qo,
+                " rows x ", row_values, " values");
+    TORCH_CHECK(out_mxfp8_scale.is_cuda() && out_mxfp8_scale.get_device() == device &&
+                    out_mxfp8_scale.is_contiguous() && out_mxfp8_scale.element_size() == 1 &&
+                    out_mxfp8_scale.numel() >= padded_rows * (row_values / 32) &&
+                    reinterpret_cast<uintptr_t>(out_mxfp8_scale.data_ptr()) % 16 == 0,
+                "out_mxfp8_scale must be a contiguous 16-byte-aligned one-byte CUDA tensor of at least ",
+                padded_rows * (row_values / 32), " elements");
+  }
 
   int pack_factor = plan.pack_factor;
   int orig_num_qo_heads = plan.orig_num_qo_heads > 0 ? plan.orig_num_qo_heads : num_qo_heads;
@@ -636,7 +656,7 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
         torch_to_tvm(plan.qo_segment_lens), torch_to_tvm(seq_lens),
         torch_to_tvm(plan.qo_segment_offsets), torch_to_tvm(plan.kv_segment_offsets),
         torch_to_tvm(plan.packed_work_range), torch_to_tvm(plan.packed_work_info),
-        torch_to_tvm(out), (double)sm_scale, (int64_t)max_qo_len, tensor_or_null(plan.qo_offset),
+        tensor_or_null(out), (double)sm_scale, (int64_t)max_qo_len, tensor_or_null(plan.qo_offset),
         run_num_kv_splits,
         in_kernel_split_kv ? tvm::ffi::Tensor(nullptr) : tensor_or_null(plan.kv_tile_begin_indices),
         in_kernel_split_kv ? tvm::ffi::Tensor(nullptr) : tensor_or_null(plan.kv_tile_end_indices),
@@ -648,7 +668,8 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
         torch_to_tvm(topk_indices), torch_to_tvm(k_scale), torch_to_tvm(v_scale),
         torch_to_tvm(k_global_scale), torch_to_tvm(v_global_scale), (int64_t)pack_factor,
         (int64_t)plan.q_tokens_per_batch, plan.qo_len_uniform, tensor_or_null(plan.kv_split_count),
-        tensor_or_null(plan.merge_counter), plan.merge_item_base, stream_int);
+        tensor_or_null(plan.merge_counter), plan.merge_item_base, tensor_or_null(out_mxfp8),
+        tensor_or_null(out_mxfp8_scale), stream_int);
   };
 
   int fmha_fwd_runtime_topk = static_cast<int>(topk_indices.size(2));
@@ -704,14 +725,14 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
     float scale_softmax_log2 = sm_scale * log2_e * stage_gain;
 
     auto reduction_fn = mgr.get_reduction_fn(device);
-    reduction_fn(torch_to_tvm(plan.workspace_o), torch_to_tvm(out),
+    reduction_fn(torch_to_tvm(plan.workspace_o), tensor_or_null(out),
                  torch_to_tvm(plan.workspace_lse), torch_to_tvm(plan.num_kv_splits_per_row),
                  (double)scale_softmax_log2, (double)stage_gain, torch_to_tvm(k_global_scale),
                  torch_to_tvm(v_global_scale), (int64_t)plan.num_kv_splits, (int64_t)qo_total_len,
                  (int64_t)num_qo_heads, (int64_t)head_dim_vo, (int64_t)(num_qo_heads * head_dim_vo),
                  (int64_t)head_dim_vo, (int64_t)(num_qo_heads * head_dim_vo), (int64_t)head_dim_vo,
                  (int64_t)orig_num_qo_heads, (int64_t)num_kv_heads, (int64_t)pack_factor,
-                 stream_int);
+                 tensor_or_null(out_mxfp8), tensor_or_null(out_mxfp8_scale), stream_int);
   }
 
   return out;
@@ -736,12 +757,15 @@ std::unique_ptr<PlanInfo> make_decode_plan(at::Tensor qo_segment_lens, at::Tenso
 at::Tensor run_decode(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &plan_info,
                       at::Tensor seq_lens, at::Tensor kv_indices, at::Tensor kv_indptr,
                       at::Tensor topk_indices, at::Tensor k_scale, at::Tensor v_scale,
-                      at::Tensor out, float sm_scale, at::Tensor k_global_scale,
-                      at::Tensor v_global_scale, int block_scale_shift) {
+                      std::optional<at::Tensor> out, float sm_scale, at::Tensor k_global_scale,
+                      at::Tensor v_global_scale, int block_scale_shift,
+                      std::optional<at::Tensor> out_mxfp8,
+                      std::optional<at::Tensor> out_mxfp8_scale) {
   ensure_initialized();
   return _run_decode_impl(q, k, v, plan_info, seq_lens, kv_indices, kv_indptr, topk_indices,
-                          k_scale, v_scale, out, sm_scale, k_global_scale, v_global_scale,
-                          block_scale_shift);
+                          k_scale, v_scale, out.value_or(at::Tensor()), sm_scale, k_global_scale,
+                          v_global_scale, block_scale_shift, out_mxfp8.value_or(at::Tensor()),
+                          out_mxfp8_scale.value_or(at::Tensor()));
 }
 
 } // namespace fmha_sm100::decode_q8kv4

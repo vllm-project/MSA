@@ -768,6 +768,7 @@ def _fmha_sm100(
     output_maxscore: bool = True,
     output_o: bool = True,
     check_input_valid: bool = False,
+    out_mxfp8: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if plan_info["MM-SA-Nv"]:
         return sparse_fmha(q=q, k=k, v=v, plan_info=plan_info, out=out, max_score=max_score, 
@@ -792,10 +793,13 @@ def _fmha_sm100(
                 out = q8kv4_decode_adapter.run(
                     q8kv4, q, k, v, k_sf, v_sf, kv_indices=kv_indices,
                     kv_block_indexes=kv_block_indexes, k_global_scale=k_global_scale,
-                    v_global_scale=v_global_scale, sm_scale=sm_scale, q_scale=q_scale, out=out)
+                    v_global_scale=v_global_scale, sm_scale=sm_scale, q_scale=q_scale, out=out,
+                    out_mxfp8=out_mxfp8)
                 return out, None
             if q8kv4["backend"] == "q8kv4":
                 raise ValueError(f"decode_backend='q8kv4' cannot serve this call: {blocker}")
+    if out_mxfp8 is not None:
+        raise ValueError("out_mxfp8 is served only by the Q8KV4 sparse decode kernel")
 
     nnz_qo, num_qo_heads, head_dim_qk = q.shape
     if kv_indices is None:
@@ -1222,6 +1226,8 @@ def fmha_sm100(
         outputs are concatenated back into the original batch order.
     """
     has_mixed_prefill, split, batch_size, decode, prefill = plan_info
+    if has_mixed_prefill and kwargs.get("out_mxfp8") is not None:
+        raise ValueError("out_mxfp8 is not supported for plans that mix decode and prefill")
     if not has_mixed_prefill:
         return _fmha_sm100(q, k, v, decode, out=out, max_score=max_score, kv_indices=kv_indices,kv_block_indexes=kv_block_indexes, q_offset_override=q_offset_override, **kwargs)
     else:

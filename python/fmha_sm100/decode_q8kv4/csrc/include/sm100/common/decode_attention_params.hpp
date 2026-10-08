@@ -57,6 +57,11 @@ struct FMHACutlassSM100Params {
   int total_qo_len_orig = 0;
   void *o_direct_ptr = nullptr;
   int num_qo_heads_orig = 0;
+  // Optional MXFP8 output: E4M3 [o_mxfp8_rows, num_qo_heads_orig * head_dim] and its UE8M0
+  // scales in the 128x4 swizzled layout. With it, o_ptr / o_direct_ptr may be null.
+  void *o_mxfp8_ptr = nullptr;
+  void *o_mxfp8_scale_ptr = nullptr;
+  int o_mxfp8_rows = 0;
   int num_ctas = 0;
   // TMA fused direct-O unpack is enabled for uniform-Q direct output.
   // When false, epilogue falls back to vec16 software scatter.

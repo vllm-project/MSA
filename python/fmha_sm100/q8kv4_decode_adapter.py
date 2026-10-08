@@ -179,7 +179,8 @@ def run(
     sm_scale,
     q_scale,
     out,
-) -> torch.Tensor:
+    out_mxfp8=None,
+) -> torch.Tensor | None:
     """Run one layer on the Q8KV4 plan with ``fmha_sm100``'s NVFP4 views and scales."""
     plan: DecodePlan = entry["plan"]
     scale = 1.0 / math.sqrt(_HEAD_DIM) if sm_scale is None else float(sm_scale)
@@ -203,4 +204,5 @@ def run(
         sm_scale=scale,
         kv_global_scale=global_scales,
         out=out,
+        out_mxfp8=out_mxfp8,
     )

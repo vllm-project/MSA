@@ -66,6 +66,9 @@ template <class Traits> struct Sm100FmhaFwdKernelParams {
   void *o_ptr = nullptr;
   void *workspace_o_ptr = nullptr;
   float *workspace_lse_ptr = nullptr;
+  uint8_t *o_mxfp8_ptr = nullptr;
+  uint8_t *o_mxfp8_scale_ptr = nullptr;
+  int o_mxfp8_rows = 0;
 
   uint64_t const *packed_work_range_ptr = nullptr;
   uint64_t const *packed_work_info_ptr = nullptr;
@@ -492,6 +495,9 @@ template <class Traits> struct FMHACutlassSM100ParamsBuilder {
     dst.v_global_scale_ptr = src.v_global_scale_ptr;
     dst.o_ptr = src.o_direct_ptr != nullptr ? src.o_direct_ptr : src.o_ptr;
     dst.workspace_o_ptr = src.workspace_o_ptr;
+    dst.o_mxfp8_ptr = static_cast<uint8_t *>(src.o_mxfp8_ptr);
+    dst.o_mxfp8_scale_ptr = static_cast<uint8_t *>(src.o_mxfp8_scale_ptr);
+    dst.o_mxfp8_rows = src.o_mxfp8_rows;
     dst.workspace_lse_ptr = src.workspace_lse_ptr;
     dst.packed_work_range_ptr = src.packed_work_range_ptr;
     dst.packed_work_info_ptr = src.packed_work_info_ptr;
@@ -563,7 +569,10 @@ template <class Traits> struct FMHACutlassSM100ParamsBuilder {
     if (status != cudaSuccess) {
       return status;
     }
-    status = build_o_desc(src, dst.tma);
+    // The O descriptor needs a BF16 output; an MXFP8-only call has none.
+    if (src.o_direct_ptr != nullptr || src.o_ptr != nullptr) {
+      status = build_o_desc(src, dst.tma);
+    }
     return status;
   }
 };

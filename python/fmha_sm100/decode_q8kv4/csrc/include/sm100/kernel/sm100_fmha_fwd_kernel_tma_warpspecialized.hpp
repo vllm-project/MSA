@@ -188,7 +188,12 @@ template <class Traits> struct Sm100FmhaFwdQ8Kv4KernelTmaWarpspecialized {
         return cudaErrorInvalidValue;
       }
     }
-    if (params.o_direct_ptr == nullptr || params.num_qo_heads_orig <= 0) {
+    if ((params.o_direct_ptr == nullptr && params.o_mxfp8_ptr == nullptr) ||
+        params.num_qo_heads_orig <= 0) {
+      return cudaErrorInvalidValue;
+    }
+    if (params.o_mxfp8_ptr != nullptr &&
+        (params.o_mxfp8_scale_ptr == nullptr || params.o_mxfp8_rows <= 0)) {
       return cudaErrorInvalidValue;
     }
     if (params.head_dim_qk != Traits::kHeadDim || params.head_dim_vo != Traits::kHeadDim) {
@@ -242,7 +247,8 @@ template <class Traits> struct Sm100FmhaFwdQ8Kv4KernelTmaWarpspecialized {
     if (params.num_qo_heads_orig != params.num_kv_heads * Traits::kHeadGroup) {
       return cudaErrorInvalidValue;
     }
-    if (params.o_direct_ptr == nullptr && params.o_ptr == nullptr) {
+    if (params.o_direct_ptr == nullptr && params.o_ptr == nullptr &&
+        params.o_mxfp8_ptr == nullptr) {
       return cudaErrorInvalidValue;
     }
     return cudaSuccess;
