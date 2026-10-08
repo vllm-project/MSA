@@ -107,8 +107,13 @@ def _run_sparse_varlen(name, seed, batch_size, num_kv_heads, num_qo_heads,
                        page_size=128, head_dim=128, shuffle_pages=False,
                        qo_lens=None, original_kv_lens=None, qo_offsets=None,
                        sparse_block_counts=None, max_sparse_blocks=16,
-                       num_kv_splits=-1, dtype=torch.bfloat16):
-    """Generic sparse attention test with full control over parameters."""
+                       num_kv_splits=-1, dtype=torch.bfloat16, interleaved_kv=False):
+    """Generic sparse attention test with full control over parameters.
+
+    ``interleaved_kv`` stores K and V side by side in one paged cache
+    ``[pages, Hkv, page_size, 2 * head_dim]`` and passes the kernel its strided
+    K and V views.
+    """
     torch.manual_seed(seed)
     random.seed(seed)
     dev = torch.device("cuda")
@@ -174,6 +179,9 @@ def _run_sparse_varlen(name, seed, batch_size, num_kv_heads, num_qo_heads,
         kv_indices = torch.arange(total_pages, device=dev, dtype=torch.int32)
         k_pages_for_kernel = k_pages
         v_pages_for_kernel = v_pages
+    if interleaved_kv:
+        kv_pages = torch.cat([k_pages_for_kernel, v_pages_for_kernel], dim=-1)
+        k_pages_for_kernel, v_pages_for_kernel = kv_pages.split(head_dim, dim=-1)
 
     kv_page_indptr = [0]
     for pp in pages_per_batch:
@@ -376,6 +384,36 @@ if __name__ == "__main__":
     print("\n=== 16. Large batch + small seq ===")
     for dt in dtypes:
         all_pass &= _run_sparse_varlen(f"large_batch {dt}", 42, 8, 4, 4, qo_lens=[1]*8, original_kv_lens=[512]*8, dtype=dt)
+
+    print("\n=== 17. K/V side by side in one paged cache (strided K/V views) ===")
+    # Eligible FP8 calls must stay on the Blackwell prefill port with strided K/V.
+    import src.blackwell_prefill.atten_fwd_sm100 as blackwell_prefill
+    from interface import _supports_blackwell_prefill
+
+    run_pagekv = blackwell_prefill.run_pagekv
+    port_q_dtypes = []
+
+    def recording_run_pagekv(q, *args, **kwargs):
+        port_q_dtypes.append(q.dtype)
+        return run_pagekv(q, *args, **kwargs)
+
+    blackwell_prefill.run_pagekv = recording_run_pagekv
+    try:
+        for dt in dtypes:
+            for seed in range(2):
+                for B, hk, hq, desc in [(3, 4, 16, "GQA4"), (2, 2, 16, "GQA8"), (2, 1, 16, "GQA16")]:
+                    all_pass &= _run_sparse_varlen(
+                        f"interleaved_kv {desc} s={seed} {dt}", seed, B, hk, hq,
+                        shuffle_pages=True, dtype=dt, interleaved_kv=True,
+                    )
+    finally:
+        blackwell_prefill.run_pagekv = run_pagekv
+    if _supports_blackwell_prefill(torch.device("cuda"), topk=16):
+        fp8_port_calls = port_q_dtypes.count(torch.float8_e4m3fn)
+        print(f"  Blackwell port served {fp8_port_calls}/6 strided FP8 calls")
+        if fp8_port_calls != 6:
+            all_pass = False
+            failed_cases.append(f"interleaved_kv: Blackwell port served {fp8_port_calls}/6 FP8 calls")
 
     print()
     total = len(failed_cases)

@@ -657,7 +657,9 @@ def _try_blackwell_sparse_prefill(
         return None
     if any(t.stride(-1) != 1 or t.data_ptr() % 16 for t in (q, k, v)):
         return None
-    if q.dtype == torch.float8_e4m3fn and not (k.is_contiguous() and v.is_contiguous()):
+    # K/V may be strided views, e.g. K and V side by side in one paged cache:
+    # their TMA descriptors take runtime strides, which must be 16-byte multiples.
+    if any(s * t.element_size() % 16 for t in (k, v) for s in t.stride()[:-1]):
         return None
     allowed = (8, 16) if q.dtype == torch.bfloat16 else (1, 2, 4, 8, 16)
     if q.shape[1] // k.shape[1] not in allowed:
