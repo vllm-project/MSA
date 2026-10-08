@@ -127,7 +127,8 @@ def run_prefill(
     lse: torch.Tensor | None = None,
     o_partial: torch.Tensor | None = None,
     lse_partial: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+    out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Run the Q8KV4 forward over a prepared k2q CSR and schedule, then combine the splits.
 
     ``paged_kv_cache`` holds the packed E2M1 K/V data views ``[pages, Hkv, 128, 64]`` and
@@ -149,6 +150,13 @@ def run_prefill(
     ``topk`` is the width of the TopK lists the schedule was built from (one split per slot).
     ``seqused_k`` (``[batch]`` int32) replaces each request's KV length for masking and for the
     bottom-right causal alignment, as ``fmha_sm100``'s ``qo_offset`` does.
+
+    ``out_mxfp8`` (``(data, scale)``, see the combine's ``o_mxfp8``) also writes the output as
+    MXFP8 for an MXFP8 GEMM: E4M3 ``[total_q, heads, 128]`` + 128x4-swizzled UE8M0 scales,
+    bitwise what quantizing the BF16 output would give. With ``out_mxfp8`` and no ``out``,
+    the BF16 output is not written and ``None`` is returned in its place. The splits are
+    then merged by the SM100 combine, which carries the MXFP8 epilogue, also where the
+    Blackwell prefill port's combine would otherwise run.
     """
     if len(paged_kv_cache) != 2 or len(kv_cache_sf) != 2:
         raise ValueError("paged_kv_cache and kv_cache_sf must be (K, V) pairs")
@@ -196,13 +204,14 @@ def run_prefill(
         )
     if lse_partial is None:
         lse_partial = torch.empty((topk, total_q, num_q_heads), dtype=torch.float32, **options)
-    if out is None:
+    if out is None and out_mxfp8 is None:
         out = torch.empty((total_q, num_q_heads, _HEAD_DIM), dtype=torch.bfloat16, **options)
 
     _, combine = _sparse_stack()
     from ..sparse_fmha_adapter import _supports_blackwell_prefill
 
-    if _supports_blackwell_prefill(q.device, topk=topk):
+    # The MXFP8 output is an epilogue of the SM100 combine only.
+    if out_mxfp8 is None and _supports_blackwell_prefill(q.device, topk=topk):
         from src.blackwell_prefill.combine import combine
     load_extension(q.device, block_scale_shift).run(
         q,
@@ -234,6 +243,7 @@ def run_prefill(
         cu_seqlens=cu_seqlens_q,
         split_counts=schedule.split_counts,
         use_pdl=True,
+        **({} if out_mxfp8 is None else {"o_mxfp8": out_mxfp8}),
     )
     return out, lse
 
