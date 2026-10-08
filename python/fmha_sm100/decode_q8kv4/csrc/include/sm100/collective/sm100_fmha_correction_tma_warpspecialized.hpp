@@ -412,53 +412,67 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
     }
   }
 
-  // copy_o_smem_to_global's copy quantized to MXFP8: a thread's 16 B are eight values of one head
-  // row, so the four adjacent lanes of each 64 B stretch hold one 32-value block. The item of the
-  // last token's first KV head also zeroes the scales of the padding rows.
+  // copy_o_smem_to_global's O tile quantized to MXFP8, in one pass: a thread takes
+  // 128 * kHeadGroup / 128 consecutive values of one head row (16 with 16 heads, two 16 B
+  // vectors; 8 with 8 heads), so 2 (4) adjacent lanes hold a 32-value block, a head row lies in
+  // one warp, and the head's four scales (four contiguous bytes of the 128x4 layout) go out as one
+  // 32-bit store. The item of the last token's first KV head also zeroes the padding rows' scales.
   CUTLASS_DEVICE static void copy_o_smem_to_mxfp8(Storage &storage, Params const &params,
                                                   int kv_head_idx, int qo_offset, int valid_rows,
                                                   int warp_group_lane) {
     namespace mx = fmha_sm100::decode_q8kv4::sm100::common;
+    static_assert(Traits::kHeadDim == 128, "a head row is four MXFP8 blocks");
     constexpr int kVecBytes = 16;
     constexpr int kSmemRowBytes = 128;
-    constexpr int kCopyCalls = Traits::kHeadGroup / 8;
+    constexpr int kThreads = Traits::kNumSoftmaxWarps * cutlass::NumThreadsPerWarp;
+    constexpr int kValues = Traits::kHeadGroup * Traits::kHeadDim / kThreads;
+    constexpr int kWords = kValues / 2;
+    constexpr int kThreadsPerHead = Traits::kHeadDim / kValues;
+    constexpr int kLanesPerBlock = mx::kMxfp8Block / kValues;
+    static_assert(kValues == 8 || kValues == 16, "8 or 16 values per thread");
 
-    int const head_base = kv_head_idx * Traits::kHeadGroup;
+    int const head = warp_group_lane / kThreadsPerHead;
+    int const dim = (warp_group_lane % kThreadsPerHead) * kValues;
+    // Smem rows [0, kHeadGroup) hold dims [0, 64) of each head, the next kHeadGroup rows
+    // dims [64, 128); 16 B vectors are XOR-swizzled within each 128 B row.
+    int const smem_row = (dim / 64) * Traits::kHeadGroup + head;
+    uint8_t const *smem_base = storage.smem_o.data;
+    uint32_t words[kWords];
+    CUTLASS_PRAGMA_UNROLL
+    for (int v = 0; v < kValues / 8; ++v) {
+      int const offset = smem_row * kSmemRowBytes + (dim % 64) * 2 + v * kVecBytes;
+      uint4 const vec = *reinterpret_cast<uint4 const *>(
+          smem_base + (offset ^ ((smem_row & 7) * kVecBytes)));
+      words[4 * v + 0] = vec.x;
+      words[4 * v + 1] = vec.y;
+      words[4 * v + 2] = vec.z;
+      words[4 * v + 3] = vec.w;
+    }
+    uint32_t const scale = mx::mxfp8_block_scale(words);
+    uint32_t const row_scales = mx::mxfp8_pack_row_scales<kLanesPerBlock>(scale);
+    uint32_t q[kWords / 2];
+    mx::mxfp8_quantize_words(words, scale, q);
+
     int const row_values = params.num_qo_heads_orig * Traits::kHeadDim;
     int const scale_cols = row_values / mx::kMxfp8Block;
-    uint8_t const *smem_base = storage.smem_o.data;
-    uint8_t *data_row = params.o_mxfp8_ptr + static_cast<int64_t>(qo_offset) * row_values;
-
-    CUTLASS_PRAGMA_UNROLL
-    for (int copy = 0; copy < kCopyCalls; ++copy) {
-      int const base_offset = warp_group_lane * kVecBytes + copy * Traits::kNumSoftmaxWarps *
-                                                                cutlass::NumThreadsPerWarp *
-                                                                kVecBytes;
-      int const smem_row = base_offset / kSmemRowBytes;
-      int const smem_col = base_offset & (kSmemRowBytes - 1);
-      int const load_offset = base_offset ^ ((smem_row & 7) * kVecBytes);
-      int const dst_row = smem_row & (Traits::kHeadGroup - 1);
-      int const col = (head_base + dst_row) * Traits::kHeadDim +
-                      ((smem_row / Traits::kHeadGroup) * kSmemRowBytes + smem_col) / 2;
-
-      uint4 const v = *reinterpret_cast<uint4 const *>(smem_base + load_offset);
-      uint32_t const words[4] = {v.x, v.y, v.z, v.w};
-      uint32_t const scale = mx::mxfp8_block_scale(words);
-      uint32_t q[2];
-      mx::mxfp8_quantize_words(words, scale, q);
-      if (dst_row < valid_rows) {
-        *reinterpret_cast<uint2 *>(data_row + col) = make_uint2(q[0], q[1]);
-        if ((warp_group_lane & 3) == 0) {
-          params.o_mxfp8_scale_ptr[mx::mxfp8_scale_offset(qo_offset, col / mx::kMxfp8Block,
-                                                          scale_cols)] =
-              static_cast<uint8_t>(scale);
-        }
+    if (head < valid_rows) {
+      int const q_head = kv_head_idx * Traits::kHeadGroup + head;
+      uint8_t *dst = params.o_mxfp8_ptr + static_cast<int64_t>(qo_offset) * row_values +
+                     q_head * Traits::kHeadDim + dim;
+      if constexpr (kValues == 16) {
+        *reinterpret_cast<uint4 *>(dst) = make_uint4(q[0], q[1], q[2], q[3]);
+      } else {
+        *reinterpret_cast<uint2 *>(dst) = make_uint2(q[0], q[1]);
+      }
+      if (warp_group_lane % kThreadsPerHead == 0) {
+        *reinterpret_cast<uint32_t *>(
+            params.o_mxfp8_scale_ptr +
+            mx::mxfp8_scale_offset(qo_offset, q_head * 4, scale_cols)) = row_scales;
       }
     }
     if (kv_head_idx == 0 && qo_offset == params.o_mxfp8_rows - 1) {
       mx::mxfp8_zero_padding_scales(params.o_mxfp8_scale_ptr, params.o_mxfp8_rows, scale_cols,
-                                    warp_group_lane, Traits::kNumSoftmaxWarps *
-                                                         cutlass::NumThreadsPerWarp);
+                                    warp_group_lane, kThreads);
     }
   }
 
@@ -807,6 +821,7 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
         int const row_values = params.num_qo_heads_orig * Traits::kHeadDim;
         int const out_col = (head_base + row) * Traits::kHeadDim + col;
         uint32_t const scale = mx::mxfp8_block_scale(packed);
+        uint32_t const row_scales = mx::mxfp8_pack_row_scales<kLanesPerBlock>(scale);
         uint32_t q[kPassElements / 4];
         mx::mxfp8_quantize_words(packed, scale, q);
         uint8_t *dst = params.o_mxfp8_ptr +
@@ -816,10 +831,12 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
         } else {
           *reinterpret_cast<uint2 *>(dst) = make_uint2(q[0], q[1]);
         }
-        if (thread_idx % kLanesPerBlock == 0) {
-          params.o_mxfp8_scale_ptr[mx::mxfp8_scale_offset(
-              item.q_token_global, out_col / mx::kMxfp8Block, row_values / mx::kMxfp8Block)] =
-              static_cast<uint8_t>(scale);
+        // A row's four blocks are its kThreadsPerRow lanes: one 32-bit store of its scales.
+        if (thread_idx % kThreadsPerRow == 0) {
+          *reinterpret_cast<uint32_t *>(
+              params.o_mxfp8_scale_ptr +
+              mx::mxfp8_scale_offset(item.q_token_global, (head_base + row) * 4,
+                                     row_values / mx::kMxfp8Block)) = row_scales;
         }
       }
       if (out_row != nullptr) {

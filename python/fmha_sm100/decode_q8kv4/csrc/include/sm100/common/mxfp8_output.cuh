@@ -158,6 +158,20 @@ CUTLASS_DEVICE void mxfp8_quantize_words(uint32_t const (&words)[kWords], uint32
   }
 }
 
+// The four block scales of a 128-value row whose blocks start every kLanesPerBlock lanes from the
+// row's first lane, packed in column order (the four contiguous bytes of the 128x4 layout) into
+// that lane; other lanes get garbage. The row must lie within one warp.
+template <int kLanesPerBlock>
+CUTLASS_DEVICE uint32_t mxfp8_pack_row_scales(uint32_t scale) {
+  static_assert(4 * kLanesPerBlock <= 32, "a row's four blocks must lie within one warp");
+  uint32_t packed = scale;
+  CUTLASS_PRAGMA_UNROLL
+  for (int j = 1; j < 4; ++j) {
+    packed |= __shfl_down_sync(0xFFFFFFFFu, scale, j * kLanesPerBlock) << (8 * j);
+  }
+  return packed;
+}
+
 // Byte offset of scale (row, col_block) in the 128x4 swizzled layout with scale_cols columns
 // (a multiple of 4).
 CUTLASS_DEVICE int64_t mxfp8_scale_offset(int row, int col_block, int scale_cols) {
