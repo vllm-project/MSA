@@ -17,6 +17,8 @@ struct IndexerGemmArguments {
   int32_t const *kv_lengths_ptr = nullptr;
   int32_t *scheduler_workspace_ptr = nullptr;
   void *scheduler_temp_storage_ptr = nullptr;
+  // Optional plan output: candidate pages per query row, local page included.
+  int32_t *num_valid_pages_ptr = nullptr;
   float *output_ptr = nullptr;
   size_t scheduler_temp_storage_bytes = 0;
   int batch = 0;

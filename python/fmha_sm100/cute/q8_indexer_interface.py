@@ -350,9 +350,13 @@ class _BatchDecodeIndexerBase:
         return (batch_size + 1) * torch.int32.itemsize
 
     def _plan_scheduler(self, block_table: torch.Tensor, seq_lens: torch.Tensor) -> None:
-        """Prefix-sum the historical pages each request scores."""
+        """Prefix-sum the historical pages each request scores and count the
+        candidate pages of every query row."""
 
         batch_size, max_pages = block_table.shape
+        self._num_valid_pages.copy_(
+            _decode_num_valid_pages(seq_lens, max_pages, self._num_heads, self._query_len)
+        )
         scheduler_bytes = self._scheduler_workspace_size(batch_size, self._num_heads)
         scheduler = self._workspace[:scheduler_bytes].view(torch.int32)
         history_pages = torch.div(seq_lens - 1, _PAGE_SIZE, rounding_mode="floor").clamp_(
@@ -456,7 +460,6 @@ class _BatchDecodeIndexerBase:
         self._block_table = block_table
         self._seq_lens = seq_lens
         self._query_len = query_len
-        self._plan_scheduler(block_table, seq_lens)
 
         tokens = batch_size * query_len
         score_shape = (batch_size, _DECODE_QUERY_LENGTH * self._num_heads, max_pages)
@@ -473,9 +476,7 @@ class _BatchDecodeIndexerBase:
             self._topk_indices = torch.empty(
                 (tokens, self._num_heads, _TOP_K), dtype=torch.int32, device=device
             )
-        self._num_valid_pages.copy_(
-            _decode_num_valid_pages(seq_lens, max_pages, self._num_heads, query_len)
-        )
+        self._plan_scheduler(block_table, seq_lens)
 
     def _run_scores(self, q: torch.Tensor, k_cache: torch.Tensor) -> torch.Tensor:
         """Write historical page scores; the local page and later pages stay untouched."""
@@ -559,8 +560,14 @@ class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
 
     def _plan_scheduler(self, block_table: torch.Tensor, seq_lens: torch.Tensor) -> None:
         if self._num_heads == 1:
+            # One launch also writes the candidate page counts.
             self._module().q8kv4_indexer_plan(
-                block_table, seq_lens, self._workspace, _stream_ptr(block_table.device)
+                block_table,
+                seq_lens,
+                self._workspace,
+                self._num_valid_pages,
+                self._query_len,
+                _stream_ptr(block_table.device),
             )
         else:
             super()._plan_scheduler(block_table, seq_lens)

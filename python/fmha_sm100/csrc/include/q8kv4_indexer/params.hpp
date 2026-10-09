@@ -19,6 +19,7 @@ struct alignas(128) IndexerGemmParams {
   int32_t const *page_table_ptr = nullptr;
   int32_t const *kv_lengths_ptr = nullptr;
   int32_t *scheduler_workspace_ptr = nullptr;
+  int32_t *num_valid_pages_ptr = nullptr;
   float *output_ptr = nullptr;
   int batch = 0;
   int query_length = 0;

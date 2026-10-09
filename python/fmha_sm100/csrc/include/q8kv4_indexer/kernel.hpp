@@ -17,11 +17,30 @@ CUTE_DEVICE int indexer_gemm_scheduler_tile_count(IndexerGemmParams const &param
   return (scored_pages + Traits::kPagesPerWorkTile - 1) / Traits::kPagesPerWorkTile;
 }
 
+// Candidate pages of each query row, its local page included: query i of
+// request b sits at position kv_length - query_length + i.
+template <class Traits>
+CUTE_DEVICE void write_decode_num_valid_pages(IndexerGemmParams const &params, int row,
+                                              int row_stride) {
+  if (params.num_valid_pages_ptr == nullptr) {
+    return;
+  }
+  int const rows = params.batch * params.query_length;
+  for (; row < rows; row += row_stride) {
+    int const position = params.kv_lengths_ptr[row / params.query_length] -
+                         params.query_length + row % params.query_length;
+    // Padded requests (kv_length 0) have negative positions and keep one page.
+    int const pages = position >= 0 ? position / Traits::kPageTokens + 1 : 1;
+    params.num_valid_pages_ptr[row] = min(pages, params.max_pages);
+  }
+}
+
 template <class Traits>
 __global__ void __launch_bounds__(Traits::kPrepareThreads)
     prepare_indexer_gemm_scheduler(const __grid_constant__ IndexerGemmParams params) {
   __shared__ int32_t warp_prefix[Traits::kPrepareWarps];
   int const thread_idx = static_cast<int>(threadIdx.x);
+  write_decode_num_valid_pages<Traits>(params, thread_idx, static_cast<int>(blockDim.x));
   int const lane_idx = thread_idx & 31;
   int const warp_idx = thread_idx >> 5;
   int const active_warps = static_cast<int>(blockDim.x) >> 5;
@@ -66,6 +85,8 @@ template <class Traits>
 __global__ void __launch_bounds__(256)
     prepare_indexer_gemm_scheduler_counts(const __grid_constant__ IndexerGemmParams params) {
   int const batch_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  write_decode_num_valid_pages<Traits>(params, batch_idx,
+                                       static_cast<int>(gridDim.x * blockDim.x));
   if (batch_idx == 0) {
     params.scheduler_workspace_ptr[-1] = 0;
     params.scheduler_workspace_ptr[0] = 0;
