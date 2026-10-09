@@ -22,6 +22,8 @@ template <class Traits> struct IndexerGemmRunner {
     return arguments.page_table_ptr != nullptr && arguments.kv_lengths_ptr != nullptr &&
            arguments.scheduler_workspace_ptr != nullptr && arguments.batch > 0 &&
            arguments.max_pages > 0 && arguments.max_pages <= Traits::kMaximumPages &&
+           (arguments.num_valid_pages_ptr == nullptr ||
+            (arguments.query_length > 0 && arguments.query_length <= Traits::kQueryLength)) &&
            (arguments.batch <= Traits::kPrepareThreads ||
             (arguments.scheduler_temp_storage_ptr != nullptr &&
              arguments.scheduler_temp_storage_bytes > 0));
@@ -63,7 +65,9 @@ template <class Traits> struct IndexerGemmRunner {
     params.kv_lengths_ptr = arguments.kv_lengths_ptr;
     params.scheduler_workspace_ptr =
         arguments.scheduler_workspace_ptr + (arguments.batch > Traits::kPrepareThreads ? 1 : 0);
+    params.num_valid_pages_ptr = arguments.num_valid_pages_ptr;
     params.batch = arguments.batch;
+    params.query_length = arguments.query_length;
     params.max_pages = arguments.max_pages;
 
     return cudaSuccess;

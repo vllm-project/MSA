@@ -550,6 +550,27 @@ def test_decode_short_queries_match_zero_padded(num_heads, query_len, batch, max
     assert torch.equal(wrapper.run(q, k.cache), expected)
 
 
+@pytest.mark.parametrize("num_heads", DECODE_HEADS["q8kv4"])
+@pytest.mark.parametrize("query_len", (1, 3, 8))
+@pytest.mark.parametrize("batch", (3, 129))
+def test_decode_plan_counts_valid_pages(num_heads, query_len, batch):
+    """plan() counts every query row's candidate pages, padded requests and the
+    max_pages clamp included, on both one-head scheduler paths (batch <= 128 and
+    the CUB scan)."""
+
+    max_pages = 4
+    edges = torch.tensor([0, 1, 127, 128, 129, 300, 4 * PAGE_SIZE + 9], dtype=torch.int32)
+    seq_lens = edges[torch.arange(batch) % edges.numel()].to("cuda")
+    seq_lens[seq_lens > 0] += query_len - 1
+    block_table = torch.zeros((batch, max_pages), dtype=torch.int32, device="cuda")
+    wrapper = BatchDecodeIndexerQ8KV4Wrapper(num_heads=num_heads)
+    wrapper.plan(block_table, seq_lens, query_len=query_len)
+    expected = q8_indexer_interface._decode_num_valid_pages(
+        seq_lens, max_pages, num_heads, query_len
+    )
+    assert torch.equal(wrapper._num_valid_pages, expected)
+
+
 def _one_head_work_counter(wrapper, batch: int) -> int:
     """The one-head kernel's work counter: int32 129 of the workspace for the
     inline scheduler (batch <= 128), int32 0 for the CUB-scan one."""

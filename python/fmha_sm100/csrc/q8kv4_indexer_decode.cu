@@ -63,6 +63,7 @@ namespace {
 
 using q8kv4_indexer::IndexerGemmArguments;
 using q8kv4_indexer::IndexerGemmTraits;
+using tvm::ffi::Optional;
 
 constexpr size_t kWorkspaceAlignment = 256;
 
@@ -145,11 +146,24 @@ int64_t q8kv4_indexer_workspace_size(int64_t batch_size) {
 }
 
 void q8kv4_indexer_plan(TensorView page_table, TensorView seq_lens, TensorView workspace,
+                        Optional<TensorView> maybe_num_valid_pages, int64_t query_length,
                         int64_t stream_ptr) {
   check_metadata(page_table, seq_lens);
   int const batch = checked_batch(page_table.size(0));
   WorkspaceLayout const layout = get_workspace_layout(batch);
   check_workspace(page_table, workspace, layout.total_bytes);
+  TVM_FFI_ICHECK(query_length >= 1 && query_length <= IndexerGemmTraits::kQueryLength)
+      << "query_length must be in [1, " << IndexerGemmTraits::kQueryLength << "]";
+  int32_t *num_valid_pages_ptr = nullptr;
+  if (maybe_num_valid_pages.has_value()) {
+    TensorView const num_valid_pages = maybe_num_valid_pages.value();
+    CHECK_INPUT_AND_TYPE(num_valid_pages, dl_int32);
+    CHECK_DIM(1, num_valid_pages);
+    CHECK_DEVICE(num_valid_pages, page_table);
+    TVM_FFI_ICHECK(num_valid_pages.size(0) == static_cast<int64_t>(batch) * query_length)
+        << "num_valid_pages must have shape [batch * query_length]";
+    num_valid_pages_ptr = tensor_data<int32_t>(num_valid_pages);
+  }
 
   ffi::CUDADeviceGuard device_guard(page_table.device().device_id);
   cudaStream_t const stream = reinterpret_cast<cudaStream_t>(stream_ptr);
@@ -161,7 +175,9 @@ void q8kv4_indexer_plan(TensorView page_table, TensorView seq_lens, TensorView w
   arguments.scheduler_temp_storage_ptr =
       layout.temp_storage_bytes > 0 ? workspace_ptr + layout.temp_storage_offset : nullptr;
   arguments.scheduler_temp_storage_bytes = layout.temp_storage_bytes;
+  arguments.num_valid_pages_ptr = num_valid_pages_ptr;
   arguments.batch = batch;
+  arguments.query_length = static_cast<int>(query_length);
   arguments.max_pages = static_cast<int>(page_table.size(1));
 
   cudaError_t const status = q8kv4_indexer::prepare_indexer_gemm(arguments, stream);
