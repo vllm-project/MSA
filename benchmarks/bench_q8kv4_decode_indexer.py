@@ -818,6 +818,7 @@ def run_case(
         packed = k_cache.reshape(pages, -1)[:, : PAGE_SIZE * HEAD_DIM // 2]
         paged_k = object.__new__(T._PagedK)
         paged_k.page_pad = 0
+        paged_k.exact_k = T._q8kv4_k_is_exact()
         paged_k.set_nvfp4(packed.reshape(pages, PAGE_SIZE, HEAD_DIM // 2), scale)
         q_rows = q.view(case.batch * query_length, num_index_heads, HEAD_DIM)
         inner = wrappers[0].wrapper

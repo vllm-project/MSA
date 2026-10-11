@@ -56,16 +56,16 @@ E2M1_VALUES = (
 DECODE_FORMATS = ("q8kv8", "q8kv4")
 
 
-def _q8kv4_k_is_exact(num_heads: int) -> bool:
-    """Whether the Q8KV4 decode kernel keeps NVFP4 x E4M3-scale products exact.
+def _q8kv4_k_is_exact() -> bool:
+    """Whether the Q8KV4 decode kernels keep NVFP4 x E4M3-scale products exact.
 
-    Mirrors ``Q8KV4DecodeIndexerSm100.use_fp16_mma``: on SM107 the 2/4-head CuTe kernel
-    dequantizes K to FP16 and runs a kind::f16 MMA, so its scores are the exact products.
-    The one-head CUTLASS kernel and the SM100/SM103 kernels round the dequantized K to
-    E4M3 (saturating at 448) for an FP8 MMA.
+    SM107 has no QMUL4, so both of its kernels dequantize K to FP16: the one-head CUTLASS
+    kernel (``q8kv4_indexer_decode_sm107``) and the 2/4-head CuTe kernel
+    (``Q8KV4DecodeIndexerSm100.use_fp16_mma``). Their scores are the exact products. The
+    SM100/SM103 kernels round the dequantized K to E4M3 (saturating at 448) for an FP8 MMA.
     """
 
-    return torch.cuda.get_device_capability() == (10, 7) and num_heads in (2, 4)
+    return torch.cuda.get_device_capability() == (10, 7)
 DECODE_WRAPPERS = {"q8kv8": BatchDecodeIndexerQ8KV8Wrapper, "q8kv4": BatchDecodeIndexerQ8KV4Wrapper}
 DECODE_HEADS = {"q8kv8": (1, 2, 4), "q8kv4": (1, 2, 4)}
 DECODE_CASES = [(fmt, num_heads) for fmt in DECODE_FORMATS for num_heads in DECODE_HEADS[fmt]]
@@ -313,7 +313,7 @@ def _make_decode(
         generator,
         page_pad=page_pad,
         k_scale=k_scale,
-        exact_k=fmt == "q8kv4" and _q8kv4_k_is_exact(num_heads),
+        exact_k=fmt == "q8kv4" and _q8kv4_k_is_exact(),
     )
     block_table = _block_table(batch, max_pages, physical_pages, generator)
     if seq_lens is None:
