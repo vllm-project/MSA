@@ -195,6 +195,9 @@ def _nvcc_flags(dequant_mode: str, arch: str, block_scale_shift: int = 0) -> str
         "-DNDEBUG",
         f"-DMINIMAX_MSA_Q8KV4_HAS_QMUL4={int(dequant_mode == _QMUL4_DEQUANT)}",
         f"-DMINIMAX_MSA_Q8KV4_RAW_KV_STAGES={12 if arch == '107a' else 8}",
+        # ptxas spills the softmax warps' live state on sm_107a when the launch bounds carry the
+        # min-blocks hint; the other targets do not and keep it (see the forward decode kernel).
+        f"-DMINIMAX_MSA_Q8KV4_MIN_BLOCKS_HINT={0 if arch == '107a' else 1}",
         f"-DMINIMAX_MSA_Q8KV4_BLOCK_SCALE_SHIFT={block_scale_shift}",
         "-Xptxas",
         "-O3",

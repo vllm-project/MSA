@@ -25,8 +25,26 @@ namespace cutlass::fmha::kernel {
 
 using namespace cutlass::fmha::collective;
 
+// The minBlocksPerMultiprocessor hint pins ptxas to 65536 / kNumThreads = 128 registers, which
+// the softmax warps (warpgroup_reg_alloc<kSoftmaxMaxRegisters> = 184) overrun. On sm_107a that
+// makes ptxas spill a 16-byte frame and reload it every KV tile (536 bytes of spill loads, 67
+// LDL.64); dropping the hint removes the spill and is worth 1.5-10% there. kNumThreads alone
+// still forces a block to fit one SM's register file, so no occupancy is lost. sm_100a and
+// sm_103a do not spill either way -- the spill is a property of the sm_107a target, not of the
+// stage count or the dequant path -- and dropping the hint there only moves ptxas off 128
+// registers for no gain, so they keep it.
+#ifndef MINIMAX_MSA_Q8KV4_MIN_BLOCKS_HINT
+#define MINIMAX_MSA_Q8KV4_MIN_BLOCKS_HINT 1
+#endif
+#if MINIMAX_MSA_Q8KV4_MIN_BLOCKS_HINT
+#define MINIMAX_MSA_Q8KV4_LAUNCH_BOUNDS(threads) __launch_bounds__(threads, 1)
+#else
+#define MINIMAX_MSA_Q8KV4_LAUNCH_BOUNDS(threads) __launch_bounds__(threads)
+#endif
+
 template <class Traits>
-__global__ __launch_bounds__(Traits::kNumThreads, 1) void sm100_fmha_fwd_device_kernel(
+__global__ MINIMAX_MSA_Q8KV4_LAUNCH_BOUNDS(Traits::kNumThreads) void
+sm100_fmha_fwd_device_kernel(
     CUTE_GRID_CONSTANT Sm100FmhaFwdKernelParams<Traits> const params) {
   extern __shared__ uint8_t smem[];
   Sm100FmhaFwdMainloopTmaWarpspecialized<Traits>::run_device(params, smem);
