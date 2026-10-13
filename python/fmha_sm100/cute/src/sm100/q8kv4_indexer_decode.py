@@ -151,7 +151,9 @@ class Q8KV4DecodeIndexerSm100:
         mKCache: cute.Tensor,
         mPageTable: cute.Tensor,
         mSeqLens: cute.Tensor,
+        mQueryCu: cute.Tensor,
         mOut: cute.Tensor,
+        mNumValidPages: cute.Tensor,
         mSchedulerStorage: cute.Tensor,
         stream: cuda.CUstream = None,
     ) -> None:
@@ -160,16 +162,22 @@ class Q8KV4DecodeIndexerSm100:
         if cutlass.const_expr(mKCache.element_type is not cutlass.Uint8):
             raise TypeError("k_cache must be Uint8 NVFP4 pages")
         if cutlass.const_expr(
-            mPageTable.element_type is not Int32 or mSeqLens.element_type is not Int32
+            mPageTable.element_type is not Int32
+            or mSeqLens.element_type is not Int32
+            or mQueryCu.element_type is not Int32
+            or mNumValidPages.element_type is not Int32
         ):
-            raise TypeError("page_table and seq_lens must be Int32")
+            raise TypeError("page_table, seq_lens, query_cu and num_valid_pages must be Int32")
         if cutlass.const_expr(mOut.element_type is not Float32):
             raise TypeError("out must be Float32")
 
         batch_size = mPageTable.shape[0]
-        # q holds 1..8 queries per request; they fill the last slots of its
-        # eight, so the TMA box starts that many rows before the request.
-        query_rows = mQ.shape[0] // batch_size * self.num_heads
+        max_pages = mPageTable.shape[1]
+        # Rows are token-major, so request b owns the q and score rows
+        # ``mQueryCu[b] * num_heads`` up to ``mQueryCu[b + 1] * num_heads``. Its
+        # 1..8 queries fill the last slots of the eight-query tile, so both the
+        # q TMA box and the scores start num_queries rows before that end.
+        total_rows = mQ.shape[0] * self.num_heads
         physical_pages = mKCache.shape[0]
         # Each page is contiguous; vLLM may pad the stride between pages.
         page_stride = mKCache.stride[0]
@@ -190,7 +198,7 @@ class Q8KV4DecodeIndexerSm100:
         mQ_krb = cute.make_tensor(
             mQ.iterator,
             cute.make_layout(
-                (self.head_dim, query_rows * batch_size),
+                (self.head_dim, total_rows),
                 stride=(1, self.head_dim),
             ),
         )
@@ -198,9 +206,9 @@ class Q8KV4DecodeIndexerSm100:
             mPageTable.iterator,
             cute.select(mPageTable.layout, mode=[1, 0]),
         )
-        mOut_pqb = cute.make_tensor(
+        mOut_pr = cute.make_tensor(
             mOut.iterator,
-            cute.select(mOut.layout, mode=[2, 1, 0]),
+            cute.select(mOut.layout, mode=[1, 0]),
         )
         mScheduler = cute.make_tensor(
             cute.recast_ptr(mSchedulerStorage.iterator, dtype=Int32),
@@ -312,10 +320,13 @@ class Q8KV4DecodeIndexerSm100:
             tma_tensor_Q,
             mPageTable_lb,
             mSeqLens,
-            mOut_pqb,
+            mQueryCu,
+            mOut_pr,
+            mNumValidPages,
             mScheduler,
             batch_size,
-            query_rows,
+            max_pages,
+            total_rows,
             sPacked_layout,
             sScale_layout,
             tK_layout,
@@ -343,10 +354,13 @@ class Q8KV4DecodeIndexerSm100:
         mQ_krb: cute.Tensor,
         mPageTable_lb: cute.Tensor,
         mSeqLens: cute.Tensor,
-        mOut_pqb: cute.Tensor,
+        mQueryCu: cute.Tensor,
+        mOut_pr: cute.Tensor,
+        mNumValidPages: cute.Tensor,
         mScheduler: cute.Tensor,
         batch_size: Int32,
-        query_rows: Int32,
+        max_pages: Int32,
+        total_rows: Int32,
         sPacked_layout: cute.ComposedLayout,
         sScale_layout: cute.Layout,
         tK_layout: cute.ComposedLayout,
@@ -598,7 +612,10 @@ class Q8KV4DecodeIndexerSm100:
                 # Rows before the request belong to the previous one, or are
                 # out of bounds and zero-filled for the first: they only fill
                 # the unused leading slots.
-                q_row = (current_batch + Int32(1)) * query_rows - Int32(self.num_queries)
+                q_row = (
+                    mQueryCu[current_batch + Int32(1)] * Int32(self.num_heads)
+                    - Int32(self.num_queries)
+                )
                 tQsQ, tQgQ = cpasync.tma_partition(
                     tma_atom_Q,
                     0,
@@ -676,6 +693,17 @@ class Q8KV4DecodeIndexerSm100:
             )
         elif warp_idx >= Int32(self.score_warp_begin):
             score_warp_idx = warp_idx - Int32(self.score_warp_begin)
+            self._write_num_valid_pages(
+                mQueryCu,
+                mSeqLens,
+                mNumValidPages,
+                batch_size,
+                max_pages,
+                total_rows,
+                worker_idx,
+                score_warp_idx,
+                lane_idx,
+            )
             rScoresFlat = cute.make_tensor(
                 rScores.iterator,
                 cute.make_layout(self.num_queries),
@@ -686,16 +714,15 @@ class Q8KV4DecodeIndexerSm100:
             last_global_page = global_page_begin + num_pages - Int32(1)
             pages_remaining = num_pages
             local_block = Int32(0)
+            row = Int32(0)
             if (
                 num_pages > Int32(0)
                 and score_warp_idx == Int32(0)
                 and lane_idx < Int32(self.num_queries)
             ):
-                seq_len = mSeqLens[current_batch]
-                query_position = (
-                    seq_len - Int32(self.query_length) + lane_idx // Int32(self.num_heads)
+                row, local_block = self._score_row(
+                    mQueryCu, mSeqLens, current_batch, lane_idx, total_rows
                 )
-                local_block = query_position // Int32(self.page_size)
             while pages_remaining > Int32(0):
                 segment_pages = mScheduler[current_batch + 1] - global_page
                 if segment_pages > pages_remaining:  # noqa: PLR1730
@@ -728,7 +755,7 @@ class Q8KV4DecodeIndexerSm100:
                             # waits for this grid, so it may start launching.
                             cute.arch.griddepcontrol_launch_dependents()
                         if logical_page < local_block:
-                            mOut_pqb[logical_page, query_idx, current_batch] = row_max
+                            mOut_pr[logical_page, row] = row_max
                     global_page += Int32(1)
                     logical_page += Int32(1)
                 pages_remaining -= segment_pages
@@ -739,14 +766,90 @@ class Q8KV4DecodeIndexerSm100:
                     current_batch += Int32(1)
                     logical_page = global_page - mScheduler[current_batch]
                 if score_warp_idx == Int32(0) and lane_idx < Int32(self.num_queries):
-                    seq_len = mSeqLens[current_batch]
-                    query_position = (
-                        seq_len - Int32(self.query_length) + lane_idx // Int32(self.num_heads)
+                    row, local_block = self._score_row(
+                        mQueryCu, mSeqLens, current_batch, lane_idx, total_rows
                     )
-                    local_block = query_position // Int32(self.page_size)
 
         pipeline.sync(barrier_id=int(_NamedBarrier.Final))
         tmem.free(tmem_ptr)
+
+    @cute.jit
+    def _score_row(
+        self,
+        mQueryCu: cute.Tensor,
+        mSeqLens: cute.Tensor,
+        batch_idx: Int32,
+        lane_idx: Int32,
+        total_rows: Int32,
+    ) -> tuple[Int32, Int32]:
+        """Return the lane's score row and the local page that bounds its scores.
+
+        Lanes past the tile, slots before the request's queries, which belong
+        to the previous one, and rows past the buffer, which a request holding
+        more than eight queries would reach, return row -1 and local page 0;
+        that drops every store.
+        """
+
+        row = mQueryCu[batch_idx + Int32(1)] * Int32(self.num_heads) - Int32(self.num_queries)
+        row += lane_idx
+        local_block = Int32(0)
+        if (
+            lane_idx >= Int32(self.num_queries)
+            or row < mQueryCu[batch_idx] * Int32(self.num_heads)
+            or row >= total_rows
+        ):
+            row = Int32(-1)
+        else:
+            query_position = (
+                mSeqLens[batch_idx] - Int32(self.query_length) + lane_idx // Int32(self.num_heads)
+            )
+            local_block = query_position // Int32(self.page_size)
+        return row, local_block
+
+    @cute.jit
+    def _write_num_valid_pages(
+        self,
+        mQueryCu: cute.Tensor,
+        mSeqLens: cute.Tensor,
+        mNumValidPages: cute.Tensor,
+        batch_size: Int32,
+        max_pages: Int32,
+        total_rows: Int32,
+        worker_idx: Int32,
+        score_warp_idx: Int32,
+        lane_idx: Int32,
+    ) -> None:
+        """Count every query row's candidate pages, its local page included.
+
+        The score warps own one request each while the first pages are still
+        in flight, so the top-k needs no launch of its own to learn the ragged
+        row lengths.
+        """
+
+        batch_idx = worker_idx * Int32(self.score_warps) + score_warp_idx
+        while batch_idx < batch_size:
+            row, local_block = self._score_row(mQueryCu, mSeqLens, batch_idx, lane_idx, total_rows)
+            if row >= Int32(0):
+                # A request still inside its first page, padded ones included,
+                # has one candidate: the local page the top-k forces.
+                num_valid = local_block + Int32(1)
+                if num_valid < Int32(1):
+                    num_valid = Int32(1)
+                elif num_valid > max_pages:
+                    num_valid = max_pages
+                mNumValidPages[row] = num_valid
+            batch_idx += Int32(self.grid_ctas * self.score_warps)
+        # Rows past the last request pad a fixed-shape buffer: one candidate
+        # keeps the top-k from ranking their scores.
+        row = (
+            mQueryCu[batch_size] * Int32(self.num_heads)
+            + worker_idx * Int32(self.score_threads)
+            + score_warp_idx * Int32(self.threads_per_warp)
+            + lane_idx
+        )
+        while row < total_rows:
+            mNumValidPages[row] = Int32(1)
+            row += Int32(self.grid_ctas * self.score_threads)
 
     @cute.jit
     def _dequant_pages(
