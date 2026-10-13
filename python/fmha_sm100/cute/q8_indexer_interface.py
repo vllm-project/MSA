@@ -12,8 +12,8 @@ or 4 per rank) share the single index-K head and each head selects its own
 pages:
 
 * ``q``: ``[num_tokens, num_heads, 128]`` E4M3, token-major (decode tokens are
-  grouped per request, eight MTP tokens each, or ``query_len`` for the Q8KV4
-  decode indexer).
+  grouped per request, eight MTP tokens each, ``query_len`` for the Q8KV4
+  decode indexer, or the ragged ``cu_query_lens`` segments it also plans).
 * Q8KV8 ``k_cache``: ``[num_blocks, 128, 128]`` E4M3.
 * Q8KV4 ``k_cache``: ``[num_blocks, 128, 72]`` uint8. Each page stores the packed
   E2M1 values of all 128 tokens (8192 bytes, 64 bytes per token, the low nibble
@@ -181,6 +181,12 @@ def _check_block_table(block_table: torch.Tensor, batch: int, device: torch.devi
         raise ValueError(f"block_table max_blocks must be in [1, {_MAXIMUM_PAGES}]")
 
 
+def _check_query_cu(cu_query_lens: torch.Tensor, batch: int, device: torch.device) -> None:
+    _check_cuda_tensor(cu_query_lens, name="cu_query_lens", dtype=torch.int32, device=device)
+    if cu_query_lens.ndim != 1 or cu_query_lens.shape[0] != batch + 1:
+        raise ValueError(f"cu_query_lens must have shape [{batch + 1}]")
+
+
 def _check_num_heads(num_heads: int, supported: tuple[int, ...] = _SUPPORTED_NUM_HEADS) -> int:
     if num_heads not in supported:
         raise ValueError(f"num_heads must be one of {supported}, got {num_heads!r}")
@@ -298,7 +304,8 @@ class _BatchDecodeIndexerBase:
 
     Wrappers with ``_supports_query_len`` also plan requests of fewer queries
     (``query_len``): ``q`` and the output then hold only those, which take the
-    last ``query_len`` of the eight slots.
+    last ``query_len`` of the eight slots. Those with ``_supports_ragged_queries``
+    take a per-request ``cu_query_lens`` instead of one length for the batch.
     """
 
     def __init__(
@@ -309,6 +316,7 @@ class _BatchDecodeIndexerBase:
         use_cuda_graph: bool = False,
         block_table_buffer: torch.Tensor | None = None,
         seq_lens_buffer: torch.Tensor | None = None,
+        query_cu_buffer: torch.Tensor | None = None,
     ) -> None:
         if workspace_buffer is not None:
             _check_cuda_tensor(workspace_buffer, name="workspace_buffer", dtype=torch.uint8)
@@ -320,6 +328,8 @@ class _BatchDecodeIndexerBase:
             if block_table_buffer is None or seq_lens_buffer is None:
                 raise ValueError("CUDA Graph mode requires block_table_buffer and seq_lens_buffer")
             self._check_metadata(block_table_buffer, seq_lens_buffer)
+            if query_cu_buffer is not None:
+                _check_query_cu(query_cu_buffer, seq_lens_buffer.shape[0], seq_lens_buffer.device)
         elif block_table_buffer is not None or seq_lens_buffer is not None:
             raise ValueError(
                 "block_table_buffer and seq_lens_buffer are only valid with use_cuda_graph=True"
@@ -330,12 +340,18 @@ class _BatchDecodeIndexerBase:
         self._use_cuda_graph = use_cuda_graph
         self._block_table_buffer = block_table_buffer
         self._seq_lens_buffer = seq_lens_buffer
+        self._query_cu_buffer = query_cu_buffer
         self._block_table: torch.Tensor | None = None
         self._seq_lens: torch.Tensor | None = None
+        self._query_cu: torch.Tensor | None = None
+        self._uniform_query_cu: torch.Tensor | None = None
+        self._uniform_query_cu_key: tuple[object, ...] | None = None
         self._scores: torch.Tensor | None = None
+        self._score_rows: torch.Tensor | None = None
         self._num_valid_pages: torch.Tensor | None = None
         self._topk_indices: torch.Tensor | None = None
         self._query_len = _DECODE_QUERY_LENGTH
+        self._num_tokens = 0
 
     _supported_num_heads = _SUPPORTED_NUM_HEADS
     _supports_query_len = False
@@ -344,6 +360,14 @@ class _BatchDecodeIndexerBase:
 
     def _check_k_cache(self, k_cache: torch.Tensor, device: torch.device) -> None:
         raise NotImplementedError
+
+    def _supports_ragged_queries(self) -> bool:
+        """Whether this instance's scorer takes per-request query offsets."""
+
+        return False
+
+    def _score_kernel_metadata(self) -> tuple[torch.Tensor, ...]:
+        return (self._block_table, self._seq_lens, self._scores, self._workspace)
 
     @classmethod
     def _scheduler_workspace_size(cls, batch_size: int, num_heads: int) -> int:
@@ -357,6 +381,10 @@ class _BatchDecodeIndexerBase:
         self._num_valid_pages.copy_(
             _decode_num_valid_pages(seq_lens, max_pages, self._num_heads, self._query_len)
         )
+        self._plan_history_pages(block_table, seq_lens)
+
+    def _plan_history_pages(self, block_table: torch.Tensor, seq_lens: torch.Tensor) -> None:
+        batch_size, max_pages = block_table.shape
         scheduler_bytes = self._scheduler_workspace_size(batch_size, self._num_heads)
         scheduler = self._workspace[:scheduler_bytes].view(torch.int32)
         history_pages = torch.div(seq_lens - 1, _PAGE_SIZE, rounding_mode="floor").clamp_(
@@ -374,7 +402,7 @@ class _BatchDecodeIndexerBase:
             sm_count,
             self._num_heads,
         )
-        metadata = (self._block_table, self._seq_lens, self._scores, self._workspace)
+        metadata = self._score_kernel_metadata()
         compiled = _compile_or_load(
             key,
             lambda: cute.compile(
@@ -405,12 +433,31 @@ class _BatchDecodeIndexerBase:
             raise ValueError("seq_lens must have shape [batch]")
         _check_block_table(block_table, seq_lens.shape[0], seq_lens.device)
 
+    def _plan_uniform_query_cu(
+        self, batch_size: int, query_len: int, device: torch.device
+    ) -> torch.Tensor:
+        """Query offsets of a uniform batch, refilled in place so a captured
+        graph keeps reading the same buffer."""
+
+        key = (batch_size, query_len, device)
+        if self._uniform_query_cu_key != key:
+            cu = self._uniform_query_cu
+            if cu is None or cu.shape[0] != batch_size + 1 or cu.device != device:
+                cu = self._uniform_query_cu = torch.empty(
+                    batch_size + 1, dtype=torch.int32, device=device
+                )
+            torch.arange(0, (batch_size + 1) * query_len, query_len, out=cu)
+            self._uniform_query_cu_key = key
+        return self._uniform_query_cu
+
     def plan(
         self,
         block_table: torch.Tensor,
         seq_lens: torch.Tensor,
         *,
         query_len: int = _DECODE_QUERY_LENGTH,
+        cu_query_lens: torch.Tensor | None = None,
+        num_tokens: int | None = None,
     ) -> None:
         """Bind metadata and build the device schedule without host synchronization.
 
@@ -418,6 +465,15 @@ class _BatchDecodeIndexerBase:
         changes. In CUDA Graph mode the metadata is copied into the fixed
         constructor buffers, whose shapes are fixed for the wrapper lifetime.
         ``query_len`` is the number of queries per request ``q`` holds.
+
+        Args:
+            cu_query_lens: ``[batch + 1]`` int32 query-row offsets, which the
+                scorer reads on the device, so requests may hold different
+                numbers of queries (at most eight) and the counts may still be
+                unknown to the host. Replaces ``query_len``.
+            num_tokens: the rows ``q`` and the output hold, which a ragged plan
+                needs because ``cu_query_lens`` stays on the device. Rows past
+                the last request pad a fixed shape and select page 0.
         """
 
         self._check_metadata(block_table, seq_lens)
@@ -432,21 +488,40 @@ class _BatchDecodeIndexerBase:
                 + ("in [1, 8]" if self._supports_query_len else "8")
                 + f", got {query_len!r}"
             )
+        ragged = cu_query_lens is not None
+        if ragged and not self._supports_ragged_queries():
+            raise ValueError(
+                f"{type(self).__name__} with {self._num_heads} index heads does not "
+                "support cu_query_lens"
+            )
+        if ragged and (
+            isinstance(num_tokens, bool) or not isinstance(num_tokens, int) or num_tokens <= 0
+        ):
+            raise ValueError("cu_query_lens requires a positive num_tokens")
         device = block_table.device
         _require_supported_device(device)
         if _is_capturing(device):
             raise RuntimeError("plan() must be called outside CUDA Graph capture")
+        if ragged:
+            _check_query_cu(cu_query_lens, seq_lens.shape[0], device)
         if self._use_cuda_graph:
-            for name, tensor, buffer in (
+            buffers = [
                 ("block_table", block_table, self._block_table_buffer),
                 ("seq_lens", seq_lens, self._seq_lens_buffer),
-            ):
+            ]
+            if ragged:
+                if self._query_cu_buffer is None:
+                    raise ValueError("CUDA Graph mode requires query_cu_buffer for cu_query_lens")
+                buffers.append(("cu_query_lens", cu_query_lens, self._query_cu_buffer))
+            for name, tensor, buffer in buffers:
                 if tensor.shape != buffer.shape or tensor.device != buffer.device:
                     raise ValueError(f"CUDA Graph mode fixes {name} shape and device")
                 if tensor.data_ptr() != buffer.data_ptr():
                     buffer.copy_(tensor, non_blocking=True)
             block_table = self._block_table_buffer
             seq_lens = self._seq_lens_buffer
+            if ragged:
+                cu_query_lens = self._query_cu_buffer
 
         batch_size, max_pages = block_table.shape
         required_bytes = self._scheduler_workspace_size(batch_size, self._num_heads)
@@ -460,9 +535,26 @@ class _BatchDecodeIndexerBase:
         self._block_table = block_table
         self._seq_lens = seq_lens
         self._query_len = query_len
+        tokens = num_tokens if ragged else batch_size * query_len
+        self._num_tokens = tokens
+        rows = tokens * self._num_heads
 
-        tokens = batch_size * query_len
-        score_shape = (batch_size, _DECODE_QUERY_LENGTH * self._num_heads, max_pages)
+        if self._supports_ragged_queries():
+            self._query_cu = (
+                cu_query_lens
+                if ragged
+                else self._plan_uniform_query_cu(batch_size, query_len, device)
+            )
+            # Ragged rows pack only the queries each request holds, so a
+            # uniform plan keeps the dense [batch, query_len * heads] view of
+            # the same rows.
+            score_shape = (
+                (rows, max_pages)
+                if ragged
+                else (batch_size, query_len * self._num_heads, max_pages)
+            )
+        else:
+            score_shape = (batch_size, _DECODE_QUERY_LENGTH * self._num_heads, max_pages)
         if (
             self._scores is None
             or self._scores.shape != score_shape
@@ -470,12 +562,16 @@ class _BatchDecodeIndexerBase:
             or self._topk_indices.shape[0] != tokens
         ):
             self._scores = torch.empty(score_shape, dtype=torch.float32, device=device)
-            self._num_valid_pages = torch.empty(
-                (tokens * self._num_heads,), dtype=torch.int32, device=device
-            )
+            self._num_valid_pages = torch.empty((rows,), dtype=torch.int32, device=device)
             self._topk_indices = torch.empty(
                 (tokens, self._num_heads, _TOP_K), dtype=torch.int32, device=device
             )
+        self._score_rows = (
+            self._scores.view(rows, max_pages)
+            if self._supports_ragged_queries()
+            # The rows of the queries q holds, which fill the last slots of the eight.
+            else self._scores[:, (_DECODE_QUERY_LENGTH - query_len) * self._num_heads :]
+        )
         self._plan_scheduler(block_table, seq_lens)
 
     def _run_scores(self, q: torch.Tensor, k_cache: torch.Tensor) -> torch.Tensor:
@@ -484,7 +580,7 @@ class _BatchDecodeIndexerBase:
         if self._scores is None:
             raise RuntimeError("plan() must be called before run()")
         device = self._scores.device
-        _check_query(q, self._scores.shape[0] * self._query_len, self._num_heads, device)
+        _check_query(q, self._num_tokens, self._num_heads, device)
         self._check_k_cache(k_cache, device)
         self._launch_scores(q, k_cache)
         return self._scores
@@ -496,16 +592,14 @@ class _BatchDecodeIndexerBase:
         *,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return ``[batch * query_len, num_heads, 16]`` logical page indices for one layer."""
+        """Return ``[num_tokens, num_heads, 16]`` logical page indices for one layer."""
 
         scores = self._run_scores(q, k_cache)
         if out is None:
             out = self._topk_indices
         else:
             _check_topk_output(out, self._topk_indices.shape[0], self._num_heads, scores.device)
-        # The rows of the queries q holds, which fill the last slots of the eight.
-        query_rows = scores[:, (_DECODE_QUERY_LENGTH - self._query_len) * self._num_heads :]
-        return _topk_select(query_rows, self._num_valid_pages, out)
+        return _topk_select(self._score_rows, self._num_valid_pages, out)
 
 
 class BatchDecodeIndexerQ8KV8Wrapper(_BatchDecodeIndexerBase):
@@ -534,7 +628,11 @@ class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
     on CUDA 13.4 or newer use the public QMUL4 instruction on SM100/SM103, and
     older ones select the exact FP16 dequantization. Requests may carry fewer than
     eight queries (``plan(..., query_len=n)``), so a caller needs no zero-padded
-    copy of its queries and gets ``[batch * n, num_heads, 16]`` back.
+    copy of its queries and gets ``[batch * n, num_heads, 16]`` back. Two or four
+    heads also take ragged per-request counts (``plan(..., cu_query_lens=cu,
+    num_tokens=rows)``), which the scorer reads on the device: it scores the
+    rows each request owns and counts their candidate pages itself, so a step
+    whose query lengths only the device knows needs no extra launch.
 
     Example::
 
@@ -551,6 +649,19 @@ class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
     @staticmethod
     def _module():
         return _indexer_module_loader("q8kv4_indexer_decode")
+
+    def _supports_ragged_queries(self) -> bool:
+        return self._num_heads != 1
+
+    def _score_kernel_metadata(self) -> tuple[torch.Tensor, ...]:
+        return (
+            self._block_table,
+            self._seq_lens,
+            self._query_cu,
+            self._score_rows,
+            self._num_valid_pages,
+            self._workspace,
+        )
 
     @classmethod
     def _scheduler_workspace_size(cls, batch_size: int, num_heads: int) -> int:
@@ -570,7 +681,8 @@ class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
                 _stream_ptr(block_table.device),
             )
         else:
-            super()._plan_scheduler(block_table, seq_lens)
+            # The scorer counts the candidate pages of its own ragged rows.
+            self._plan_history_pages(block_table, seq_lens)
 
     def _check_k_cache(self, k_cache: torch.Tensor, device: torch.device) -> None:
         _check_paged_cache(k_cache, dtype=torch.uint8, page_width=_NVFP4_PAGE_WIDTH, device=device)

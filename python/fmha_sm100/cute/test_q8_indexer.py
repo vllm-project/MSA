@@ -540,8 +540,9 @@ def test_decode_short_queries_match_zero_padded(num_heads, query_len, batch, max
     wrapper = BatchDecodeIndexerQ8KV4Wrapper(num_heads=num_heads)
     wrapper.plan(block_table, seq_lens, query_len=query_len)
     real = slice(pad * num_heads, None)
-    scores = _run_decode_scores(wrapper, q, k.cache)
-    assert torch.equal(scores[:, real], expected_scores[:, real])
+    _run_decode_scores(wrapper, q, k.cache)
+    rows = wrapper._score_rows.reshape(batch * query_len * num_heads, -1)
+    assert torch.equal(rows, expected_scores[:, real].reshape(rows.shape))
     out = torch.full((batch * query_len, num_heads, TOP_K), -777, dtype=torch.int32, device="cuda")
     topk = wrapper.run(q, k.cache, out=out)
     assert topk.data_ptr() == out.data_ptr()
@@ -554,9 +555,10 @@ def test_decode_short_queries_match_zero_padded(num_heads, query_len, batch, max
 @pytest.mark.parametrize("query_len", (1, 3, 8))
 @pytest.mark.parametrize("batch", (3, 129))
 def test_decode_plan_counts_valid_pages(num_heads, query_len, batch):
-    """plan() counts every query row's candidate pages, padded requests and the
-    max_pages clamp included, on both one-head scheduler paths (batch <= 128 and
-    the CUB scan)."""
+    """Every query row's candidate pages are counted, padded requests and the
+    max_pages clamp included, by the one-head plan kernel (both scheduler
+    paths: batch <= 128 and the CUB scan) and by the two- and four-head
+    scorer."""
 
     max_pages = 4
     edges = torch.tensor([0, 1, 127, 128, 129, 300, 4 * PAGE_SIZE + 9], dtype=torch.int32)
@@ -565,10 +567,189 @@ def test_decode_plan_counts_valid_pages(num_heads, query_len, batch):
     block_table = torch.zeros((batch, max_pages), dtype=torch.int32, device="cuda")
     wrapper = BatchDecodeIndexerQ8KV4Wrapper(num_heads=num_heads)
     wrapper.plan(block_table, seq_lens, query_len=query_len)
+    if num_heads != 1:
+        q, k, _, _ = _make_decode(
+            "q8kv4", batch, max_pages, 7, num_heads=num_heads, seq_lens=seq_lens
+        )
+        wrapper.run(q[: batch * query_len], k.cache)
     expected = q8_indexer_interface._decode_num_valid_pages(
         seq_lens, max_pages, num_heads, query_len
     )
     assert torch.equal(wrapper._num_valid_pages, expected)
+
+
+def _ragged_query_lens(batch: int, seed: int, max_query_len: int = MTP) -> list[int]:
+    """Per-request query counts covering one, the maximum, those between, and
+    the empty requests that pad a CUDA Graph batch."""
+
+    values = [1 + (i * 3 + seed) % max_query_len for i in range(batch)]
+    values[0] = max_query_len
+    values[-1] = 0 if batch > 2 else 1
+    if batch > 3:
+        values[batch // 2] = 0
+    return values
+
+
+def _ragged_rows(query_lens: list[int]) -> torch.Tensor:
+    """The eight-slot rows that the ragged rows hold, in ragged order."""
+
+    return torch.tensor(
+        [b * MTP + MTP - n + i for b, n in enumerate(query_lens) for i in range(n)],
+        dtype=torch.int64,
+        device="cuda",
+    )
+
+
+def _select_rows(tensor: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+    if tensor.dtype == torch.float8_e4m3fn:
+        return tensor.view(torch.uint8)[rows].view(torch.float8_e4m3fn)
+    return tensor[rows]
+
+
+def _cumulative(query_lens: list[int]) -> torch.Tensor:
+    return torch.tensor(np.cumsum([0, *query_lens]), dtype=torch.int32, device="cuda")
+
+
+@pytest.mark.parametrize("num_heads", (2, 4))
+@pytest.mark.parametrize("batch,max_pages", [(1, 1), (5, 6), (129, 4)])
+@pytest.mark.parametrize("pad_rows", (0, 3))
+def test_decode_ragged_queries_match_zero_padded(num_heads, batch, max_pages, pad_rows):
+    """Requests holding different numbers of queries score and rank exactly the
+    rows a uniform eight-query plan does; rows past the last request keep their
+    scores and select page 0 alone."""
+
+    seed = 100 * batch + 10 * num_heads + pad_rows
+    padded_q, k, block_table, seq_lens = _make_decode(
+        "q8kv4", batch, max_pages, seed, num_heads=num_heads
+    )
+    query_lens = _ragged_query_lens(batch, seed)
+    rows = _ragged_rows(query_lens)
+    tokens = rows.numel() + pad_rows
+
+    padded = BatchDecodeIndexerQ8KV4Wrapper(num_heads=num_heads)
+    padded.plan(block_table, seq_lens)
+    expected_scores = _run_decode_scores(padded, padded_q, k.cache).clone()
+    expected_scores = expected_scores.view(batch * MTP, num_heads, max_pages)[rows]
+    expected_topk = padded.run(padded_q, k.cache)[rows].clone()
+    expected_lengths = _decode_valid_pages(seq_lens, num_heads).view(batch * MTP, num_heads)[rows]
+
+    q = torch.zeros((tokens, num_heads, HEAD_DIM), dtype=torch.float8_e4m3fn, device="cuda")
+    q[: rows.numel()] = _select_rows(padded_q, rows)
+    wrapper = BatchDecodeIndexerQ8KV4Wrapper(num_heads=num_heads)
+    wrapper.plan(block_table, seq_lens, cu_query_lens=_cumulative(query_lens), num_tokens=tokens)
+    wrapper._scores.fill_(POISON)
+    out = torch.full((tokens, num_heads, TOP_K), -777, dtype=torch.int32, device="cuda")
+    assert wrapper.run(q, k.cache, out=out).data_ptr() == out.data_ptr()
+
+    scores = wrapper._score_rows.view(tokens, num_heads, max_pages)
+    lengths = wrapper._num_valid_pages.view(tokens, num_heads)
+    assert torch.equal(scores[: rows.numel()], expected_scores)
+    assert torch.equal(lengths[: rows.numel()], expected_lengths)
+    assert torch.equal(out[: rows.numel()], expected_topk)
+    assert torch.all(scores[rows.numel() :] == POISON)
+    assert torch.all(lengths[rows.numel() :] == 1)
+    assert torch.all(out[rows.numel() :, :, 0] == 0)
+    assert torch.all(out[rows.numel() :, :, 1:] == -1)
+
+
+@pytest.mark.parametrize("num_heads", (2, 4))
+def test_decode_ragged_cuda_graph_replay_and_replan(num_heads):
+    """A captured run picks up the query lengths of a later plan: only the
+    device offsets it binds say which rows each request owns."""
+
+    batch, max_pages = 64, 6
+    max_query_len = 4
+    tokens = batch * max_query_len
+    _, k, _, _ = _make_decode("q8kv4", batch, max_pages, 61, num_heads=num_heads)
+    wrapper = BatchDecodeIndexerQ8KV4Wrapper(
+        num_heads=num_heads,
+        use_cuda_graph=True,
+        block_table_buffer=torch.empty((batch, max_pages), dtype=torch.int32, device="cuda"),
+        seq_lens_buffer=torch.empty(batch, dtype=torch.int32, device="cuda"),
+        query_cu_buffer=torch.empty(batch + 1, dtype=torch.int32, device="cuda"),
+    )
+    reference = BatchDecodeIndexerQ8KV4Wrapper(num_heads=num_heads)
+    q = torch.zeros((tokens, num_heads, HEAD_DIM), dtype=torch.float8_e4m3fn, device="cuda")
+    out = torch.full((tokens, num_heads, TOP_K), -777, dtype=torch.int32, device="cuda")
+
+    def plan(seed):
+        padded_q, _, block_table, seq_lens = _make_decode(
+            "q8kv4", batch, max_pages, seed, num_heads=num_heads
+        )
+        query_lens = _ragged_query_lens(batch, seed, max_query_len)
+        rows = _ragged_rows(query_lens)
+        reference.plan(block_table, seq_lens)
+        expected = reference.run(padded_q, k.cache)[rows].clone()
+        q.zero_()
+        q[: rows.numel()] = _select_rows(padded_q, rows)
+        wrapper.plan(
+            block_table, seq_lens, cu_query_lens=_cumulative(query_lens), num_tokens=tokens
+        )
+        return rows.numel(), expected
+
+    num_rows, expected = plan(71)
+    wrapper.run(q, k.cache, out=out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, k.cache, out=out)
+        with pytest.raises(RuntimeError, match=r"plan\(\) must be called outside"):
+            wrapper.plan(
+                wrapper._block_table, wrapper._seq_lens, cu_query_lens=wrapper._query_cu,
+                num_tokens=tokens,
+            )
+    captured = (
+        wrapper._scores.data_ptr(),
+        wrapper._num_valid_pages.data_ptr(),
+        wrapper._query_cu.data_ptr(),
+    )
+    out.fill_(-777)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out[:num_rows], expected)
+
+    next_rows, next_expected = plan(72)
+    assert next_rows != num_rows
+    # A replan of the same shapes must not move what the capture reads.
+    assert captured == (
+        wrapper._scores.data_ptr(),
+        wrapper._num_valid_pages.data_ptr(),
+        wrapper._query_cu.data_ptr(),
+    )
+    out.fill_(-777)
+    wrapper._scores.fill_(POISON)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out[:next_rows], next_expected)
+    assert torch.all(out[next_rows:, :, 0] == 0)
+
+
+def test_decode_ragged_queries_need_a_supporting_wrapper():
+    """Ragged offsets reach only the two- and four-head Q8KV4 scorer, and a
+    captured plan needs a fixed buffer to bind them."""
+
+    batch, max_pages, query_len = 4, 3, 2
+    _, _, block_table, seq_lens = _make_decode("q8kv4", batch, max_pages, 3)
+    cu = _cumulative([query_len] * batch)
+    tokens = batch * query_len
+    for unsupported in (
+        BatchDecodeIndexerQ8KV4Wrapper(num_heads=1),
+        BatchDecodeIndexerQ8KV8Wrapper(num_heads=4),
+    ):
+        with pytest.raises(ValueError, match="does not support cu_query_lens"):
+            unsupported.plan(block_table, seq_lens, cu_query_lens=cu, num_tokens=tokens)
+    wrapper = BatchDecodeIndexerQ8KV4Wrapper(num_heads=4)
+    with pytest.raises(ValueError, match="positive num_tokens"):
+        wrapper.plan(block_table, seq_lens, cu_query_lens=cu)
+    with pytest.raises(ValueError, match="cu_query_lens must have shape"):
+        wrapper.plan(block_table, seq_lens, cu_query_lens=cu[:-1], num_tokens=tokens)
+    captured = BatchDecodeIndexerQ8KV4Wrapper(
+        num_heads=4,
+        use_cuda_graph=True,
+        block_table_buffer=block_table,
+        seq_lens_buffer=seq_lens,
+    )
+    with pytest.raises(ValueError, match="query_cu_buffer"):
+        captured.plan(block_table, seq_lens, cu_query_lens=cu, num_tokens=tokens)
 
 
 def _one_head_work_counter(wrapper, batch: int) -> int:
