@@ -63,6 +63,70 @@ def _e2m1x8_scaled_to_e4m3x8(
     )
 
 
+@dsl_user_op
+def _e4m3_scale_to_f16x2(scales: Int32, byte: int, *, loc=None, ip=None) -> Int32:
+    """Broadcast E4M3 byte ``byte`` of ``scales`` to both halves of an f16x2."""
+
+    selector = byte | (byte << 4)
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(scales).ir_value(loc=loc, ip=ip)],
+            "{\n\t"
+            ".reg .b32 sf_bytes;\n\t"
+            ".reg .b16 sf_pair;\n\t"
+            f"prmt.b32 sf_bytes, $1, 0, {selector};\n\t"
+            "mov.b32 {sf_pair, _}, sf_bytes;\n\t"
+            "cvt.rn.f16x2.e4m3x2 $0, sf_pair;\n\t"
+            "}\n",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _e2m1x8_f16x2_scaled_to_e4m3x8(
+    packed: Int32, scale_f16x2: Int32, *, loc=None, ip=None
+) -> tuple[Int32, Int32]:
+    """``cvt_fp4x8_e2m1_scaled_e4m3x8`` with the scale already converted to f16x2."""
+
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int32(packed).ir_value(loc=loc, ip=ip), Int32(scale_f16x2).ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b16 e0, e1, e2, e3;\n\t"
+        ".reg .b8 byte0, byte1, byte2, byte3;\n\t"
+        ".reg .b32 h0, h1, h2, h3;\n\t"
+        "mov.b32 {byte0, byte1, byte2, byte3}, $2;\n\t"
+        "cvt.rn.f16x2.e2m1x2 h0, byte0;\n\t"
+        "cvt.rn.f16x2.e2m1x2 h1, byte1;\n\t"
+        "cvt.rn.f16x2.e2m1x2 h2, byte2;\n\t"
+        "cvt.rn.f16x2.e2m1x2 h3, byte3;\n\t"
+        "mul.rn.f16x2 h0, h0, $3;\n\t"
+        "mul.rn.f16x2 h1, h1, $3;\n\t"
+        "mul.rn.f16x2 h2, h2, $3;\n\t"
+        "mul.rn.f16x2 h3, h3, $3;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f16x2 e0, h0;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f16x2 e1, h1;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f16x2 e2, h2;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f16x2 e3, h3;\n\t"
+        "mov.b32 $0, {e0, e1};\n\t"
+        "mov.b32 $1, {e2, e3};\n\t"
+        "}\n",
+        "=r,=r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (
+        Int32(llvm.extractvalue(T.i32(), out, [0], loc=loc, ip=ip)),
+        Int32(llvm.extractvalue(T.i32(), out, [1], loc=loc, ip=ip)),
+    )
+
+
 class _NamedBarrier(enum.IntEnum):
     TmemPtr = enum.auto()
     Score = enum.auto()
@@ -121,6 +185,11 @@ class Q8KV4DecodeIndexerSm100:
     threads_per_cta = (dequant_warp_begin + dequant_warps) * threads_per_warp
     tmem_copy_threads = 128
     target_ctas_per_sm = 2
+    sm107_mma_k = 64
+    q_stages = 1
+    q_loader_warp = 2
+    merge_q_loader = False
+    empty_cta_pages = -1
 
     def __init__(self, *, sm_count: int, num_heads: int) -> None:
         if sm_count <= 0:
@@ -130,19 +199,36 @@ class Q8KV4DecodeIndexerSm100:
         self.num_heads = num_heads
         self.num_queries = self.query_length * num_heads
         self.n_tile = self.num_queries
+        arch = BaseDSL._get_dsl().get_arch_enum()
+        rubin_arch = getattr(arch.__class__, "sm_107", None)
+        is_rubin = rubin_arch is not None and arch.is_family_of(rubin_arch)
+        if is_rubin:
+            # The page-loader warp also issues the Q TMA, so a CTA has ten
+            # warps; two Q stages let it run a request segment ahead.
+            self.merge_q_loader = True
+            self.q_loader_warp = -1
+            self.q_stages = 2
+            self.score_warp_begin = 2
+            self.dequant_warp_begin = self.score_warp_begin + self.score_warps
+            self.threads_per_cta = (self.dequant_warp_begin + self.dequant_warps) * self.threads_per_warp
+            self.target_ctas_per_sm = 3
+            self.empty_cta_pages = 0
+            self.raw_stages = 7
         self.acc_tmem_cols = self.acc_stages * self.num_queries
         # The allocation is a power of two of at least 32 columns: 128 for both
         # two heads (2 * 16 + 2 * 32 columns) and four heads (2 * 32 + 2 * 32).
         used_tmem_cols = self.acc_tmem_cols + self.k_stages * self.k_stage_tmem_cols
         self.tmem_cols = max(32, 1 << (used_tmem_cols - 1).bit_length())
         self.grid_ctas = sm_count * self.target_ctas_per_sm
-        arch = BaseDSL._get_dsl().get_arch_enum()
-        rubin_arch = getattr(arch.__class__, "sm_107", None)
-        is_rubin = rubin_arch is not None and arch.is_family_of(rubin_arch)
         self.use_qmul4 = _HAS_QMUL4 and not is_rubin
         # SM107's FP16 dequant path needs more registers; without a register
         # bound only one CTA fits per SM there and the grid runs in two waves.
         self.min_blocks_per_mp = self.target_ctas_per_sm if is_rubin else 1
+        # SM107 has a K=64 FP8 UMMA, two instructions per page instead of four.
+        self.use_sm107_fp8_mma = is_rubin
+        # One scale byte covers two packed words, so SM107 converts each of a
+        # row's eight scales to f16x2 once per page instead of once per word.
+        self.hoist_scale_cvt = is_rubin and not self.use_qmul4
 
     @cute.jit
     def __call__(
@@ -210,16 +296,30 @@ class Q8KV4DecodeIndexerSm100:
         qk_tiler = (self.m_tile, self.n_tile, self.k_tile)
         cta_group = tcgen05.CtaGroup.ONE
         # Both operands are K-major: dequantized K rows in TMEM and Q rows.
-        tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            cutlass.Float8E4M3FN,
-            mQ.element_type,
-            OperandMajorMode.K,
-            OperandMajorMode.K,
-            Float32,
-            cta_group,
-            qk_tiler[:2],
-            tcgen05.OperandSource.TMEM,
-        )
+        if cutlass.const_expr(self.use_sm107_fp8_mma):
+            tiled_mma = cute.make_tiled_mma(
+                tcgen05.SM107MmaFP8Op(
+                    cutlass.Float8E4M3FN,
+                    mQ.element_type,
+                    Float32,
+                    (self.m_tile, self.n_tile, self.sm107_mma_k),
+                    cta_group,
+                    tcgen05.OperandSource.TMEM,
+                    OperandMajorMode.K,
+                    OperandMajorMode.K,
+                )
+            )
+        else:
+            tiled_mma = sm100_utils.make_trivial_tiled_mma(
+                cutlass.Float8E4M3FN,
+                mQ.element_type,
+                OperandMajorMode.K,
+                OperandMajorMode.K,
+                Float32,
+                cta_group,
+                qk_tiler[:2],
+                tcgen05.OperandSource.TMEM,
+            )
         tK_layout = sm100_utils.make_smem_layout_a(
             tiled_mma,
             qk_tiler,
@@ -230,7 +330,7 @@ class Q8KV4DecodeIndexerSm100:
             tiled_mma,
             qk_tiler,
             mQ.element_type,
-            1,
+            self.q_stages,
         )
         sQ_tma_layout = cute.make_composed_layout(
             sQ_layout.inner,
@@ -282,7 +382,7 @@ class Q8KV4DecodeIndexerSm100:
         class SharedStorage:
             raw_mbar_ptr: cute.struct.MemRange[Int64, self.raw_stages * 2]
             k_mbar_ptr: cute.struct.MemRange[Int64, self.k_stages * 2]
-            q_mbar_ptr: cute.struct.MemRange[Int64, 2]
+            q_mbar_ptr: cute.struct.MemRange[Int64, self.q_stages * 2]
             acc_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stages * 2]
             tmem_holding_buf: Int32
             sPacked: cute.struct.Align[
@@ -362,7 +462,9 @@ class Q8KV4DecodeIndexerSm100:
         if warp_idx == Int32(1):
             cpasync.prefetch_descriptor(tma_atom_packed)
             cpasync.prefetch_descriptor(tma_atom_scale)
-        elif warp_idx == Int32(2):
+            if cutlass.const_expr(self.merge_q_loader):
+                cpasync.prefetch_descriptor(tma_atom_Q)
+        elif warp_idx == Int32(self.q_loader_warp):
             cpasync.prefetch_descriptor(tma_atom_Q)
 
         smem = utils.SmemAllocator()
@@ -408,7 +510,7 @@ class Q8KV4DecodeIndexerSm100:
             defer_sync=True,
         ).make_participants()
         q_producer, q_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=1,
+            num_stages=self.q_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             tx_count=self.num_queries * self.head_dim,
@@ -543,207 +645,234 @@ class Q8KV4DecodeIndexerSm100:
         tCcScores = thr_mma.partition_C(cScores)
         tTR_cScores = thr_tmem_copy.partition_D(tCcScores)
 
-        if warp_idx == Int32(1):
-            current_batch = batch_idx
-            logical_page = logical_page_begin
-            global_page = global_page_begin
-            pages_remaining = num_pages
-            while pages_remaining > Int32(0):
-                segment_pages = mScheduler[current_batch + 1] - global_page
-                if segment_pages > pages_remaining:  # noqa: PLR1730
-                    segment_pages = pages_remaining
-                # Each lane fetches one of the next 32 page-table entries, so
-                # the page lookup latency is paid once per 32 raw pages.
-                for chunk_begin in cutlass.range(0, segment_pages, self.threads_per_warp, unroll=1):
-                    chunk_pages = segment_pages - chunk_begin
-                    if chunk_pages > Int32(self.threads_per_warp):  # noqa: PLR1730
-                        chunk_pages = Int32(self.threads_per_warp)
-                    lane_page = Int32(0)
-                    if lane_idx < chunk_pages:
-                        lane_page = mPageTable_lb[logical_page + lane_idx, current_batch]
-                    for chunk_page in cutlass.range(chunk_pages, unroll=1):
-                        physical_page = cute.arch.shuffle_sync(lane_page, chunk_page)
-                        raw_empty = raw_producer.acquire_and_advance()
-                        cute.copy(
-                            tma_atom_packed,
-                            tPgP[(None, 0, 0, physical_page)],
-                            tPsP[(None, raw_empty.index)],
-                            tma_bar_ptr=raw_empty.barrier,
+        # Small steps leave most CTAs without pages: on SM107 those go straight
+        # to the final barrier and TMEM free (num_pages >= 0 elsewhere).
+        if num_pages > Int32(self.empty_cta_pages):
+            if warp_idx == Int32(1):
+                current_batch = batch_idx
+                logical_page = logical_page_begin
+                global_page = global_page_begin
+                pages_remaining = num_pages
+                while pages_remaining > Int32(0):
+                    segment_pages = mScheduler[current_batch + 1] - global_page
+                    if segment_pages > pages_remaining:  # noqa: PLR1730
+                        segment_pages = pages_remaining
+                    if cutlass.const_expr(self.merge_q_loader):
+                        q_empty = q_producer.acquire_and_advance()
+                        q_row = (current_batch + Int32(1)) * query_rows - Int32(self.num_queries)
+                        sQ_stage = cute.make_tensor(
+                            sQ.iterator + q_empty.index * Int32(self.head_dim * self.num_queries),
+                            sQ_tma_layout.outer,
                         )
-                        cute.copy(
-                            tma_atom_scale,
-                            tSgS[(None, 0, 0, physical_page)],
-                            tSsS[(None, raw_empty.index)],
-                            tma_bar_ptr=raw_empty.barrier,
+                        tQsQ, tQgQ = cpasync.tma_partition(
+                            tma_atom_Q,
+                            0,
+                            cute.make_layout(1),
+                            cute.group_modes(sQ_stage, 0, 2),
+                            cute.group_modes(
+                                cute.flat_divide(
+                                    cute.domain_offset((0, q_row), mQ_krb),
+                                    (self.head_dim, self.num_queries),
+                                ),
+                                0,
+                                2,
+                            ),
                         )
-                    global_page += chunk_pages
-                    logical_page += chunk_pages
-                pages_remaining -= segment_pages
-                while (
-                    current_batch < batch_size - Int32(1)
-                    and mScheduler[current_batch + 1] <= global_page
-                ):
-                    current_batch += Int32(1)
-                    logical_page = global_page - mScheduler[current_batch]
-            raw_producer.tail()
-        elif warp_idx == Int32(2):
-            current_batch = batch_idx
-            global_page = global_page_begin
-            pages_remaining = num_pages
-            while pages_remaining > Int32(0):
-                segment_pages = mScheduler[current_batch + 1] - global_page
-                if segment_pages > pages_remaining:  # noqa: PLR1730
-                    segment_pages = pages_remaining
-                q_empty = q_producer.acquire_and_advance()
-                # Rows before the request belong to the previous one, or are
-                # out of bounds and zero-filled for the first: they only fill
-                # the unused leading slots.
-                q_row = (current_batch + Int32(1)) * query_rows - Int32(self.num_queries)
-                tQsQ, tQgQ = cpasync.tma_partition(
-                    tma_atom_Q,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sQ_tma, 0, 2),
-                    cute.group_modes(
-                        cute.flat_divide(
-                            cute.domain_offset((0, q_row), mQ_krb),
-                            (self.head_dim, self.num_queries),
-                        ),
-                        0,
-                        2,
-                    ),
-                )
-                cute.copy(
-                    tma_atom_Q,
-                    tQgQ[(None, 0, 0)],
-                    tQsQ,
-                    tma_bar_ptr=q_empty.barrier,
-                )
-                global_page += segment_pages
-                pages_remaining -= segment_pages
-                while (
-                    current_batch < batch_size - Int32(1)
-                    and mScheduler[current_batch + 1] <= global_page
-                ):
-                    current_batch += Int32(1)
-            q_producer.tail()
-        elif warp_idx == Int32(0):
-            num_k_blocks = cute.size(tCrK, mode=[2])
-            current_batch = batch_idx
-            global_page = global_page_begin
-            pages_remaining = num_pages
-            while pages_remaining > Int32(0):
-                segment_pages = mScheduler[current_batch + 1] - global_page
-                if segment_pages > pages_remaining:  # noqa: PLR1730
-                    segment_pages = pages_remaining
-                q_full = q_consumer.wait_and_advance()
-                for _ in cutlass.range(segment_pages, unroll=1):
-                    acc_empty = acc_producer.acquire_and_advance()
-                    tCtAcc = tCtAcc_staged[(None, None, None, acc_empty.index)]
-                    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                    k_full = k_consumer.wait_and_advance()
-                    for k_block_idx in cutlass.range_constexpr(num_k_blocks):
-                        cute.gemm(
-                            tiled_mma,
-                            tCtAcc,
-                            tCrK[(None, None, k_block_idx, k_full.index)],
-                            tCrQ[(None, None, k_block_idx, 0)],
-                            tCtAcc,
-                        )
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                    k_full.release()
-                    acc_empty.commit()
-                q_full.release()
-                global_page += segment_pages
-                pages_remaining -= segment_pages
-                while (
-                    current_batch < batch_size - Int32(1)
-                    and mScheduler[current_batch + 1] <= global_page
-                ):
-                    current_batch += Int32(1)
-            acc_producer.tail()
-
-        rScores = cute.make_rmem_tensor(tTR_cScores.shape, Float32)
-        if warp_idx >= Int32(self.dequant_warp_begin):
-            self._dequant_pages(
-                num_pages,
-                raw_consumer,
-                k_producer,
-                sPacked,
-                sScale,
-                tKtK,
-                copy_tidx,
-            )
-        elif warp_idx >= Int32(self.score_warp_begin):
-            score_warp_idx = warp_idx - Int32(self.score_warp_begin)
-            rScoresFlat = cute.make_tensor(
-                rScores.iterator,
-                cute.make_layout(self.num_queries),
-            )
-            current_batch = batch_idx
-            logical_page = logical_page_begin
-            global_page = global_page_begin
-            last_global_page = global_page_begin + num_pages - Int32(1)
-            pages_remaining = num_pages
-            local_block = Int32(0)
-            if (
-                num_pages > Int32(0)
-                and score_warp_idx == Int32(0)
-                and lane_idx < Int32(self.num_queries)
-            ):
-                seq_len = mSeqLens[current_batch]
-                query_position = (
-                    seq_len - Int32(self.query_length) + lane_idx // Int32(self.num_heads)
-                )
-                local_block = query_position // Int32(self.page_size)
-            while pages_remaining > Int32(0):
-                segment_pages = mScheduler[current_batch + 1] - global_page
-                if segment_pages > pages_remaining:  # noqa: PLR1730
-                    segment_pages = pages_remaining
-                for _ in cutlass.range(segment_pages, unroll=1):
-                    partial_stage = global_page % Int32(2)
-                    acc_full = acc_consumer.wait_and_advance()
-                    cute.copy(
-                        tmem_tiled_copy,
-                        tTR_tAcc_staged[(None, None, None, None, acc_full.index)],
-                        rScores,
-                    )
-                    cute.arch.fence_view_async_tmem_load()
-                    for query_idx in cutlass.range_constexpr(self.num_queries):
-                        partial_max = cute.arch.warp_redux_sync(rScoresFlat[query_idx], "fmax")
-                        if lane_idx == Int32(0):
-                            sPartialMax[partial_stage, score_warp_idx, query_idx] = partial_max
-                    acc_full.release()
-                    score_barrier.arrive_and_wait()
-
-                    if score_warp_idx == Int32(0) and lane_idx < Int32(self.num_queries):
-                        query_idx = lane_idx
-                        row_max = -Float32.inf
-                        for partial_idx in cutlass.range_constexpr(self.score_warps):
-                            row_max = cute.arch.fmax(
-                                row_max, sPartialMax[partial_stage, partial_idx, query_idx]
+                        cute.copy(tma_atom_Q, tQgQ[(None, 0, 0)], tQsQ, tma_bar_ptr=q_empty.barrier)
+                    # Each lane fetches one of the next 32 page-table entries, so
+                    # the page lookup latency is paid once per 32 raw pages.
+                    for chunk_begin in cutlass.range(0, segment_pages, self.threads_per_warp, unroll=1):
+                        chunk_pages = segment_pages - chunk_begin
+                        if chunk_pages > Int32(self.threads_per_warp):  # noqa: PLR1730
+                            chunk_pages = Int32(self.threads_per_warp)
+                        lane_page = Int32(0)
+                        if lane_idx < chunk_pages:
+                            lane_page = mPageTable_lb[logical_page + lane_idx, current_batch]
+                        for chunk_page in cutlass.range(chunk_pages, unroll=1):
+                            physical_page = cute.arch.shuffle_sync(lane_page, chunk_page)
+                            raw_empty = raw_producer.acquire_and_advance()
+                            cute.copy(
+                                tma_atom_packed,
+                                tPgP[(None, 0, 0, physical_page)],
+                                tPsP[(None, raw_empty.index)],
+                                tma_bar_ptr=raw_empty.barrier,
                             )
-                        if global_page == last_global_page:
-                            # The CTA's last scores: the top-k that reads them
-                            # waits for this grid, so it may start launching.
-                            cute.arch.griddepcontrol_launch_dependents()
-                        if logical_page < local_block:
-                            mOut_pqb[logical_page, query_idx, current_batch] = row_max
-                    global_page += Int32(1)
-                    logical_page += Int32(1)
-                pages_remaining -= segment_pages
-                while (
-                    current_batch < batch_size - Int32(1)
-                    and mScheduler[current_batch + 1] <= global_page
+                            cute.copy(
+                                tma_atom_scale,
+                                tSgS[(None, 0, 0, physical_page)],
+                                tSsS[(None, raw_empty.index)],
+                                tma_bar_ptr=raw_empty.barrier,
+                            )
+                        global_page += chunk_pages
+                        logical_page += chunk_pages
+                    pages_remaining -= segment_pages
+                    while (
+                        current_batch < batch_size - Int32(1)
+                        and mScheduler[current_batch + 1] <= global_page
+                    ):
+                        current_batch += Int32(1)
+                        logical_page = global_page - mScheduler[current_batch]
+                raw_producer.tail()
+                if cutlass.const_expr(self.merge_q_loader):
+                    q_producer.tail()
+            elif warp_idx == Int32(self.q_loader_warp):
+                current_batch = batch_idx
+                global_page = global_page_begin
+                pages_remaining = num_pages
+                while pages_remaining > Int32(0):
+                    segment_pages = mScheduler[current_batch + 1] - global_page
+                    if segment_pages > pages_remaining:  # noqa: PLR1730
+                        segment_pages = pages_remaining
+                    q_empty = q_producer.acquire_and_advance()
+                    # Rows before the request belong to the previous one, or are
+                    # out of bounds and zero-filled for the first: they only fill
+                    # the unused leading slots.
+                    q_row = (current_batch + Int32(1)) * query_rows - Int32(self.num_queries)
+                    tQsQ, tQgQ = cpasync.tma_partition(
+                        tma_atom_Q,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(sQ_tma, 0, 2),
+                        cute.group_modes(
+                            cute.flat_divide(
+                                cute.domain_offset((0, q_row), mQ_krb),
+                                (self.head_dim, self.num_queries),
+                            ),
+                            0,
+                            2,
+                        ),
+                    )
+                    cute.copy(
+                        tma_atom_Q,
+                        tQgQ[(None, 0, 0)],
+                        tQsQ,
+                        tma_bar_ptr=q_empty.barrier,
+                    )
+                    global_page += segment_pages
+                    pages_remaining -= segment_pages
+                    while (
+                        current_batch < batch_size - Int32(1)
+                        and mScheduler[current_batch + 1] <= global_page
+                    ):
+                        current_batch += Int32(1)
+                q_producer.tail()
+            elif warp_idx == Int32(0):
+                num_k_blocks = cute.size(tCrK, mode=[2])
+                current_batch = batch_idx
+                global_page = global_page_begin
+                pages_remaining = num_pages
+                while pages_remaining > Int32(0):
+                    segment_pages = mScheduler[current_batch + 1] - global_page
+                    if segment_pages > pages_remaining:  # noqa: PLR1730
+                        segment_pages = pages_remaining
+                    q_full = q_consumer.wait_and_advance()
+                    for _ in cutlass.range(segment_pages, unroll=1):
+                        acc_empty = acc_producer.acquire_and_advance()
+                        tCtAcc = tCtAcc_staged[(None, None, None, acc_empty.index)]
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                        k_full = k_consumer.wait_and_advance()
+                        for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                            cute.gemm(
+                                tiled_mma,
+                                tCtAcc,
+                                tCrK[(None, None, k_block_idx, k_full.index)],
+                                tCrQ[(None, None, k_block_idx, q_full.index)],
+                                tCtAcc,
+                            )
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        k_full.release()
+                        acc_empty.commit()
+                    q_full.release()
+                    global_page += segment_pages
+                    pages_remaining -= segment_pages
+                    while (
+                        current_batch < batch_size - Int32(1)
+                        and mScheduler[current_batch + 1] <= global_page
+                    ):
+                        current_batch += Int32(1)
+                acc_producer.tail()
+
+            rScores = cute.make_rmem_tensor(tTR_cScores.shape, Float32)
+            if warp_idx >= Int32(self.dequant_warp_begin):
+                self._dequant_pages(
+                    num_pages,
+                    raw_consumer,
+                    k_producer,
+                    sPacked,
+                    sScale,
+                    tKtK,
+                    copy_tidx,
+                )
+            elif warp_idx >= Int32(self.score_warp_begin):
+                score_warp_idx = warp_idx - Int32(self.score_warp_begin)
+                rScoresFlat = cute.make_tensor(
+                    rScores.iterator,
+                    cute.make_layout(self.num_queries),
+                )
+                current_batch = batch_idx
+                logical_page = logical_page_begin
+                global_page = global_page_begin
+                last_global_page = global_page_begin + num_pages - Int32(1)
+                pages_remaining = num_pages
+                local_block = Int32(0)
+                if (
+                    num_pages > Int32(0)
+                    and score_warp_idx == Int32(0)
+                    and lane_idx < Int32(self.num_queries)
                 ):
-                    current_batch += Int32(1)
-                    logical_page = global_page - mScheduler[current_batch]
-                if score_warp_idx == Int32(0) and lane_idx < Int32(self.num_queries):
                     seq_len = mSeqLens[current_batch]
                     query_position = (
                         seq_len - Int32(self.query_length) + lane_idx // Int32(self.num_heads)
                     )
                     local_block = query_position // Int32(self.page_size)
+                while pages_remaining > Int32(0):
+                    segment_pages = mScheduler[current_batch + 1] - global_page
+                    if segment_pages > pages_remaining:  # noqa: PLR1730
+                        segment_pages = pages_remaining
+                    for _ in cutlass.range(segment_pages, unroll=1):
+                        partial_stage = global_page % Int32(2)
+                        acc_full = acc_consumer.wait_and_advance()
+                        cute.copy(
+                            tmem_tiled_copy,
+                            tTR_tAcc_staged[(None, None, None, None, acc_full.index)],
+                            rScores,
+                        )
+                        cute.arch.fence_view_async_tmem_load()
+                        for query_idx in cutlass.range_constexpr(self.num_queries):
+                            partial_max = cute.arch.warp_redux_sync(rScoresFlat[query_idx], "fmax")
+                            if lane_idx == Int32(0):
+                                sPartialMax[partial_stage, score_warp_idx, query_idx] = partial_max
+                        acc_full.release()
+                        score_barrier.arrive_and_wait()
+
+                        if score_warp_idx == Int32(0) and lane_idx < Int32(self.num_queries):
+                            query_idx = lane_idx
+                            row_max = -Float32.inf
+                            for partial_idx in cutlass.range_constexpr(self.score_warps):
+                                row_max = cute.arch.fmax(
+                                    row_max, sPartialMax[partial_stage, partial_idx, query_idx]
+                                )
+                            if global_page == last_global_page:
+                                # The CTA's last scores: the top-k that reads them
+                                # waits for this grid, so it may start launching.
+                                cute.arch.griddepcontrol_launch_dependents()
+                            if logical_page < local_block:
+                                mOut_pqb[logical_page, query_idx, current_batch] = row_max
+                        global_page += Int32(1)
+                        logical_page += Int32(1)
+                    pages_remaining -= segment_pages
+                    while (
+                        current_batch < batch_size - Int32(1)
+                        and mScheduler[current_batch + 1] <= global_page
+                    ):
+                        current_batch += Int32(1)
+                        logical_page = global_page - mScheduler[current_batch]
+                    if score_warp_idx == Int32(0) and lane_idx < Int32(self.num_queries):
+                        seq_len = mSeqLens[current_batch]
+                        query_position = (
+                            seq_len - Int32(self.query_length) + lane_idx // Int32(self.num_heads)
+                        )
+                        local_block = query_position // Int32(self.page_size)
 
         pipeline.sync(barrier_id=int(_NamedBarrier.Final))
         tmem.free(tmem_ptr)
@@ -782,6 +911,7 @@ class Q8KV4DecodeIndexerSm100:
         packed_words = self.packed_bytes_per_token // word_bytes
         rPacked = cute.make_rmem_tensor((packed_words,), Int32)
         rScales = cute.make_rmem_tensor((self.scales_per_token // word_bytes,), Int32)
+        rScalesF16x2 = cute.make_rmem_tensor((self.scales_per_token,), Int32)
         chunk_load = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), Int32, num_bits_per_copy=self.packed_chunk_bytes * 8
         )
@@ -827,10 +957,17 @@ class Q8KV4DecodeIndexerSm100:
                 assumed_align=self.scales_per_token,
             )
             cute.copy(scale_load, cute.make_tensor(scale_ptr, rScales.layout), rScales)
+            if cutlass.const_expr(self.hoist_scale_cvt):
+                for group in cutlass.range_constexpr(self.scales_per_token):
+                    rScalesF16x2[group] = _e4m3_scale_to_f16x2(
+                        rScales[group // word_bytes], group % word_bytes
+                    )
             for word in cutlass.range_constexpr(packed_words):
                 group = word * values_per_word // self.scale_group
                 scale = rScales[group // word_bytes] >> Int32(8 * (group % word_bytes))
-                if cutlass.const_expr(self.use_qmul4):
+                if cutlass.const_expr(self.hoist_scale_cvt):
+                    lo, hi = _e2m1x8_f16x2_scaled_to_e4m3x8(rPacked[word], rScalesF16x2[group])
+                elif cutlass.const_expr(self.use_qmul4):
                     lo, hi = _e2m1x8_scaled_to_e4m3x8(rPacked[word], scale)
                 else:
                     lo, hi = common_utils.cvt_fp4x8_e2m1_scaled_e4m3x8(rPacked[word], scale)
