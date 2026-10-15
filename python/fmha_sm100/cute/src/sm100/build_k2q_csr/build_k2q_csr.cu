@@ -11,6 +11,7 @@
 //   M:  build_row_map      -- round-robin packing of rows across batches
 //   H:  histogram + tile_counts
 //   PR: row prefix         -- single block per head, row_counts -> row_ptr
+//                             (+ the attention work list, largest first)
 //   PT: tile prefix        -- multi-block, scan tile_counts along (c, w) axis
 //   S:  scatter (sorted)   -- per-warp slot range, q-sequential within warp
 //
@@ -216,7 +217,69 @@ __global__ void k2q_hist_kernel(
 
 // ---------------------------------------------------------------------------
 // PR: row prefix. One block per head.
+//
+// With a schedule, each block also emits its head's attention work items: one
+// per (row, chunk of <= target_q_per_cta q), in a list ordered largest
+// q_count first (LPT). The attention kernels run work item i on CTA i and are
+// not persistent, so the list order is the launch order: appending items with
+// atomicAdd left the largest ones at random positions and the grid waited for
+// them at the end. Every block histograms the item sizes of all heads
+// (q_count >> lpt_shift buckets), and separately those of the heads before
+// its own, which gives each bucket's offset and the block's slice of it with
+// no inter-block communication: buckets descend by size, then ascend by head.
+// The order inside a slice is not deterministic. No output depends on the
+// order: each item writes its own partial slots.
 // ---------------------------------------------------------------------------
+constexpr int kLptBuckets = 2048;
+
+// Adds the work items of one (head, row) with row_count > 0 q to bucket_counts.
+__device__ __forceinline__ void lpt_count_items(
+    int* bucket_counts, int row_count, int target_q_per_cta, int lpt_shift)
+{
+    if (row_count <= target_q_per_cta) {  // one item, the common case
+        atomicAdd(&bucket_counts[(row_count - 1) >> lpt_shift], 1);
+        return;
+    }
+    int full_chunks = row_count / target_q_per_cta;
+    int last_chunk = row_count - full_chunks * target_q_per_cta;
+    atomicAdd(&bucket_counts[(target_q_per_cta - 1) >> lpt_shift], full_chunks);
+    if (last_chunk > 0) atomicAdd(&bucket_counts[(last_chunk - 1) >> lpt_shift], 1);
+}
+
+// Exclusive scan of one value per thread across the block (warp shuffles, two
+// barriers); scratch holds >= kThreads / 32 + 1 ints. Returns the thread's
+// exclusive prefix and sets total to the block sum.
+template <int kThreads>
+__device__ __forceinline__ int block_exclusive_scan(int value, int* scratch, int& total)
+{
+    constexpr int kWarpsPerBlock = kThreads / kWarpSize;
+    static_assert(kThreads % kWarpSize == 0 && kWarpsPerBlock <= kWarpSize, "one warp scans the warp sums");
+    int lane = threadIdx.x & (kWarpSize - 1);
+    int warp = threadIdx.x / kWarpSize;
+    int x = value;
+    #pragma unroll
+    for (int off = 1; off < kWarpSize; off <<= 1) {
+        int y = __shfl_up_sync(0xFFFFFFFFu, x, off);
+        if (lane >= off) x += y;
+    }
+    if (lane == kWarpSize - 1) scratch[warp] = x;
+    __syncthreads();
+    if (warp == 0) {
+        int w = lane < kWarpsPerBlock ? scratch[lane] : 0;
+        int t = w;
+        #pragma unroll
+        for (int off = 1; off < kWarpSize; off <<= 1) {
+            int y = __shfl_up_sync(0xFFFFFFFFu, t, off);
+            if (lane >= off) t += y;
+        }
+        if (lane < kWarpsPerBlock) scratch[lane] = t - w;
+        if (lane == kWarpSize - 1) scratch[kWarpsPerBlock] = t;
+    }
+    __syncthreads();
+    total = scratch[kWarpsPerBlock];
+    return scratch[warp] + x - value;
+}
+
 template <int kThreads>
 __global__ void k2q_row_prefix_kernel(
     int const* __restrict__ row_counts,
@@ -226,11 +289,24 @@ __global__ void k2q_row_prefix_kernel(
     int* __restrict__ work_count,
     int total_rows,
     int target_q_per_cta,
-    int work_capacity)
+    int work_capacity,
+    int lpt_shift)
 {
+    static_assert(kLptBuckets % kThreads == 0, "buckets must split evenly across threads");
     int h = blockIdx.x;
     int tid = threadIdx.x;
     __shared__ int scan_buf[kThreads];
+    // Items per bucket: of every head (-> bucket offsets), and of the heads
+    // before this one (-> this head's next slot in each bucket).
+    __shared__ int bucket_all[kLptBuckets];
+    __shared__ int bucket_slot[kLptBuckets];
+    bool const emit_schedule = scheduler_metadata != nullptr && work_count != nullptr;
+    if (emit_schedule) {
+        for (int b = tid; b < kLptBuckets; b += kThreads) {
+            bucket_all[b] = 0;
+            bucket_slot[b] = 0;
+        }
+    }
 
     int const* head_counts = row_counts + (size_t)h * total_rows;
     int* head_rowptr = row_ptr + (size_t)h * (total_rows + 1);
@@ -254,26 +330,89 @@ __global__ void k2q_row_prefix_kernel(
         int row_count = head_counts[i];
         running += row_count;
         head_rowptr[i + 1] = running;
-        if (scheduler_metadata != nullptr && work_count != nullptr && row_count > 0) {
-            int num_chunks = (row_count + target_q_per_cta - 1) / target_q_per_cta;
-            int base = atomicAdd(work_count, num_chunks);
-            int batch_idx = row_coords[(size_t)i * 2];
-            int kv_block_idx = row_coords[(size_t)i * 2 + 1];
-            for (int c = 0; c < num_chunks; ++c) {
-                int work_idx = base + c;
-                if (work_idx < work_capacity) {
-                    int q_begin = c * target_q_per_cta;
-                    int q_count = min(target_q_per_cta, row_count - q_begin);
-                    int* meta = scheduler_metadata + (size_t)work_idx * 6;
-                    meta[0] = h;
-                    meta[1] = i;
-                    meta[2] = q_begin;
-                    meta[3] = q_count;
-                    meta[4] = batch_idx;
-                    meta[5] = kv_block_idx;
+    }
+    if (!emit_schedule) return;
+
+    // This head's work items: rows tid, tid + kThreads, ... The loads of the
+    // first kRowsPrefetched land while the buckets are counted and scanned.
+    constexpr int kRowsPrefetched = 2;
+    int2 const* coords2 = reinterpret_cast<int2 const*>(row_coords);
+    int own_counts[kRowsPrefetched];
+    int2 own_coords[kRowsPrefetched];
+    #pragma unroll
+    for (int u = 0; u < kRowsPrefetched; ++u) {
+        int row = tid + u * kThreads;
+        own_counts[u] = row < total_rows ? head_counts[row] : 0;
+        own_coords[u] = row < total_rows ? coords2[row] : make_int2(0, 0);
+    }
+
+    // (head, row) pairs of every head; a batch's loads are all in flight
+    // before its first atomic.
+    constexpr int kPairsPerBatch = 8;
+    int const all_pairs = gridDim.x * total_rows;
+    int const pairs_before = h * total_rows;
+    for (int first = tid; first < all_pairs; first += kThreads * kPairsPerBatch) {
+        int pair_counts[kPairsPerBatch];
+        #pragma unroll
+        for (int u = 0; u < kPairsPerBatch; ++u) {
+            int pair = first + u * kThreads;
+            pair_counts[u] = pair < all_pairs ? row_counts[pair] : 0;
+        }
+        #pragma unroll
+        for (int u = 0; u < kPairsPerBatch; ++u) {
+            if (pair_counts[u] > 0) {
+                lpt_count_items(bucket_all, pair_counts[u], target_q_per_cta, lpt_shift);
+                if (first + u * kThreads < pairs_before) {
+                    lpt_count_items(bucket_slot, pair_counts[u], target_q_per_cta, lpt_shift);
                 }
             }
         }
+    }
+    __syncthreads();
+
+    // Exclusive scan of bucket_all in descending bucket order: thread t owns the
+    // kPerThread buckets that follow those of thread t - 1.
+    constexpr int kPerThread = kLptBuckets / kThreads;
+    int counts[kPerThread];
+    int count_sum = 0;
+    #pragma unroll
+    for (int j = 0; j < kPerThread; ++j) {
+        counts[j] = bucket_all[kLptBuckets - 1 - (tid * kPerThread + j)];
+        count_sum += counts[j];
+    }
+    int total_items = 0;
+    int offset = block_exclusive_scan<kThreads>(count_sum, scan_buf, total_items);
+    #pragma unroll
+    for (int j = 0; j < kPerThread; ++j) {
+        bucket_slot[kLptBuckets - 1 - (tid * kPerThread + j)] += offset;
+        offset += counts[j];
+    }
+    if (h == 0 && tid == 0) *work_count = total_items;
+    __syncthreads();
+
+    auto place_row = [&](int row, int row_count, int2 coords) {
+        int num_chunks = (row_count + target_q_per_cta - 1) / target_q_per_cta;
+        for (int c = 0; c < num_chunks; ++c) {
+            int q_begin = c * target_q_per_cta;
+            int q_count = min(target_q_per_cta, row_count - q_begin);
+            int work_idx = atomicAdd(&bucket_slot[(q_count - 1) >> lpt_shift], 1);
+            if (work_idx < work_capacity) {
+                int* meta = scheduler_metadata + (size_t)work_idx * 6;
+                meta[0] = h;
+                meta[1] = row;
+                meta[2] = q_begin;
+                meta[3] = q_count;
+                meta[4] = coords.x;
+                meta[5] = coords.y;
+            }
+        }
+    };
+    #pragma unroll
+    for (int u = 0; u < kRowsPrefetched; ++u) {
+        place_row(tid + u * kThreads, own_counts[u], own_coords[u]);
+    }
+    for (int row = tid + kRowsPrefetched * kThreads; row < total_rows; row += kThreads) {
+        place_row(row, head_counts[row], coords2[row]);
     }
 }
 
@@ -585,6 +724,9 @@ static void launch_pipeline(
     auto row_map = torch::empty({B, max_kv_blocks}, opts);
     bool emit_schedule = scheduler_metadata.defined();
     auto row_coords = emit_schedule ? torch::empty({total_rows, 2}, opts) : torch::Tensor();
+    // Work-list size buckets: q_count >> lpt_shift < kLptBuckets.
+    int lpt_shift = 0;
+    while (((target_q_per_cta - 1) >> lpt_shift) >= kLptBuckets) ++lpt_shift;
     int* scheduler_metadata_ptr = emit_schedule ? scheduler_metadata.data_ptr<int>() : nullptr;
     int* work_count_ptr = emit_schedule ? work_count.data_ptr<int>() : nullptr;
     int* qsplit_idx_ptr = emit_schedule ? qsplit_idx.data_ptr<int>() : nullptr;
@@ -675,7 +817,8 @@ static void launch_pipeline(
             work_count_ptr,
             total_rows,
             target_q_per_cta,
-            work_capacity);
+            work_capacity,
+            lpt_shift);
 
         // Grid is H * blocks_per_h so each block stays within a single
         // head; flat (H*total_rows) grid would skip rows when total_rows
