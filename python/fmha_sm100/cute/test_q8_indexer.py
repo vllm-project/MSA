@@ -945,6 +945,7 @@ def test_prefill_matches_reference(case, num_heads):
         f"prefill-{case}-scores", lambda: _run_prefill_scores(wrapper, q, k_cache).clone()
     )
     assert int(wrapper._state.plan_error.item()) == 0
+    assert wrapper._state.scores.stride(0) % 4 == 0  # float4 TopK rows
     lengths = _prefill_lengths(inputs)
     torch.testing.assert_close(wrapper._state.num_valid_pages, lengths, atol=0, rtol=0)
     expected = _prefill_reference(inputs, scores.shape[1])
@@ -1145,7 +1146,10 @@ def _focused_topk_inputs(max_cols: int, num_rows: int, seed: int):
     return torch.from_numpy(scores).cuda(), torch.from_numpy(lengths).cuda()
 
 
-@pytest.mark.parametrize("max_cols", (16, 17, 33, 65, 129, 257, 258, 513, 1025, 2049, 4097, 8192))
+@pytest.mark.parametrize(
+    "max_cols",
+    (16, 17, 33, 65, 129, 257, 258, 513, 770, 1025, 1026, 1282, 1538, 2049, 2050, 4097, 8192),
+)
 def test_topk_select_contract(max_cols):
     scores, lengths = _focused_topk_inputs(max_cols, num_rows=91, seed=max_cols)
     padded = torch.full((scores.shape[0], max_cols + 19), -123.0, device="cuda")
@@ -1156,6 +1160,115 @@ def test_topk_select_contract(max_cols):
     baseline = out.clone()
     for _ in range(3):
         assert torch.equal(_topk_select(scores, lengths, out), baseline)
+
+
+@pytest.mark.parametrize("num_rows", (640, 1_100))  # one CTA per row, then packed CTAs
+@pytest.mark.parametrize("max_cols", (258, 1026, 1282, 1538, 2049))
+def test_topk_select_wide_warp_rows(max_cols, num_rows):
+    """Launches of at least 512 rows rank rows of up to 2048 candidates per warp."""
+
+    scores, lengths = _focused_topk_inputs(max_cols, num_rows=num_rows, seed=max_cols + 7)
+    out = torch.empty((scores.shape[0], 1, TOP_K), dtype=torch.int32, device="cuda")
+    _topk_select(scores, lengths, out)
+    _assert_topk_contract(scores, lengths, out)
+
+
+def _topk_edge_scores(num_rows, max_cols, seed):
+    """Rows of normal, constant, NaN-holding, all-NaN, infinite and huge scores."""
+
+    rng = np.random.default_rng(seed)
+    scores = rng.standard_normal((num_rows, max_cols)).astype(np.float32)
+    kind = np.arange(num_rows) % 7
+    scores[kind == 1] = 1.0
+    for row in np.flatnonzero(kind == 2):  # constant with NaNs
+        scores[row] = 1.0
+        scores[row, rng.integers(0, max_cols, size=1 + max_cols // 16)] = np.nan
+    scores[kind == 3] = np.nan
+    for row in np.flatnonzero(kind == 4):  # NaN and +-inf among normal scores
+        scores[row, rng.integers(0, max_cols, size=3)] = (np.nan, np.inf, -np.inf)
+    scores[kind == 5] *= np.float32(3e38)
+    for row in np.flatnonzero(kind == 6):  # NaN in the first columns of a constant row
+        scores[row] = -2.5
+        scores[row, : rng.integers(1, 4)] = np.nan
+    lengths = rng.integers(1, max_cols + 1, size=num_rows).astype(np.int32)
+    lengths[:7] = max_cols
+    short = min(num_rows - 7, 18)  # rows of 0..17 candidates, around the 16-slot rows
+    lengths[7 : 7 + short] = np.minimum(np.arange(short), max_cols)
+    return scores, lengths
+
+
+@pytest.mark.parametrize(
+    ("max_cols", "num_rows"),
+    (
+        # float4 families (launches past their row minimum): narrow, paired, wide
+        (17, 6_147), (33, 6_144), (129, 12_289), (257, 24_577), (289, 2_051), (300, 16_384),
+        (385, 16_385), (1029, 2_048), (1300, 2_051), (2049, 2_048),
+        # warp family below the row minimum, width gated out, block family
+        (129, 45), (1029, 640), (18, 64), (2050, 64),
+    ),
+)
+def test_topk_select_float4_rows_match_the_base_kernels(max_cols, num_rows):
+    """Aligned scores of n_cols % 4 < 2 in launches of enough rows take the float4 row kernels;
+    a row pitch that is not a multiple of four floats keeps the base warp/block kernels. Both
+    give the same ids, NaN, inf and constant rows included."""
+
+    scores, lengths = _topk_edge_scores(num_rows, max_cols, seed=max_cols)
+    lengths_gpu = torch.from_numpy(lengths).cuda()
+    ids = []
+    for pitch in (-(-max_cols // 4) * 4, max_cols + 1 + (max_cols % 2)):
+        buffer = torch.full((num_rows, pitch), -7.0, device="cuda")
+        buffer[:, :max_cols] = torch.from_numpy(scores).cuda()
+        out = torch.empty((num_rows, 1, TOP_K), dtype=torch.int32, device="cuda")
+        _topk_select(buffer[:, :max_cols], lengths_gpu, out)
+        ids.append(out)
+    assert torch.equal(ids[0], ids[1])
+
+
+@pytest.mark.parametrize(
+    ("rows", "cols"), ((6_145, 17), (6_145, 18), (6_145, 21), (2_049, 301), (2_049, 1029))
+)
+def test_topk_select_last_row_ends_the_storage(rows, cols):
+    """The storage ends at the last row's width, before its pitch."""
+
+    pitch = -(-cols // 4) * 4 + 4
+    storage = torch.randn((rows - 1) * pitch + cols, device="cuda")
+    scores = storage.as_strided((rows, cols), (pitch, 1))
+    lengths = torch.full((rows,), cols, dtype=torch.int32, device="cuda")
+    out = torch.empty((rows, 1, TOP_K), dtype=torch.int32, device="cuda")
+    _topk_select(scores, lengths, out)
+    _assert_topk_contract(scores.clone(), lengths, out)
+
+
+@pytest.mark.parametrize("group_pad", (4, 2))
+def test_topk_select_float4_row_groups(group_pad):
+    """A [groups, rows, cols] view in a float4-sized launch ranks the same rows as its
+    contiguous copy, whether the group stride keeps 16-byte rows (pad 4) or not (pad 2)."""
+
+    generator = _generator(9)
+    groups, rows, cols, pitch = 4, 2_048, 301, 304
+    group_stride = rows * pitch + group_pad
+    storage = torch.randn((groups * group_stride,), generator=generator, device="cuda")
+    view = storage.as_strided((groups, rows, cols), (group_stride, pitch, 1))
+    lengths = torch.randint(
+        1, cols + 1, (groups * rows,), generator=generator, device="cuda", dtype=torch.int32
+    )
+    out = torch.empty((groups * rows, TOP_K), dtype=torch.int32, device="cuda")
+    _topk_select(view, lengths, out)
+    expected = torch.empty_like(out)
+    _topk_select(view.reshape(groups * rows, cols).contiguous(), lengths, expected)
+    assert torch.equal(out, expected)
+
+
+def test_prefill_score_pages_keep_the_topk_family():
+    """Score columns round up only at 2 or 3 mod 4, so they never cross a TopK family limit."""
+
+    pages = [q8_indexer_interface._prefill_score_pages(p) for p in (1, 2, 3, 4, 5)]
+    assert pages == [1, 4, 4, 4, 5]
+    pitches = [q8_indexer_interface._prefill_score_pitch(p) for p in (1, 2, 3, 4, 5)]
+    assert pitches == [4, 4, 4, 4, 8]
+    for limit in (256, 384, 1024, 2048):  # candidates = columns - 1
+        assert q8_indexer_interface._prefill_score_pages(limit + 1) == limit + 1
+        assert q8_indexer_interface._prefill_score_pages(limit + 2) - 1 > limit
 
 
 def test_topk_select_strided_row_groups():

@@ -98,6 +98,20 @@ def _sm_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+def _prefill_score_pages(max_pages: int) -> int:
+    """Columns of the prefill score view: max_pages, rounded up to a multiple of
+    four when max_pages % 4 is 2 or 3. With the row pitch a multiple of four
+    (_prefill_score_pitch), this keeps the TopK on its float4 row kernels (see
+    m3_topk.cuh, narrow::usable). The TopK family limits sit at widths of 1 mod
+    4, so the rounding never moves a launch to another family."""
+    return max_pages if max_pages % 4 < 2 else -(-max_pages // 4) * 4
+
+
+def _prefill_score_pitch(max_pages: int) -> int:
+    """Row pitch of the prefill score buffer, in floats: a multiple of four."""
+    return -(-max_pages // 4) * 4
+
+
 def _is_capturing(device: torch.device) -> bool:
     with torch.cuda.device(device):
         return torch.cuda.is_current_stream_capturing()
@@ -792,7 +806,9 @@ class BatchPrefillIndexerQ8KV8Wrapper:
             scores=(
                 score_out
                 if score_out is not None
-                else torch.empty((total_rows, max_pages), dtype=torch.float32, **options)
+                else torch.empty(
+                    (total_rows, _prefill_score_pitch(max_pages)), dtype=torch.float32, **options
+                )[:, : _prefill_score_pages(max_pages)]
             ),
             num_valid_pages=torch.empty((total_rows,), dtype=torch.int32, **options),
             topk_indices=torch.empty(

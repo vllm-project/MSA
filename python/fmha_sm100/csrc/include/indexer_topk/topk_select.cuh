@@ -27,6 +27,24 @@ struct alignas(16) SelectSmem {
 
 namespace topk_sel {
 
+// Warp max / min of a float: 2 bit-ops map it onto an int of the same order
+// (negatives get their magnitude bits flipped; the map is its own inverse), so
+// one redux.sync replaces a 5-step shuffle tree. Exact, and no NaN reaches it.
+__device__ __forceinline__ int f32_ordered(float v) {
+  const int b = __float_as_int(v);
+  return b ^ ((b >> 31) & 0x7FFFFFFF);
+}
+__device__ __forceinline__ float warp_max_f32(float v) {
+  int r;
+  asm("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(r) : "r"(f32_ordered(v)));
+  return __int_as_float(r ^ ((r >> 31) & 0x7FFFFFFF));
+}
+__device__ __forceinline__ float warp_min_f32(float v) {
+  int r;
+  asm("redux.sync.min.s32 %0, %1, 0xffffffff;" : "=r"(r) : "r"(f32_ordered(v)));
+  return __int_as_float(r ^ ((r >> 31) & 0x7FFFFFFF));
+}
+
 // Descending sort of a register array: Batcher odd-even merge, which is defined
 // for EVERY N -- a bitonic network is not, and at a non-power-of-two N it both
 // indexes past the array and skips its last merge stage. t[0] ends up the lane
