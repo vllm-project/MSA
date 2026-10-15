@@ -16,6 +16,7 @@ import os
 import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from functools import cache
 from pathlib import Path
 
 import jinja2
@@ -234,7 +235,10 @@ def _namespace():
     return _namespace_instance
 
 
-def _get_nvcc_flags(fmha=True, kv_mode=0, fast_math=True):
+_DEFAULT_ARCHS = ("100a", "103a", "100f")
+
+
+def _get_nvcc_flags(fmha=True, kv_mode=0, fast_math=True, archs=_DEFAULT_ARCHS):
     tvm_include = _get_tvm_ffi_include()
     fmha_include = str(_FMHA_VARLEN_DIR / "include")
     cutlass_include = str(_CUTLASS_INCLUDE)
@@ -242,9 +246,7 @@ def _get_nvcc_flags(fmha=True, kv_mode=0, fast_math=True):
     nvcc_flags = [
         "-O3", "-std=c++20",
         "--expt-relaxed-constexpr", "--expt-extended-lambda",
-        "-gencode=arch=compute_100a,code=sm_100a",
-        "-gencode=arch=compute_103a,code=sm_103a",
-        "-gencode=arch=compute_100f,code=sm_100f",
+        *(f"-gencode=arch=compute_{arch},code=sm_{arch}" for arch in archs),
         "-static-global-template-stub=false",
         "-DFLASHINFER_ENABLE_BF16",
         "-DFLASHINFER_ENABLE_FP8_E4M3",
@@ -478,9 +480,16 @@ _MODULES = {
                             {"fast_math": False}, ""),
     "q8kv4_indexer_decode": ("q8kv4_indexer_decode", ("q8kv4_indexer_decode.cu",),
                              {"fast_math": False}, ""),
+    # SM107's own one-head decode indexer: sm_107a only (FHFMA2), so it is a separate library.
+    "q8kv4_indexer_decode_sm107": ("q8kv4_indexer_decode_sm107",
+                                   ("q8kv4_indexer_decode_sm107.cu",),
+                                   {"fast_math": False, "archs": ("107a",)},
+                                   " -Xcompiler -fvisibility=hidden"),
 }
 # The modules get_indexer_module loads.
 _INDEXER_MODULE_SOURCES = ("indexer_topk_select", "q8kv4_indexer_decode")
+# Per-architecture replacements of an indexer module, keyed by (major, minor).
+_INDEXER_MODULE_VARIANTS = {("q8kv4_indexer_decode", (10, 7)): "q8kv4_indexer_decode_sm107"}
 _modules = {}
 _modules_lock = threading.Lock()
 
@@ -534,8 +543,19 @@ def get_reduction_module(nvfp4=False):
     return _load_module("reduction_nvfp4" if nvfp4 else "reduction")
 
 
+@cache
+def _device_capability(device_index):
+    import torch
+
+    return torch.cuda.get_device_capability(device_index)
+
+
 def get_indexer_module(name):
-    """Load one of ``_INDEXER_MODULE_SOURCES``. JIT compiles on first call."""
+    """Load one of ``_INDEXER_MODULE_SOURCES`` for the current device, or its replacement
+    for this architecture. JIT compiles on first call."""
     if name not in _INDEXER_MODULE_SOURCES:
         raise KeyError(f"unknown indexer module {name!r}")
-    return _load_module(name)
+    import torch
+
+    capability = _device_capability(torch.cuda.current_device())
+    return _load_module(_INDEXER_MODULE_VARIANTS.get((name, capability), name))

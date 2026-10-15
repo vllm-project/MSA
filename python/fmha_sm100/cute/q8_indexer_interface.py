@@ -550,7 +550,9 @@ class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
     positive and does not change the ranking, so it is not an input. One head
     runs the CUTLASS C++ kernel and two or four heads run the CuTe DSL kernel. Builds
     on CUDA 13.4 or newer use the public QMUL4 instruction on SM100/SM103, and
-    older ones select the exact FP16 dequantization. Requests may carry fewer than
+    older ones select the exact FP16 dequantization. SM107 has no QMUL4: its own
+    one-head kernel keeps every NVFP4 x scale product exact instead of rounding it
+    to E4M3, so its scores differ from SM100's. Requests may carry fewer than
     eight queries (``plan(..., query_len=n)``), so a caller needs no zero-padded
     copy of its queries and gets ``[batch * n, num_heads, 16]`` back.
 

@@ -149,6 +149,7 @@ class _PagedK:
             raw[:, :page_bytes].view(torch.float8_e4m3fn).unflatten(1, (PAGE_SIZE, HEAD_DIM))
         )
         self.dequantized = logical.float()
+        self.dequantized_exact = self.dequantized
 
     def set_nvfp4(self, packed: torch.Tensor, scale: torch.Tensor) -> None:
         physical_pages = packed.shape[0]
@@ -164,9 +165,11 @@ class _PagedK:
         codes = torch.stack((packed & 0x0F, packed >> 4), dim=-1).reshape(
             physical_pages, PAGE_SIZE, HEAD_DIM
         )
-        # NVFP4 times the E4M3 block scale, saturated and rounded to E4M3.
+        # NVFP4 times the E4M3 block scale, saturated and rounded to E4M3 (QMUL4).
         product = lut[codes.long()] * scale.float().repeat_interleave(16, dim=-1)
-        self.dequantized = product.clamp_(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn).float()
+        self.dequantized = product.clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn).float()
+        # The unrounded product, which FP16 holds exactly.
+        self.dequantized_exact = product
 
 
 def _page_scores(q_rows: torch.Tensor, k_pages: torch.Tensor) -> torch.Tensor:
@@ -175,17 +178,25 @@ def _page_scores(q_rows: torch.Tensor, k_pages: torch.Tensor) -> torch.Tensor:
     return torch.einsum("rd,ptd->rpt", q_rows, k_pages).amax(dim=-1)
 
 
+def _exact_nvfp4_decode(num_heads: int) -> bool:
+    """SM107 has no QMUL4: its one-head kernel keeps NVFP4 x scale exact instead of rounding
+    the product to E4M3."""
+
+    return num_heads == 1 and torch.cuda.get_device_capability() == (10, 7)
+
+
 def _decode_reference(q: torch.Tensor, k: _PagedK, block_table: torch.Tensor) -> torch.Tensor:
     """Scores ``[batch, 8 * num_heads, max_pages]`` with rows ``token * num_heads + head``."""
 
     batch, max_pages = block_table.shape
+    dequantized = k.dequantized_exact if _exact_nvfp4_decode(q.shape[1]) else k.dequantized
     q_rows = q.view(batch, MTP * q.shape[1], HEAD_DIM).float()
     output = torch.empty((batch, q_rows.shape[1], max_pages), dtype=torch.float32, device="cuda")
     page_chunk = 64
     for b in range(batch):
         for begin in range(0, max_pages, page_chunk):
             pages = block_table[b, begin : begin + page_chunk].long()
-            output[b, :, begin : begin + page_chunk] = _page_scores(q_rows[b], k.dequantized[pages])
+            output[b, :, begin : begin + page_chunk] = _page_scores(q_rows[b], dequantized[pages])
     return output
 
 
