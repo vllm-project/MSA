@@ -192,6 +192,9 @@ class JitSpec:
                 # Seen by the host and device passes alike (the cute arch macros are device-only),
                 # so the kernel instantiation the host registers is the one the cubin holds.
                 f"-DFMHA_SM100_PREFILL_Q8KV4_SM107={int(self.target_arch == '107a')}",
+                # The kernel is launched with programmatic stream serialization (PDL); without
+                # this define CUTLASS compiles griddepcontrol.wait / launch_dependents out.
+                "-DCUTLASS_ENABLE_GDC_FOR_SM100",
             ],
             "extra_ldflags": ["-lcuda", f"-Wl,-rpath,{_cuda_home() / 'lib64'}"],
         }

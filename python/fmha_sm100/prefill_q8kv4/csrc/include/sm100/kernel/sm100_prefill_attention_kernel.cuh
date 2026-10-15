@@ -42,9 +42,6 @@ void prefill_attention_kernel(
       cute::TMEM::Allocator1Sm allocator;
       allocator.release_allocation_lock();
     }
-    if (tid == 0) {
-      cutlass::arch::launch_dependent_grids();
-    }
     return;
   }
 
@@ -62,12 +59,6 @@ void prefill_attention_kernel(
   }
   cutlass::arch::fence_barrier_init();
   __syncthreads();
-  // Every CTA of this grid has started once the last one reaches this point, so the dependent
-  // grid (the combine) can be staged now: its CTAs fill the SMs this grid's CTAs leave, run their
-  // prologue, and wait for this grid's completion before reading anything it writes.
-  if (tid == 0) {
-    cutlass::arch::launch_dependent_grids();
-  }
 
   cutlass::arch::NamedBarrier tmem_barrier(
       WarpSpecialization::kTmemParticipantWarps * 32, kTmemBarrierId);

@@ -365,7 +365,6 @@ CUTLASS_DEVICE void run_mma_warp(Storage &storage, TiledMmaQK tiled_mma_qk,
   tmem_barrier.arrive_and_wait();
   cute::TMEM::Allocator1Sm allocator;
   allocator.free(storage.tmem_base, kTmemColumns);
-  cutlass::arch::launch_dependent_grids();
 }
 
 template <class Storage, class TiledMmaQK>
