@@ -64,6 +64,7 @@ from interface import (  # noqa: E402
     SparseDecodePagedAttentionWrapper,
     sparse_atten_func,
     sparse_atten_nvfp4_kv_func,
+    sparse_atten_workspace_size,
     sparse_decode_atten_func,
 )
 
@@ -111,6 +112,7 @@ __all__ = [
     # attention
     "sparse_atten_func",
     "sparse_atten_nvfp4_kv_func",
+    "sparse_atten_workspace_size",
     "sparse_decode_atten_func",
     "SparseDecodePagedAttentionWrapper",
     # indexing / CSR

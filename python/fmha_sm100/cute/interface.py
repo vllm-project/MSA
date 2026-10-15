@@ -78,6 +78,71 @@ def _normalize_partial_dtype(partial_dtype: torch.dtype) -> torch.dtype:
     return partial_dtype
 
 
+def _partials_layout(
+    total_q: int,
+    num_q_heads: int,
+    topK: int,
+    partial_dtype: torch.dtype,
+    temperature_lse: bool,
+) -> list:
+    """O, LSE and, with temperature LSE, temperature-LSE split partials."""
+    layout = [
+        ((topK, total_q, num_q_heads, 128), partial_dtype),
+        ((topK, total_q, num_q_heads), torch.float32),
+    ]
+    if temperature_lse:
+        layout.append(((topK, total_q, num_q_heads), torch.float32))
+    return layout
+
+
+def sparse_atten_workspace_size(
+    total_q: int,
+    num_q_heads: int,
+    topK: int,
+    *,
+    partial_dtype: torch.dtype = torch.bfloat16,
+    return_temperature_lse: bool = False,
+) -> int:
+    """Bytes of ``workspace`` ``sparse_atten_func`` / ``sparse_atten_nvfp4_kv_func``
+    need for ``total_q`` query tokens with the same ``partial_dtype`` and
+    ``return_temperature_lse``.  A workspace sized for more tokens serves any
+    smaller call."""
+    layout = _partials_layout(
+        total_q,
+        num_q_heads,
+        topK,
+        _normalize_partial_dtype(partial_dtype),
+        return_temperature_lse,
+    )
+    return sum(math.prod(shape) * dtype.itemsize for shape, dtype in layout)
+
+
+def _split_partials(
+    workspace: Optional[torch.Tensor],
+    q: torch.Tensor,
+    topK: int,
+    partial_dtype: torch.dtype,
+    temperature_lse: bool,
+) -> tuple:
+    """(O, LSE, temperature LSE or None) split partials, carved from ``workspace``
+    when given."""
+    total_q, head_q, _ = q.shape
+    layout = _partials_layout(total_q, head_q, topK, partial_dtype, temperature_lse)
+    if workspace is None:
+        partials = [torch.empty(shape, dtype=dtype, device=q.device) for shape, dtype in layout]
+    else:
+        needed = sum(math.prod(shape) * dtype.itemsize for shape, dtype in layout)
+        if workspace.data_ptr() % 16 or workspace.numel() < needed:
+            raise ValueError(f"workspace must be 16-byte aligned with >= {needed} bytes")
+        # Every partial is a multiple of 16 bytes, so packed back to back they stay aligned.
+        partials = []
+        for shape, dtype in layout:
+            nbytes = math.prod(shape) * dtype.itemsize
+            partials.append(workspace[:nbytes].view(dtype).view(shape))
+            workspace = workspace[nbytes:]
+    return partials[0], partials[1], partials[2] if temperature_lse else None
+
+
 def _normalize_forward_mma_dtype(dtype: Optional[torch.dtype], fallback: torch.dtype, name: str) -> torch.dtype:
     dtype = fallback if dtype is None else dtype
     if dtype not in _SUPPORTED_FWD_MMA_DTYPES:
@@ -728,6 +793,7 @@ def sparse_atten_func(
     out: Optional[torch.Tensor] = None,
     enable_fp16_softmax: Optional[bool] = None,
     enable_2x_fp8: Optional[bool] = None,
+    workspace: Optional[torch.Tensor] = None,
 ):
     """Run SM100 CSR block-sparse varlen attention.
 
@@ -814,6 +880,10 @@ def sparse_atten_func(
         Rubin (SM107) only: issue the FP8 QK^T and PV MMAs with K=64 instead of
         K=32.  Same requirements and ``None``/``False``/``True`` semantics as
         ``enable_fp16_softmax``.
+    workspace : torch.Tensor, optional
+        1-D uint8, 16-byte aligned buffer of at least
+        ``sparse_atten_workspace_size`` bytes for the split partials.  When
+        omitted, they are allocated per call.
 
     Returns
     -------
@@ -908,6 +978,7 @@ def sparse_atten_func(
         out,
         enable_fp16_softmax=enable_fp16_softmax,
         enable_2x_fp8=enable_2x_fp8,
+        workspace=workspace,
     )
 
 
@@ -939,6 +1010,7 @@ def sparse_atten_nvfp4_kv_func(
     schedule: Optional[SparseAttentionSchedule] = None,
     out: Optional[torch.Tensor] = None,
     kv_layout: str = "legacy",
+    workspace: Optional[torch.Tensor] = None,
 ):
     """Run SM100 CSR sparse attention with packed NVFP4 K/V.
 
@@ -1008,6 +1080,10 @@ def sparse_atten_nvfp4_kv_func(
     out : torch.Tensor, optional
         Optional BF16 output buffer with shape ``[total_q, Hq, 128]``.  When
         provided, the combine stage writes directly into this tensor.
+    workspace : torch.Tensor, optional
+        1-D uint8, 16-byte aligned buffer of at least
+        ``sparse_atten_workspace_size`` bytes for the split partials.  When
+        omitted, they are allocated per call.
 
     Returns
     -------
@@ -1071,16 +1147,8 @@ def sparse_atten_nvfp4_kv_func(
         return_temperature_lse and not temperature_lse_fast_path
     )
 
-    O_partial = torch.empty(
-        topK, total_q, head_q, dim, dtype=partial_dtype, device=q.device
-    )
-    LSE_partial = torch.empty(
-        topK, total_q, head_q, dtype=torch.float32, device=q.device
-    )
-    LSE_temperature_partial = (
-        torch.empty(topK, total_q, head_q, dtype=torch.float32, device=q.device)
-        if kernel_return_temperature_lse
-        else None
+    O_partial, LSE_partial, LSE_temperature_partial = _split_partials(
+        workspace, q, topK, partial_dtype, kernel_return_temperature_lse
     )
     O_out = (
         out
@@ -1623,6 +1691,7 @@ def _sparse_atten_csr_varlen_forward(
     *,
     enable_fp16_softmax: Optional[bool] = None,
     enable_2x_fp8: Optional[bool] = None,
+    workspace: Optional[torch.Tensor] = None,
 ):
     total_q, head_q, dim = q.shape
     if head_q % head_kv != 0:
@@ -1641,16 +1710,8 @@ def _sparse_atten_csr_varlen_forward(
         return_temperature_lse and not temperature_lse_fast_path
     )
 
-    O_partial = torch.empty(
-        topK, total_q, head_q, dim, dtype=partial_dtype, device=q.device
-    )
-    LSE_partial = torch.empty(
-        topK, total_q, head_q, dtype=torch.float32, device=q.device
-    )
-    LSE_temperature_partial = (
-        torch.empty(topK, total_q, head_q, dtype=torch.float32, device=q.device)
-        if kernel_return_temperature_lse
-        else None
+    O_partial, LSE_partial, LSE_temperature_partial = _split_partials(
+        workspace, q, topK, partial_dtype, kernel_return_temperature_lse
     )
     O_out = (
         out

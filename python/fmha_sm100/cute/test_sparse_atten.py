@@ -2001,6 +2001,71 @@ def test_sparse_atten_nvfp4_kv_matches_dequantized_bf16(
     torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("kv_format", ("bf16", "nvfp4"))
+@pytest.mark.parametrize("temperature_lse", (False, True))
+def test_sparse_atten_caller_workspace_matches_per_call_partials(
+    kv_format: str, temperature_lse: bool
+) -> None:
+    """Split partials carved from a caller workspace give bitwise the per-call result,
+    including from a workspace sized for more tokens than the call."""
+
+    torch.random.manual_seed(41)
+    topk = 16
+    inputs = _build_sparse_inputs(
+        q_lens=(300, 129),
+        k_lens=(2_048, 1_000),
+        head_kv=2,
+        qhead_per_kv=8,
+        dim=128,
+        topk=topk,
+        blk_kv=BLK_KV,
+        causal=True,
+        dtype=torch.bfloat16,
+        q2k_pattern=Q2KPattern.UNIFORM,
+    )
+    common = dict(
+        blk_kv=inputs["blk_kv"],
+        causal=True,
+        softmax_scale=inputs["softmax_scale"],
+        partial_dtype=torch.bfloat16,
+        return_softmax_lse=True,
+        return_temperature_lse=temperature_lse,
+        cu_seqlens_q=inputs["cu_seqlens_q"],
+        cu_seqlens_k=inputs["cu_seqlens_k"],
+        max_seqlen_q=inputs["max_seqlen_q"],
+        max_seqlen_k=inputs["max_seqlen_k"],
+        schedule=inputs["schedule"],
+    )
+    if kv_format == "bf16":
+        def run(**extra):
+            return sparse_atten_func(
+                inputs["q"], inputs["k"], inputs["v"], inputs["k2q_row_ptr"],
+                inputs["k2q_q_indices"], topk, **common, **extra,
+            )
+    else:
+        k_q = _quantize_bf16_to_nvfp4_or_skip(inputs["k"])
+        v_q = _quantize_bf16_to_nvfp4_or_skip(inputs["v"])
+
+        def run(**extra):
+            return sparse_atten_nvfp4_kv_func(
+                inputs["q"], k_q.data, v_q.data, k_q.scale_128x4, v_q.scale_128x4,
+                k_q.global_scale, v_q.global_scale, inputs["k2q_row_ptr"],
+                inputs["k2q_q_indices"], topk, **common, **extra,
+            )
+
+    total_q, num_q_heads = inputs["q"].shape[:2]
+    expected = run()
+    needed = sparse_interface.sparse_atten_workspace_size(
+        total_q + 37, num_q_heads, topk, return_temperature_lse=temperature_lse
+    )
+    workspace = torch.full((needed,), 0xFF, dtype=torch.uint8, device="cuda")
+    for got in (run(workspace=workspace), run(workspace=workspace)):
+        for a, b in zip(expected, got, strict=True):
+            assert torch.equal(a, b)
+    with pytest.raises(ValueError, match="workspace"):
+        run(workspace=workspace[1:])
+
+
 @pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("batch", [3])

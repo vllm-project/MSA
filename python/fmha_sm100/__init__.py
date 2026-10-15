@@ -22,6 +22,7 @@ _SPARSE_LAZY_EXPORTS = frozenset(
     {
         "sparse_atten_func",
         "sparse_atten_nvfp4_kv_func",
+        "sparse_atten_workspace_size",
         "sparse_decode_atten_func",
         "SparseDecodePagedAttentionWrapper",
         "fp4_indexer_block_scores",
