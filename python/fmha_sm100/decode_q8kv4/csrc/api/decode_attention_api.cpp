@@ -479,7 +479,7 @@ PlanInfo _make_decode_plan_impl(at::Tensor qo_segment_lens, at::Tensor kv_segmen
     // The kernel clamps every segment to the pages a request actually has; a segment past the
     // end runs empty and publishes a zero partial with -inf LSEs, so the fold needs no validity
     // test.
-    int const kv_iters = kv_block_num * page_size / kv_tile_size;
+    int const kv_iters = (kv_block_num * page_size + kv_tile_size - 1) / kv_tile_size;
     StreamKSchedule schedule =
         build_stream_k_schedule(qo_lens, kv_lens, num_qo_heads, num_ctas, kv_iters, pack_factor,
                                 page_size, kv_block_num, kv_tile_size);
