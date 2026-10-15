@@ -91,6 +91,7 @@ template <class Traits> struct Sm100FmhaFwdKernelParams {
   int num_qo_heads_orig = 0;
   int max_qo_len = 0;
   int q_tokens_per_batch = 1;
+  cutlass::FastDivmod q_tokens_divmod;
   int scheduler_total_logical_ctas = 0;
   int scheduler_max_active_ctas = 0;
   int max_kv_len = 0;
@@ -329,12 +330,9 @@ template <class Traits> struct FMHACutlassSM100ParamsBuilder {
     policy.persistent_scheduler_fits_smem = policy.max_active_ctas > 0;
     // CLC persistent scheduling requires a rectangular, uniform sparse grid.
     // Heterogeneous chunks and split-KV keep their existing direct or
-    // workspace-scheduled paths. The folded batch raster decodes q_token_idx
-    // with bit operations, so non-power-of-two query chunks use the direct
-    // grid instead.
-    bool const has_power_of_two_q_tokens = q_tokens > 0 && (q_tokens & (q_tokens - 1)) == 0;
+    // workspace-scheduled paths.
     bool const persistent_scheduler_supported =
-        has_power_of_two_q_tokens && src.qo_segment_lens_ptr == nullptr &&
+        q_tokens > 0 && src.qo_segment_lens_ptr == nullptr &&
         src.kv_block_num >= 1 && src.kv_block_num <= Traits::kMaxSparseTopK &&
         src.num_kv_splits == 1;
     policy.use_persistent_scheduler =
@@ -516,6 +514,7 @@ template <class Traits> struct FMHACutlassSM100ParamsBuilder {
     dst.num_qo_heads_orig = src.num_qo_heads_orig;
     dst.max_qo_len = src.max_qo_len;
     dst.q_tokens_per_batch = q_tokens_per_batch(src);
+    dst.q_tokens_divmod = cutlass::FastDivmod(dst.q_tokens_per_batch > 0 ? dst.q_tokens_per_batch : 1);
     dst.scheduler_total_logical_ctas = 0;
     dst.scheduler_max_active_ctas = 0;
     dst.use_persistent_scheduler = false;

@@ -7,6 +7,7 @@
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
+#include "cutlass/fast_math.h"
 #include "cutlass/gemm/kernel/sm100_tile_scheduler.hpp"
 #include "cutlass/gemm_coord.h"
 #include "cutlass/kernel_hardware_info.h"
@@ -144,11 +145,9 @@ template <class Traits> struct Sm100FmhaScheduler {
   }
 
   CUTLASS_DEVICE static WorkTile work_tile_from_info(WorkTileInfo const &info,
-                                                     int q_tokens_per_batch) {
-    int const expanded_batch_idx = info.L_idx;
-    int const q_token_idx = expanded_batch_idx & (q_tokens_per_batch - 1);
-    int const q_token_shift = 31 - __clz(q_tokens_per_batch);
-    int const batch_idx = expanded_batch_idx >> q_token_shift;
+                                                     cutlass::FastDivmod const &q_tokens_divmod) {
+    int batch_idx, q_token_idx;
+    q_tokens_divmod(batch_idx, q_token_idx, info.L_idx);
     return WorkTile{q_token_idx, info.N_idx, batch_idx, info.is_valid_tile};
   }
 

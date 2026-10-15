@@ -316,7 +316,7 @@ CUTLASS_DEVICE void run_fwd_mainloop_device(Sm100FmhaFwdKernelParams<Traits> con
         WorkIdPipelineState work_id_consumer_state;
         do {
           auto work_tile =
-              SchedulerAdapter::work_tile_from_info(work_tile_info, params.q_tokens_per_batch);
+              SchedulerAdapter::work_tile_from_info(work_tile_info, params.q_tokens_divmod);
           Sm100FmhaPageOffsetsTmaWarpspecialized<Traits>{}.run_tile(
               storage, params, work_tile.batch_idx, work_tile.kv_head_idx, work_tile.q_token_idx,
               lane_idx, state);
@@ -336,7 +336,7 @@ CUTLASS_DEVICE void run_fwd_mainloop_device(Sm100FmhaFwdKernelParams<Traits> con
           throttle_pipeline.producer_commit(throttle_producer_state);
           ++throttle_producer_state;
           auto work_tile =
-              SchedulerAdapter::work_tile_from_info(work_tile_info, params.q_tokens_per_batch);
+              SchedulerAdapter::work_tile_from_info(work_tile_info, params.q_tokens_divmod);
           Sm100FmhaLoadTmaWarpspecialized<Traits>{}.run_tile(
               storage, params, work_tile.batch_idx, work_tile.kv_head_idx, work_tile.q_token_idx,
               lane_idx, static_cast<bool>(cute::elect_one_sync()), state);
@@ -352,7 +352,7 @@ CUTLASS_DEVICE void run_fwd_mainloop_device(Sm100FmhaFwdKernelParams<Traits> con
         WorkIdPipelineState work_id_consumer_state;
         do {
           auto work_tile =
-              SchedulerAdapter::work_tile_from_info(work_tile_info, params.q_tokens_per_batch);
+              SchedulerAdapter::work_tile_from_info(work_tile_info, params.q_tokens_divmod);
           Sm100FmhaSoftmaxTmaWarpspecialized<Traits>{}.run_tile(
               storage, params, work_tile.batch_idx, work_tile.kv_head_idx, work_tile.q_token_idx,
               lane_idx, warp_idx - Traits::kSoftmaxWarpStart, state);
@@ -368,7 +368,7 @@ CUTLASS_DEVICE void run_fwd_mainloop_device(Sm100FmhaFwdKernelParams<Traits> con
         WorkIdPipelineState work_id_consumer_state;
         do {
           auto work_tile =
-              SchedulerAdapter::work_tile_from_info(work_tile_info, params.q_tokens_per_batch);
+              SchedulerAdapter::work_tile_from_info(work_tile_info, params.q_tokens_divmod);
           Sm100FmhaCorrectionTmaWarpspecialized<Traits>{}.run_tile(
               storage, params, work_tile.batch_idx, work_tile.kv_head_idx, work_tile.q_token_idx,
               lane_idx, warp_idx - Traits::kCorrectionWarpStart, state);
@@ -384,7 +384,7 @@ CUTLASS_DEVICE void run_fwd_mainloop_device(Sm100FmhaFwdKernelParams<Traits> con
         WorkIdPipelineState work_id_consumer_state;
         do {
           auto work_tile =
-              SchedulerAdapter::work_tile_from_info(work_tile_info, params.q_tokens_per_batch);
+              SchedulerAdapter::work_tile_from_info(work_tile_info, params.q_tokens_divmod);
           Sm100FmhaKvTransformTmaWarpspecialized<Traits>{}.run_tile(
               storage, params, work_tile.batch_idx, work_tile.kv_head_idx, work_tile.q_token_idx,
               lane_idx, warp_idx - Traits::kTransformKvWarpStart, state);
@@ -399,7 +399,7 @@ CUTLASS_DEVICE void run_fwd_mainloop_device(Sm100FmhaFwdKernelParams<Traits> con
         WorkIdPipelineState work_id_consumer_state;
         do {
           auto work_tile =
-              SchedulerAdapter::work_tile_from_info(work_tile_info, params.q_tokens_per_batch);
+              SchedulerAdapter::work_tile_from_info(work_tile_info, params.q_tokens_divmod);
           Sm100FmhaMmaTmaWarpspecialized<Traits>{}.run_tile(storage, params, work_tile.batch_idx,
                                                             work_tile.kv_head_idx,
                                                             work_tile.q_token_idx, lane_idx, state);
