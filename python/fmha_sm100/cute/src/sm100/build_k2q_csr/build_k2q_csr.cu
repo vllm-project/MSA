@@ -3,24 +3,25 @@
 
 // CUDA C++ q2k -> k2q CSR builder.
 //
-// Five-stage pipeline. q-ascending order within each CSR row is preserved
-// by partitioning q across (CTA, warp_in_CTA) units; each unit owns a
-// contiguous q-sub-range and reserves a contiguous slot range per row via
-// a precomputed exclusive prefix scan.
+// Four kernels, no memsets. q-ascending order within each CSR row is preserved
+// by partitioning the queries into tiles of kQPerTile consecutive queries of
+// one KV head (one CTA per tile and head); warp w of a tile's CTA owns the
+// tile's w-th kQPerWarp-query slice and walks it in query order, kTopK lanes
+// per query, so a row's entries ordered by tile, then warp, then warp
+// instruction, then lane are ordered by (query, top-k slot).
 //
-//   M:  build_row_map      -- round-robin packing of rows across batches
-//   H:  histogram + tile_counts
-//   PR: row prefix         -- single block per head, row_counts -> row_ptr
-//                             (+ the attention work list, largest first)
-//   PT: tile prefix        -- multi-block, scan tile_counts along (c, w) axis
-//   S:  scatter (sorted)   -- per-warp slot range, q-sequential within warp
-//
-// Per-warp partitioning: each CTA has kWarps warps; warp w of CTA c owns
-// q-range [c*q_per_cta + w*q_per_warp, c*q_per_cta + (w+1)*q_per_warp).
-// tile_counts is shaped [G * kWarps, H, total_rows]; the "row" dimension
-// of the prefix scan is the flattened (c * kWarps + w) index, scanned in
-// lexicographic order so that warp-local slot ranges concatenate to the
-// global q-sorted output.
+//   P: prepare   -- row map (round-robin packing of rows across batches), row
+//                   coords, zeroed row_counts
+//   C: count     -- per tile: row histogram -> tile_counts [H, tiles, rows],
+//                   and row_counts (one global atomic per touched row and tile)
+//   S: schedule  -- blocks [0, H): row_counts -> row_ptr (+ the attention work
+//                   list, largest first); the other blocks: exclusive scan of
+//                   tile_counts over the tiles of every (head, row), in place
+//   W: scatter   -- per tile: per-warp row counts (packed int16, smem) become
+//                   per-warp offsets inside the tile; each warp reserves its
+//                   slots with lane-ordered shared-memory atomics and writes
+//                   q_idx / qsplit_idx at row_ptr + tile offset + slot, and
+//                   split_counts; the tiles also fill the q_idx tail with -1.
 
 #include <torch/extension.h>
 #include <cuda.h>
@@ -83,143 +84,272 @@ __device__ __forceinline__ int read_int16_packed(int const* base_int32, int row)
     return (v >> shift) & 0xFFFF;
 }
 
+// Queries per tile (one CTA per tile and KV head), warps per tile CTA (fewer
+// for very many rows: the scatter keeps per-warp row counts in smem), and the
+// queries a warp holds in registers at a time.
+constexpr int kQPerTile = 128;
+constexpr int kMaxTileWarps = 8;
+constexpr int kChunkQ = kQPerTile / kMaxTileWarps;
+
+// Top-k entries of a warp's queries [q_begin, q_end) (at most kIters * kQPerIter
+// of them), kQPerIter queries per iteration: lane l takes slot l % kTopK of
+// query q_begin + u * kQPerIter + l / kTopK. row[u] is the entry's CSR row (-1
+// for no query or an invalid / unmapped KV block), qloc[u] the query's index
+// inside its batch.
+template <int kTopK, int kIters>
+__device__ __forceinline__ void load_warp_rows(
+    int const* __restrict__ q2k,
+    int const* __restrict__ cu_q,
+    int const* __restrict__ row_map,
+    int B, int total_rows, int max_kv_blocks,
+    int q2k_head_stride, int q2k_q_stride,
+    int h, int q_begin, int q_end, int lane,
+    int (&row)[kIters], int (&qloc)[kIters])
+{
+    constexpr int kQPerIter = kWarpSize / kTopK;
+    int const q_in_iter = lane / kTopK;
+    int const slot_in_q = lane % kTopK;
+    int const* head_q2k = q2k + (size_t)h * q2k_head_stride;
+    int kvb[kIters];
+    int batch[kIters];
+    int bi = 0;
+    #pragma unroll
+    for (int u = 0; u < kIters; ++u) {
+        int const q = q_begin + u * kQPerIter + q_in_iter;
+        kvb[u] = -1;
+        qloc[u] = 0;
+        batch[u] = 0;
+        if (q < q_end) {
+            advance_batch_only(cu_q, B, q, bi);
+            qloc[u] = q - cu_q[bi];
+            batch[u] = bi;
+            kvb[u] = head_q2k[(size_t)q * q2k_q_stride + slot_in_q];
+        }
+    }
+    #pragma unroll
+    for (int u = 0; u < kIters; ++u) {
+        int r = -1;
+        if (kvb[u] >= 0 && kvb[u] < max_kv_blocks) {
+            r = row_map[(size_t)batch[u] * max_kv_blocks + kvb[u]];
+        }
+        row[u] = (r >= 0 && r < total_rows) ? r : -1;
+    }
+}
+
 // ---------------------------------------------------------------------------
-// M: round-robin row map.
+// P: row map (rows of all batches packed round-robin by KV block level), row
+// coords (batch, level) and zeroed row_counts. One thread per level.
 // ---------------------------------------------------------------------------
 template <int kBlockK>
-__global__ void k2q_build_row_map_kernel(
+__global__ void k2q_prepare_kernel(
     int const* __restrict__ cu_k,
     int* __restrict__ row_map,
     int* __restrict__ row_coords,
+    int* __restrict__ row_counts,
     int B,
-    int max_kv_blocks)
+    int max_kv_blocks,
+    int num_row_counts)
 {
-    int level = blockIdx.x;
-    if (level >= max_kv_blocks) return;
-    if (threadIdx.x != 0) return;
-    int rows_before = 0;
-    for (int b = 0; b < B; ++b) {
-        int rb = (cu_k[b + 1] - cu_k[b] + kBlockK - 1) / kBlockK;
-        rows_before += (rb < level ? rb : level);
-    }
-    int active_before = 0;
-    for (int b = 0; b < B; ++b) {
-        int rb = (cu_k[b + 1] - cu_k[b] + kBlockK - 1) / kBlockK;
-        if (rb > level) {
-            int row_linear = rows_before + active_before;
-            row_map[(size_t)b * max_kv_blocks + level] = row_linear;
-            if (row_coords != nullptr) {
-                row_coords[(size_t)row_linear * 2] = b;
-                row_coords[(size_t)row_linear * 2 + 1] = level;
+    int const first = blockIdx.x * blockDim.x + threadIdx.x;
+    int const stride = gridDim.x * blockDim.x;
+    for (int i = first; i < num_row_counts; i += stride) row_counts[i] = 0;
+    for (int level = first; level < max_kv_blocks; level += stride) {
+        int rows_before = 0;
+        for (int b = 0; b < B; ++b) {
+            int rb = (cu_k[b + 1] - cu_k[b] + kBlockK - 1) / kBlockK;
+            rows_before += (rb < level ? rb : level);
+        }
+        int active_before = 0;
+        for (int b = 0; b < B; ++b) {
+            int rb = (cu_k[b + 1] - cu_k[b] + kBlockK - 1) / kBlockK;
+            if (rb > level) {
+                int row_linear = rows_before + active_before;
+                row_map[(size_t)b * max_kv_blocks + level] = row_linear;
+                if (row_coords != nullptr) {
+                    row_coords[(size_t)row_linear * 2] = b;
+                    row_coords[(size_t)row_linear * 2 + 1] = level;
+                }
+                ++active_before;
+            } else {
+                row_map[(size_t)b * max_kv_blocks + level] = -1;
             }
-            ++active_before;
-        } else {
-            row_map[(size_t)b * max_kv_blocks + level] = -1;
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// H: per-warp histogram + tile_counts.
-// kWarps warps per CTA, each owns q-sub-range = q_per_cta / kWarps.
-// SMEM hist[kWarps, total_rows] int32 (stored as packed int16 cursor:
-// 2 entries per int32 word). Each warp counts to its own row.
-// At end-of-CTA, write tile_counts[c*kWarps + w, h, r] = smem_hist[w, r]
-// and atomicAdd(row_counts[h, r], sum over w of smem_hist[w, r]).
+// C: per (tile, head) CTA, the tile's entries per row (packed int16 counts in
+// smem: a tile has < 32768 entries per row) -> tile_counts[h][tile][*] and
+// row_counts[h][*].
 // ---------------------------------------------------------------------------
-template <int kTopK, int kBlockK, int kWarps>
-__global__ void k2q_hist_kernel(
+template <int kTopK, int kWarps>
+__global__ void __launch_bounds__(kWarps * kWarpSize) k2q_tile_count_kernel(
     int const* __restrict__ q2k,
     int const* __restrict__ cu_q,
     int const* __restrict__ row_map,
     int* __restrict__ row_counts,
     int* __restrict__ tile_counts,
-    int H, int B, int S_Q,
-    int total_rows, int max_kv_blocks,
-    int q_per_cta, int q_per_warp,
+    int B, int S_Q,
+    int total_rows, int max_kv_blocks, int num_tiles,
     int q2k_head_stride, int q2k_q_stride)
 {
     constexpr int kThreads = kWarps * kWarpSize;
-    extern __shared__ int smem_hist_int[];
-    int* smem_hist = smem_hist_int;
-    int tid = threadIdx.x;
-    int warp_id = tid >> 5;
-    int lane = tid & 31;
-    int c = blockIdx.x;
-    int q_start_cta = c * q_per_cta;
-    int q_end_cta = min(q_start_cta + q_per_cta, S_Q);
-    int q_start_warp = min(q_start_cta + warp_id * q_per_warp, q_end_cta);
-    int q_end_warp = min(q_start_warp + q_per_warp, q_end_cta);
+    constexpr int kQPerWarp = kQPerTile / kWarps;
+    constexpr int kIters = kChunkQ * kTopK / kWarpSize;
+    extern __shared__ int smem_tile_count[];
+    int const tile = blockIdx.x;
+    int const h = blockIdx.y;
+    int const tid = threadIdx.x;
+    int const words = (total_rows + 1) >> 1;
+    for (int i = tid; i < words; i += kThreads) smem_tile_count[i] = 0;
+    __syncthreads();
 
-    constexpr int kInt4PerToken = kTopK / 4;
-    int packed_per_warp = (total_rows + 1) >> 1;
-    int* my_hist = smem_hist + warp_id * packed_per_warp;
-
-    for (int h = 0; h < H; ++h) {
-        for (int i = lane; i < packed_per_warp; i += kWarpSize) my_hist[i] = 0;
-        __syncthreads();
-
-        if (q_start_warp < q_end_warp) {
-            int bi = 0;
-            int qi = q_start_warp + lane;
-            advance_batch_only(cu_q, B, qi, bi);
-
-            // Strided q2k base (contiguous => h*S_Q*kTopK, q_stride_i4 = kTopK/4).
-            int4 const* head_topk4 =
-                reinterpret_cast<int4 const*>(q2k + (size_t)h * q2k_head_stride);
-            int const q_stride_i4 = q2k_q_stride >> 2;
-
-            for (; qi < q_end_warp; qi += kWarpSize) {
-                advance_batch_only(cu_q, B, qi, bi);
-                int const* my_row_map = row_map + (size_t)bi * max_kv_blocks;
-
-                int4 buf[kInt4PerToken];
-                #pragma unroll
-                for (int v = 0; v < kInt4PerToken; ++v) {
-                    buf[v] = head_topk4[(size_t)qi * q_stride_i4 + v];
-                }
-                #pragma unroll
-                for (int t = 0; t < kTopK; ++t) {
-                    int kvb_local = reinterpret_cast<int const*>(buf)[t];
-                    if (kvb_local >= 0 && kvb_local < max_kv_blocks) {
-                        int row = my_row_map[kvb_local];
-                        if (row >= 0 && row < total_rows) {
-                            atomic_inc_int16_packed(my_hist, row);
-                        }
-                    }
-                }
-            }
+    int const q_begin = tile * kQPerTile + (tid / kWarpSize) * kQPerWarp;
+    int const q_end = min(q_begin + kQPerWarp, S_Q);
+    for (int chunk = q_begin; chunk < q_end; chunk += kChunkQ) {
+        int row[kIters];
+        int qloc[kIters];
+        load_warp_rows<kTopK, kIters>(q2k, cu_q, row_map, B, total_rows, max_kv_blocks,
+                                      q2k_head_stride, q2k_q_stride, h, chunk,
+                                      min(chunk + kChunkQ, q_end), tid % kWarpSize, row, qloc);
+        #pragma unroll
+        for (int u = 0; u < kIters; ++u) {
+            if (row[u] >= 0) atomic_inc_int16_packed(smem_tile_count, row[u]);
         }
-        __syncthreads();
+    }
+    __syncthreads();
 
-        int* head_row_counts = row_counts + (size_t)h * total_rows;
-        // Each warp writes its own slice of tile_counts (full int32) by
-        // unpacking int16 entries from SMEM.
-        int* my_tile = tile_counts +
-            ((size_t)(c * kWarps + warp_id) * H + h) * total_rows;
-        for (int i = lane; i < total_rows; i += kWarpSize) {
-            my_tile[i] = read_int16_packed(my_hist, i);
-        }
-        __syncthreads();
-
-        // Sum across warps (int32 accumulator), atomicAdd to row_counts.
-        for (int i = tid; i < total_rows; i += kThreads) {
-            int sum = 0;
-            #pragma unroll
-            for (int w = 0; w < kWarps; ++w) {
-                sum += read_int16_packed(smem_hist + w * packed_per_warp, i);
-            }
-            if (sum > 0) atomicAdd(&head_row_counts[i], sum);
-        }
-        if (h + 1 < H) __syncthreads();
+    int* tile_row = tile_counts + ((size_t)h * num_tiles + tile) * total_rows;
+    int* head_counts = row_counts + (size_t)h * total_rows;
+    for (int i = tid; i < total_rows; i += kThreads) {
+        int const count = read_int16_packed(smem_tile_count, i);
+        tile_row[i] = count;
+        if (count > 0) atomicAdd(&head_counts[i], count);
     }
 }
 
 // ---------------------------------------------------------------------------
-// PR: row prefix. One block per head.
+// W: per (tile, head) CTA. Each warp counts its entries per row (packed int16
+// in its own smem slice), the CTA turns the counts into per-warp exclusive
+// offsets inside the tile, and each warp walks its entries again in the same
+// order, reserving slots with lane-ordered smem atomics.
+// CORRECTNESS NOTE: relies on lane-ordered SMEM atomicAdd return values
+// within a single warp instruction (verified on SM100; tests pass).
+// ---------------------------------------------------------------------------
+template <int kTopK, int kWarps>
+__global__ void __launch_bounds__(kWarps * kWarpSize) k2q_tile_scatter_kernel(
+    int const* __restrict__ q2k,
+    int const* __restrict__ cu_q,
+    int const* __restrict__ row_map,
+    int const* __restrict__ row_ptr,
+    int const* __restrict__ tile_prefix,
+    int* __restrict__ q_idx,
+    int* __restrict__ qsplit_idx,
+    int* __restrict__ split_counts,
+    int H, int B, int S_Q,
+    int total_rows, int max_kv_blocks, int num_tiles,
+    int q2k_head_stride, int q2k_q_stride)
+{
+    constexpr int kThreads = kWarps * kWarpSize;
+    constexpr int kQPerIter = kWarpSize / kTopK;
+    constexpr int kQPerWarp = kQPerTile / kWarps;
+    constexpr int kIters = kChunkQ / kQPerIter;
+    // One chunk: its rows stay in registers between the passes; else reloaded.
+    constexpr bool kOneChunk = kQPerWarp == kChunkQ;
+    extern __shared__ int smem_warp_cursor[];
+    int const tile = blockIdx.x;
+    int const h = blockIdx.y;
+    int const tid = threadIdx.x;
+    int const warp = tid / kWarpSize;
+    int const lane = tid % kWarpSize;
+    int const words = (total_rows + 1) >> 1;
+    int* my_cursor = smem_warp_cursor + warp * words;
+    for (int i = lane; i < words; i += kWarpSize) my_cursor[i] = 0;
+    __syncwarp();
+
+    int const q_begin = tile * kQPerTile + warp * kQPerWarp;
+    int const q_end = min(q_begin + kQPerWarp, S_Q);
+    int row[kIters];
+    int qloc[kIters];
+    for (int chunk = q_begin; chunk < q_end; chunk += kChunkQ) {
+        load_warp_rows<kTopK, kIters>(q2k, cu_q, row_map, B, total_rows, max_kv_blocks,
+                                      q2k_head_stride, q2k_q_stride, h, chunk,
+                                      min(chunk + kChunkQ, q_end), lane, row, qloc);
+        #pragma unroll
+        for (int u = 0; u < kIters; ++u) {
+            if (row[u] >= 0) atomic_inc_int16_packed(my_cursor, row[u]);
+        }
+    }
+    __syncthreads();
+
+    // Per row, the warps' counts -> their exclusive offsets inside the tile. A
+    // word packs two rows' int16 counts, which add without carrying.
+    for (int i = tid; i < words; i += kThreads) {
+        int running = 0;
+        #pragma unroll
+        for (int w = 0; w < kWarps; ++w) {
+            int const count = smem_warp_cursor[w * words + i];
+            smem_warp_cursor[w * words + i] = running;
+            running += count;
+        }
+    }
+    __syncthreads();
+
+    int const* head_row_ptr = row_ptr + (size_t)h * (total_rows + 1);
+    int const* tile_base = tile_prefix + ((size_t)h * num_tiles + tile) * total_rows;
+    int* head_q_idx = q_idx + (size_t)h * S_Q * kTopK;
+    int* head_qsplit = qsplit_idx != nullptr ? qsplit_idx + (size_t)h * S_Q * kTopK : nullptr;
+    int const q_in_iter = lane / kTopK;
+    int const slot_in_q = lane % kTopK;
+    unsigned int const group_mask = (kTopK == 32)
+        ? 0xFFFFFFFFu
+        : (((1u << kTopK) - 1u) << (q_in_iter * kTopK));
+    unsigned int const lower_lane_mask = lane == 0 ? 0u : ((1u << lane) - 1u);
+    for (int chunk = q_begin; chunk < q_end; chunk += kChunkQ) {
+        int const chunk_end = min(chunk + kChunkQ, q_end);
+        if constexpr (!kOneChunk) {
+            load_warp_rows<kTopK, kIters>(q2k, cu_q, row_map, B, total_rows, max_kv_blocks,
+                                          q2k_head_stride, q2k_q_stride, h, chunk, chunk_end,
+                                          lane, row, qloc);
+        }
+        int base[kIters];
+        #pragma unroll
+        for (int u = 0; u < kIters; ++u) {
+            base[u] = row[u] >= 0 ? head_row_ptr[row[u]] + tile_base[row[u]] : 0;
+        }
+        #pragma unroll
+        for (int u = 0; u < kIters; ++u) {
+            bool const valid_edge = row[u] >= 0;
+            unsigned int const valid_mask = __ballot_sync(0xFFFFFFFFu, valid_edge);
+            int const split_slot = __popc(valid_mask & group_mask & lower_lane_mask);
+            int const q = chunk + u * kQPerIter + q_in_iter;
+            if (split_counts != nullptr && slot_in_q == 0 && q < chunk_end) {
+                split_counts[(size_t)q * H + h] = __popc(valid_mask & group_mask);
+            }
+            if (valid_edge) {
+                int const out_pos = base[u] + atomic_inc_int16_packed(my_cursor, row[u]);
+                head_q_idx[out_pos] = qloc[u];
+                if (head_qsplit != nullptr) {
+                    head_qsplit[out_pos] = qloc[u] | ((split_slot & 0xFF) << 24);
+                }
+            }
+        }
+    }
+
+    // q_idx past the head's last entry is -1; the head's tiles split the tail.
+    int64_t const nnz = (int64_t)S_Q * kTopK;
+    int64_t const tail_begin = head_row_ptr[total_rows];
+    int64_t const per_tile = (nnz - tail_begin + num_tiles - 1) / num_tiles;
+    int64_t const begin = tail_begin + (int64_t)tile * per_tile;
+    int64_t const end = min(begin + per_tile, nnz);
+    for (int64_t i = begin + tid; i < end; i += kThreads) head_q_idx[i] = -1;
+}
+
+// ---------------------------------------------------------------------------
+// S: schedule. Blocks [0, H): one block per head, row_counts -> row_ptr.
 //
-// With a schedule, each block also emits its head's attention work items: one
-// per (row, chunk of <= target_q_per_cta q), in a list ordered largest
+// With a schedule, each such block also emits its head's attention work items:
+// one per (row, chunk of <= target_q_per_cta q), in a list ordered largest
 // q_count first (LPT). The attention kernels run work item i on CTA i and are
 // not persistent, so the list order is the launch order: appending items with
 // atomicAdd left the largest ones at random positions and the grid waited for
@@ -228,7 +358,11 @@ __global__ void k2q_hist_kernel(
 // its own, which gives each bucket's offset and the block's slice of it with
 // no inter-block communication: buckets descend by size, then ascend by head.
 // The order inside a slice is not deterministic. No output depends on the
-// order: each item writes its own partial slots.
+// order: each item writes its own partial slots. The list's unused capacity
+// is zeroed.
+//
+// Blocks [H, ...): one thread per (head, row), the exclusive scan of
+// tile_counts over the tiles, in place (-> each tile's offset in the row).
 // ---------------------------------------------------------------------------
 constexpr int kLptBuckets = 2048;
 
@@ -281,7 +415,8 @@ __device__ __forceinline__ int block_exclusive_scan(int value, int* scratch, int
 }
 
 template <int kThreads>
-__global__ void k2q_row_prefix_kernel(
+__device__ __forceinline__ void row_prefix_block(
+    int h, int H,
     int const* __restrict__ row_counts,
     int* __restrict__ row_ptr,
     int const* __restrict__ row_coords,
@@ -293,9 +428,8 @@ __global__ void k2q_row_prefix_kernel(
     int lpt_shift)
 {
     static_assert(kLptBuckets % kThreads == 0, "buckets must split evenly across threads");
-    int h = blockIdx.x;
     int tid = threadIdx.x;
-    __shared__ int scan_buf[kThreads];
+    __shared__ int scan_buf[kWarpSize + 1];
     // Items per bucket: of every head (-> bucket offsets), and of the heads
     // before this one (-> this head's next slot in each bucket).
     __shared__ int bucket_all[kLptBuckets];
@@ -311,24 +445,16 @@ __global__ void k2q_row_prefix_kernel(
     int const* head_counts = row_counts + (size_t)h * total_rows;
     int* head_rowptr = row_ptr + (size_t)h * (total_rows + 1);
     int chunk = (total_rows + kThreads - 1) / kThreads;
-    int lo = tid * chunk;
+    int lo = min(tid * chunk, total_rows);
     int hi = min(lo + chunk, total_rows);
 
     int local_sum = 0;
     for (int i = lo; i < hi; ++i) local_sum += head_counts[i];
-    scan_buf[tid] = local_sum;
-    __syncthreads();
-
-    for (int off = 1; off < kThreads; off <<= 1) {
-        int add = (tid >= off) ? scan_buf[tid - off] : 0;
-        __syncthreads();
-        scan_buf[tid] += add;
-        __syncthreads();
-    }
-    int running = scan_buf[tid] - local_sum;
+    int head_total = 0;
+    int running = block_exclusive_scan<kThreads>(local_sum, scan_buf, head_total);
+    if (tid == 0) head_rowptr[0] = 0;
     for (int i = lo; i < hi; ++i) {
-        int row_count = head_counts[i];
-        running += row_count;
+        running += head_counts[i];
         head_rowptr[i + 1] = running;
     }
     if (!emit_schedule) return;
@@ -349,7 +475,7 @@ __global__ void k2q_row_prefix_kernel(
     // (head, row) pairs of every head; a batch's loads are all in flight
     // before its first atomic.
     constexpr int kPairsPerBatch = 8;
-    int const all_pairs = gridDim.x * total_rows;
+    int const all_pairs = H * total_rows;
     int const pairs_before = h * total_rows;
     for (int first = tid; first < all_pairs; first += kThreads * kPairsPerBatch) {
         int pair_counts[kPairsPerBatch];
@@ -414,266 +540,56 @@ __global__ void k2q_row_prefix_kernel(
     for (int row = tid + kRowsPrefetched * kThreads; row < total_rows; row += kThreads) {
         place_row(row, head_counts[row], coords2[row]);
     }
+
+    // Unused capacity (never read) is zeroed, interleaved across the H blocks.
+    int64_t const used = (int64_t)min(total_items, work_capacity) * 6;
+    int64_t const capacity_ints = (int64_t)work_capacity * 6;
+    for (int64_t i = used + (int64_t)h * kThreads + tid; i < capacity_ints; i += (int64_t)H * kThreads) {
+        scheduler_metadata[i] = 0;
+    }
 }
 
-// ---------------------------------------------------------------------------
-// PT_smem: SMEM-staged tile prefix scan.
-// Each block handles kRowsPerBlock rows for one head h. Cooperative load
-// of tile_counts[*, h, base_r..base_r+M) into SMEM (better coalescing
-// than per-warp uncoalesced stride reads), then per-warp scan in SMEM,
-// then cooperative store back. Fuses row_ptr into the base.
-// ---------------------------------------------------------------------------
-template <int kThreads, int kRowsPerBlock>
-__global__ void k2q_tile_prefix_smem_kernel(
+template <int kThreads>
+__global__ void __launch_bounds__(kThreads) k2q_schedule_kernel(
+    int const* __restrict__ row_counts,
+    int* __restrict__ row_ptr,
+    int const* __restrict__ row_coords,
+    int* __restrict__ scheduler_metadata,
+    int* __restrict__ work_count,
     int* __restrict__ tile_counts,
-    int const* __restrict__ row_ptr,
-    int H, int total_rows, int G_total)
+    int H,
+    int total_rows,
+    int num_tiles,
+    int target_q_per_cta,
+    int work_capacity,
+    int lpt_shift)
 {
-    static_assert(kRowsPerBlock > 0, "kRowsPerBlock must be positive");
-    extern __shared__ int smem_tprefix[];
-    // smem layout: smem[r_off][g] for r_off in [0, M), g in [0, G_total).
-
-    int tid = threadIdx.x;
-    int lane = tid & 31;
-    int warp_id = tid >> 5;
-
-    // Grid: H * blocks_per_h. Each block stays within a single head h
-    // and processes kRowsPerBlock contiguous rows starting at b_in_h *
-    // kRowsPerBlock. (Earlier flat-grid mapping `h = block_job /
-    // total_rows; base_r = block_job - h*total_rows` skipped rows when
-    // total_rows was not a multiple of kRowsPerBlock and H > 1, because
-    // the last partial block of head h-1 left blocks of head h starting
-    // at a non-zero row offset.)
-    int blocks_per_h = (total_rows + kRowsPerBlock - 1) / kRowsPerBlock;
-    int h = blockIdx.x / blocks_per_h;
-    int b_in_h = blockIdx.x - h * blocks_per_h;
-    if (h >= H) return;
-    int base_r = b_in_h * kRowsPerBlock;
-    if (base_r >= total_rows) return;
-    int actual_M = min(kRowsPerBlock, total_rows - base_r);
-
-    size_t stride_g = (size_t)H * total_rows;
-    int* base_ptr = tile_counts + (size_t)h * total_rows + base_r;
-    int total_elems = G_total * actual_M;
-
-    // Cooperative load. Pattern: thread tid -> (r_off=tid%M, g=tid/M),
-    // then strided. 32 lanes hit M r's × (32/M) g's, giving 32/M cache
-    // lines per warp (vs 32 in the naive stride-along-g pattern).
-    for (int i = tid; i < total_elems; i += kThreads) {
-        int r_off = i % actual_M;
-        int g = i / actual_M;
-        smem_tprefix[r_off * G_total + g] = base_ptr[g * stride_g + r_off];
+    if ((int)blockIdx.x < H) {
+        row_prefix_block<kThreads>(blockIdx.x, H, row_counts, row_ptr, row_coords,
+                                   scheduler_metadata, work_count, total_rows,
+                                   target_q_per_cta, work_capacity, lpt_shift);
+        return;
     }
-    __syncthreads();
-
-    // Per-warp scan: warp w scans row (base_r + w) if w < actual_M.
-    if (warp_id < actual_M) {
-        int abs_r = base_r + warp_id;
-        int rp = row_ptr[(size_t)h * (total_rows + 1) + abs_r];
-        int* my_smem = smem_tprefix + warp_id * G_total;
-        int running = rp;
-        for (int g0 = 0; g0 < G_total; g0 += kWarpSize) {
-            int g = g0 + lane;
-            int v = (g < G_total) ? my_smem[g] : 0;
-            int x = v;
-            #pragma unroll
-            for (int off = 1; off < kWarpSize; off <<= 1) {
-                int nbr = __shfl_up_sync(0xFFFFFFFF, x, off);
-                if (lane >= off) x += nbr;
-            }
-            int excl = running + x - v;
-            if (g < G_total) my_smem[g] = excl;
-            int chunk_sum = __shfl_sync(0xFFFFFFFF, x, 31);
-            running += chunk_sum;
+    int const column = ((int)blockIdx.x - H) * kThreads + (int)threadIdx.x;
+    if (column >= H * total_rows) return;
+    int const h = column / total_rows;
+    int const r = column - h * total_rows;
+    int* tiles = tile_counts + (size_t)h * num_tiles * total_rows + r;
+    constexpr int kBatch = 16;
+    int running = 0;
+    for (int t0 = 0; t0 < num_tiles; t0 += kBatch) {
+        int counts[kBatch];
+        #pragma unroll
+        for (int k = 0; k < kBatch; ++k) {
+            counts[k] = t0 + k < num_tiles ? tiles[(size_t)(t0 + k) * total_rows] : 0;
         }
-    }
-    __syncthreads();
-
-    // Cooperative store back.
-    for (int i = tid; i < total_elems; i += kThreads) {
-        int r_off = i % actual_M;
-        int g = i / actual_M;
-        base_ptr[g * stride_g + r_off] = smem_tprefix[r_off * G_total + g];
-    }
-}
-
-// ---------------------------------------------------------------------------
-// S: scatter. kWarps warps per CTA, each owns q-sub-range. Per-warp SMEM
-// cursor and per-warp tile_offset slot range. Within a warp, q's are
-// processed sequentially; lanes 0..kTopK-1 handle the topK slots in
-// lockstep. Across distinct q's in the same warp, the lockstep ordering
-// guarantees q-monotonic atomicAdd on smem_cursor[r].
-// ---------------------------------------------------------------------------
-// kQPerIter * kTopK lanes are active per warp iter; remaining lanes idle.
-// For kTopK=16, kQPerIter=2 uses all 32 lanes; for kTopK=8, kQPerIter=4.
-// CORRECTNESS NOTE: relies on lane-ordered SMEM atomicAdd return values
-// within a single warp instruction (verified on SM100; tests pass).
-//
-// SMEM cursor stored as packed int16 (two cursors per int32). Per-warp
-// row count must stay < 32768 (~q_per_warp * kTopK at max sink), which
-// holds for all task.md sizes up to 1024K.
-template <int kTopK, int kBlockK, int kWarps>
-__global__ void k2q_scatter_kernel(
-    int const* __restrict__ q2k,
-    int const* __restrict__ cu_q,
-    int const* __restrict__ row_map,
-    int const* __restrict__ abs_base,
-    int* __restrict__ q_idx,
-    int* __restrict__ qsplit_idx,
-    int* __restrict__ split_counts,
-    int H, int B, int S_Q,
-    int total_rows, int max_kv_blocks,
-    int q_per_cta, int q_per_warp,
-    int max_seqlen_q,
-    int q2k_head_stride, int q2k_q_stride)
-{
-    constexpr int kQPerIter = kWarpSize / kTopK > 0 ? kWarpSize / kTopK : 1;
-    extern __shared__ int smem_cursor_int[];
-    int* smem_cursor = smem_cursor_int;
-    int tid = threadIdx.x;
-    int warp_id = tid >> 5;
-    int lane = tid & 31;
-    int c = blockIdx.x;
-    int q_start_cta = c * q_per_cta;
-    int q_end_cta = min(q_start_cta + q_per_cta, S_Q);
-    int q_start_warp = min(q_start_cta + warp_id * q_per_warp, q_end_cta);
-    int q_end_warp = min(q_start_warp + q_per_warp, q_end_cta);
-
-    int q_in_iter = lane / kTopK;
-    int slot_in_q = lane % kTopK;
-    bool lane_active = (lane < kQPerIter * kTopK);
-
-    // Per-warp packed cursor: total_rows int16 entries -> ceil(total_rows/2) int32.
-    int packed_per_warp = (total_rows + 1) >> 1;
-    int* my_cursor = smem_cursor + warp_id * packed_per_warp;
-
-    for (int h = 0; h < H; ++h) {
-        for (int i = lane; i < packed_per_warp; i += kWarpSize) my_cursor[i] = 0;
-        __syncwarp();
-
-        if (q_start_warp < q_end_warp) {
-            int bi = 0;
-            advance_batch_only(cu_q, B, q_start_warp, bi);
-
-            // Strided q2k base; head_qidx keeps h*S_Q*kTopK (q_idx is contiguous).
-            int const* head_q2k = q2k + (size_t)h * q2k_head_stride;
-            int const* my_abs_base =
-                abs_base + ((size_t)(c * kWarps + warp_id) * H + h) * total_rows;
-            int* head_qidx = q_idx + (size_t)h * S_Q * kTopK;
-
-            // (Hot-row register cache experiment showed no measurable
-            // benefit; relying on L1 to keep row 0 / row total_rows-1
-            // hot since they're hit every iteration in sink workloads.)
-
-            constexpr int kUnroll = 16;
-            int qi_base = q_start_warp;
-            for (; qi_base + kUnroll * kQPerIter <= q_end_warp;
-                 qi_base += kUnroll * kQPerIter) {
-                int kvb[kUnroll];
-                int qloc[kUnroll];
-                int batch[kUnroll];
-                int const* rmap[kUnroll];
-
-                #pragma unroll
-                for (int u = 0; u < kUnroll; ++u) {
-                    int qi_u = qi_base + u * kQPerIter + q_in_iter;
-                    kvb[u] = -1;
-                    qloc[u] = 0;
-                    batch[u] = 0;
-                    if (lane_active) {
-                        advance_batch_only(cu_q, B, qi_u, bi);
-                        qloc[u] = qi_u - cu_q[bi];
-                        batch[u] = bi;
-                        kvb[u] = head_q2k[(size_t)qi_u * q2k_q_stride + slot_in_q];
-                    }
-                    rmap[u] = row_map + (size_t)bi * max_kv_blocks;
-                }
-
-                int row[kUnroll];
-                #pragma unroll
-                for (int u = 0; u < kUnroll; ++u) {
-                    row[u] = -1;
-                    if (lane_active && kvb[u] >= 0 && kvb[u] < max_kv_blocks)
-                        row[u] = rmap[u][kvb[u]];
-                }
-
-                // Pre-issue all kUnroll abs_base loads in parallel before
-                // the atomic chain so memory pipeline runs concurrently
-                // with SMEM atomic-adds.
-                int abs_v[kUnroll];
-                #pragma unroll
-                for (int u = 0; u < kUnroll; ++u) {
-                    abs_v[u] = (row[u] >= 0 && row[u] < total_rows)
-                        ? my_abs_base[row[u]] : 0;
-                }
-
-                #pragma unroll
-                for (int u = 0; u < kUnroll; ++u) {
-                    int r = row[u];
-                    bool valid_edge = r >= 0 && r < total_rows;
-                    unsigned int valid_mask = __ballot_sync(0xFFFFFFFFu, valid_edge);
-                    unsigned int group_mask = (kTopK == 32)
-                        ? 0xFFFFFFFFu
-                        : (((1u << kTopK) - 1u) << (q_in_iter * kTopK));
-                    unsigned int lower_lane_mask = lane == 0 ? 0u : ((1u << lane) - 1u);
-                    int split_slot = __popc(valid_mask & group_mask & lower_lane_mask);
-                    int valid_count = __popc(valid_mask & group_mask);
-                    if (split_counts != nullptr && slot_in_q == 0) {
-                        int q_abs = cu_q[batch[u]] + qloc[u];
-                        split_counts[(size_t)q_abs * H + h] = valid_count;
-                    }
-                    if (valid_edge) {
-                        int slot = atomic_inc_int16_packed(my_cursor, r);
-                        int out_pos = abs_v[u] + slot;
-                        head_qidx[out_pos] = qloc[u];
-                        if (qsplit_idx != nullptr) {
-                            qsplit_idx[(size_t)h * S_Q * kTopK + out_pos] =
-                                qloc[u] | ((split_slot & 0xFF) << 24);
-                        }
-                    }
-                }
-            }
-            // Tail: 1-3 iters left.
-            for (; qi_base < q_end_warp; qi_base += kQPerIter) {
-                int my_qi = qi_base + q_in_iter;
-                bool valid_q = (my_qi < q_end_warp) && lane_active;
-                int kvb_local = -1;
-                int q_local = 0;
-                int batch_local = 0;
-                if (valid_q) {
-                    advance_batch_only(cu_q, B, my_qi, bi);
-                    batch_local = bi;
-                    q_local = my_qi - cu_q[bi];
-                    kvb_local = head_q2k[(size_t)my_qi * q2k_q_stride + slot_in_q];
-                }
-                int const* my_row_map = row_map + (size_t)bi * max_kv_blocks;
-                int row = -1;
-                if (valid_q && kvb_local >= 0 && kvb_local < max_kv_blocks) {
-                    row = my_row_map[kvb_local];
-                }
-                bool valid_edge = row >= 0 && row < total_rows;
-                unsigned int valid_mask = __ballot_sync(0xFFFFFFFFu, valid_edge);
-                unsigned int group_mask = (kTopK == 32)
-                    ? 0xFFFFFFFFu
-                    : (((1u << kTopK) - 1u) << (q_in_iter * kTopK));
-                unsigned int lower_lane_mask = lane == 0 ? 0u : ((1u << lane) - 1u);
-                int split_slot = __popc(valid_mask & group_mask & lower_lane_mask);
-                int valid_count = __popc(valid_mask & group_mask);
-                if (split_counts != nullptr && valid_q && slot_in_q == 0) {
-                    split_counts[(size_t)my_qi * H + h] = valid_count;
-                }
-                if (valid_edge) {
-                    int slot = atomic_inc_int16_packed(my_cursor, row);
-                    int out_pos = my_abs_base[row] + slot;
-                    head_qidx[out_pos] = q_local;
-                    if (qsplit_idx != nullptr) {
-                        qsplit_idx[(size_t)h * S_Q * kTopK + out_pos] =
-                            q_local | ((split_slot & 0xFF) << 24);
-                    }
-                }
+        #pragma unroll
+        for (int k = 0; k < kBatch; ++k) {
+            if (t0 + k < num_tiles) {
+                tiles[(size_t)(t0 + k) * total_rows] = running;
+                running += counts[k];
             }
         }
-        if (h + 1 < H) __syncthreads();
     }
 }
 
@@ -701,6 +617,7 @@ static void launch_pipeline(
     int work_capacity = 0,
     int max_seqlen_q = 0)
 {
+    (void)max_seqlen_q;
     int H = (int)q2k.size(0);
     int S_Q = (int)q2k.size(1);
     int topK = (int)q2k.size(2);
@@ -709,21 +626,9 @@ static void launch_pipeline(
     int q2k_head_stride = (int)q2k.stride(0);
     int q2k_q_stride = (int)q2k.stride(1);
     int B = (int)cu_q.size(0) - 1;
-    auto device = q2k.device();
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
-    CUDA_CHECK(cudaMemsetAsync(
-        row_ptr.data_ptr<int>(), 0,
-        (size_t)H * (total_rows + 1) * sizeof(int), stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        q_idx.data_ptr<int>(), 0xFF,
-        (size_t)H * S_Q * kTopK * sizeof(int), stream));
-
-    auto opts = torch::TensorOptions().dtype(torch::kInt32).device(device);
-    auto row_counts = torch::zeros({H, total_rows}, opts);
-    auto row_map = torch::empty({B, max_kv_blocks}, opts);
     bool emit_schedule = scheduler_metadata.defined();
-    auto row_coords = emit_schedule ? torch::empty({total_rows, 2}, opts) : torch::Tensor();
     // Work-list size buckets: q_count >> lpt_shift < kLptBuckets.
     int lpt_shift = 0;
     while (((target_q_per_cta - 1) >> lpt_shift) >= kLptBuckets) ++lpt_shift;
@@ -731,124 +636,79 @@ static void launch_pipeline(
     int* work_count_ptr = emit_schedule ? work_count.data_ptr<int>() : nullptr;
     int* qsplit_idx_ptr = emit_schedule ? qsplit_idx.data_ptr<int>() : nullptr;
     int* split_counts_ptr = emit_schedule ? split_counts.data_ptr<int>() : nullptr;
-    int* row_coords_ptr = emit_schedule ? row_coords.data_ptr<int>() : nullptr;
-    if (emit_schedule) {
-        CUDA_CHECK(cudaMemsetAsync(work_count_ptr, 0, sizeof(int), stream));
-        CUDA_CHECK(cudaMemsetAsync(
-            scheduler_metadata_ptr, 0,
-            (size_t)work_capacity * 6 * sizeof(int), stream));
-    }
 
+    // Tile CTAs: the scatter keeps kWarps packed int16 counts per row in smem;
+    // fewer warps (longer slices) for very many rows.
     int dev = q2k.get_device();
-    int num_sms = 0;
-    CUDA_CHECK(cudaDeviceGetAttribute(
-        &num_sms, cudaDevAttrMultiProcessorCount, dev));
+    int max_smem = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+    size_t const words_bytes = (size_t)((total_rows + 1) >> 1) * sizeof(int);
+    int tile_warps = kMaxTileWarps;
+    while (tile_warps > 1 && (size_t)tile_warps * words_bytes > (size_t)max_smem) tile_warps >>= 1;
+    TORCH_CHECK((size_t)tile_warps * words_bytes <= (size_t)max_smem,
+                "build_k2q_csr: too many rows (", total_rows, ") for the shared-memory row counts");
+    int num_tiles = (S_Q + kQPerTile - 1) / kQPerTile;
 
-    // -- Pick kWarps per CTA based on SMEM budget for cursor/hist ---------
-    // SMEM per CTA = kWarps * total_rows * sizeof(int) (for both H and S).
-    // Want at least 2 CTAs/SM for memory parallelism. SM100 SMEM = 228KB.
-    // Pick the largest kWarps that fits two CTAs/SM, capped at 4.
-    // SMEM cursor packed as int16 (2 entries per int32 word):
-    int per_warp_smem = ((total_rows + 1) >> 1) * (int)sizeof(int);
-    int kWarps_pick = 4;
-    while (kWarps_pick > 1 && (kWarps_pick * per_warp_smem) * 2 > 228 * 1024) {
-        kWarps_pick >>= 1;
-    }
-    if (kWarps_pick < 1) kWarps_pick = 1;
+    // One int32 workspace: row_coords [R, 2] (first: read as int2) | row_counts [H, R] |
+    // tile_counts [H, tiles, R] | row_map [B, max_kv_blocks].
+    size_t const n_row_coords = emit_schedule ? (size_t)total_rows * 2 : 0;
+    size_t const n_row_counts = (size_t)H * total_rows;
+    size_t const n_tile_counts = (size_t)H * num_tiles * total_rows;
+    size_t const n_row_map = (size_t)B * max_kv_blocks;
+    auto opts = torch::TensorOptions().dtype(torch::kInt32).device(q2k.device());
+    auto workspace = torch::empty(
+        {(int64_t)(n_row_coords + n_row_counts + n_tile_counts + n_row_map)}, opts);
+    int* row_coords = emit_schedule ? workspace.data_ptr<int>() : nullptr;
+    int* row_counts = workspace.data_ptr<int>() + n_row_coords;
+    int* tile_counts = row_counts + n_row_counts;
+    int* row_map = tile_counts + n_tile_counts;
 
-    // -- Pick G (CTAs) ----------------------------------------------------
-    // For each (kWarps, per_warp_smem) pair, the SMEM-bound occupancy is
-    // 228KB / (kWarps*per_warp_smem) CTAs/SM. We size G as
-    // num_sms * occupancy so a single resident wave covers all CTAs and
-    // the memory pipeline runs at peak.
-    int per_cta_smem_bytes = kWarps_pick * per_warp_smem;
-    int max_ctas_per_sm = std::max(
-        1, (228 * 1024) / std::max(1, per_cta_smem_bytes));
-    if (max_ctas_per_sm > 8) max_ctas_per_sm = 8;
-    constexpr int kMinQPerCta = 256;
-    // Cap target_g at num_sms * 3 — empirically this balances
-    // per-CTA work-size against parallelism. Higher caps regress
-    // mid-size cases due to row_counts atomicAdd contention and
-    // smaller q_per_cta. SMEM-bound configurations naturally cap
-    // lower if max_ctas_per_sm < 3.
-    int target_g = num_sms * std::min(max_ctas_per_sm, 3);
-    int max_g_for_q = (S_Q + kMinQPerCta - 1) / kMinQPerCta;
-    int G = std::min({target_g, max_g_for_q, S_Q});
-    if (G < 1) G = 1;
-    int q_per_cta = (S_Q + G - 1) / G;
-    G = (S_Q + q_per_cta - 1) / q_per_cta;
-    int q_per_warp = (q_per_cta + kWarps_pick - 1) / kWarps_pick;
-    int G_total = G * kWarps_pick;
+    constexpr int kPrepareThreads = 256;
+    int prepare_items = std::max(max_kv_blocks, (int)n_row_counts);
+    int prepare_blocks = std::max(1, std::min((prepare_items + kPrepareThreads - 1) / kPrepareThreads, 1024));
+    k2q_prepare_kernel<kBlockK><<<prepare_blocks, kPrepareThreads, 0, stream>>>(
+        cu_k.data_ptr<int>(), row_map, row_coords, row_counts, B, max_kv_blocks, (int)n_row_counts);
 
-    auto tile_counts = torch::empty({G_total, H, total_rows}, opts);
+    auto launch_tiles = [&](auto warps_const) {
+        constexpr int W = decltype(warps_const)::value;
+        auto count_fn = k2q_tile_count_kernel<kTopK, W>;
+        auto scatter_fn = k2q_tile_scatter_kernel<kTopK, W>;
+        size_t const count_smem = words_bytes;
+        size_t const scatter_smem = W * words_bytes;
+        if (count_smem > 48 * 1024) {
+            CUDA_CHECK(cudaFuncSetAttribute(
+                count_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)count_smem));
+        }
+        if (scatter_smem > 48 * 1024) {
+            CUDA_CHECK(cudaFuncSetAttribute(
+                scatter_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)scatter_smem));
+        }
+        dim3 const grid(num_tiles, H);
+        count_fn<<<grid, W * kWarpSize, count_smem, stream>>>(
+            q2k.data_ptr<int>(), cu_q.data_ptr<int>(), row_map, row_counts, tile_counts,
+            B, S_Q, total_rows, max_kv_blocks, num_tiles, q2k_head_stride, q2k_q_stride);
 
-    // -- Compile-time switch on kWarps for the templated kernels ---------
-    auto rmap_fn = k2q_build_row_map_kernel<kBlockK>;
-    auto rprefix_fn = k2q_row_prefix_kernel<1024>;
-    constexpr int kPtRowsPerBlock = 8;
-    constexpr int kPtThreads = 256;
-    auto tprefix_smem_fn = k2q_tile_prefix_smem_kernel<kPtThreads, kPtRowsPerBlock>;
+        constexpr int kScheduleThreads = 1024;
+        int const scan_blocks = (H * total_rows + kScheduleThreads - 1) / kScheduleThreads;
+        k2q_schedule_kernel<kScheduleThreads><<<H + scan_blocks, kScheduleThreads, 0, stream>>>(
+            row_counts, row_ptr.data_ptr<int>(), row_coords, scheduler_metadata_ptr,
+            work_count_ptr, tile_counts, H, total_rows, num_tiles, target_q_per_cta,
+            work_capacity, lpt_shift);
 
-    if (max_kv_blocks > 0) {
-        rmap_fn<<<max_kv_blocks, 32, 0, stream>>>(
-            cu_k.data_ptr<int>(), row_map.data_ptr<int>(), row_coords_ptr, B, max_kv_blocks);
-    }
-
-    auto launch_hist_scatter = [&](auto kWarps_const) {
-        constexpr int W = decltype(kWarps_const)::value;
-        size_t smem_bytes = (size_t)W * per_warp_smem;
-        auto hist_fn = k2q_hist_kernel<kTopK, kBlockK, W>;
-        auto scat_fn = k2q_scatter_kernel<kTopK, kBlockK, W>;
-        CUDA_CHECK(cudaFuncSetAttribute(
-            hist_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
-        CUDA_CHECK(cudaFuncSetAttribute(
-            scat_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
-
-        hist_fn<<<G, W * kWarpSize, smem_bytes, stream>>>(
-            q2k.data_ptr<int>(), cu_q.data_ptr<int>(), row_map.data_ptr<int>(),
-            row_counts.data_ptr<int>(), tile_counts.data_ptr<int>(),
-            H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp,
-            q2k_head_stride, q2k_q_stride);
-
-        rprefix_fn<<<H, 1024, 0, stream>>>(
-            row_counts.data_ptr<int>(), row_ptr.data_ptr<int>(),
-            emit_schedule ? row_coords.data_ptr<int>() : nullptr,
-            scheduler_metadata_ptr,
-            work_count_ptr,
-            total_rows,
-            target_q_per_cta,
-            work_capacity,
-            lpt_shift);
-
-        // Grid is H * blocks_per_h so each block stays within a single
-        // head; flat (H*total_rows) grid would skip rows when total_rows
-        // is not a multiple of kPtRowsPerBlock.
-        int blocks_per_h = (total_rows + kPtRowsPerBlock - 1) / kPtRowsPerBlock;
-        int pt_grid = H * blocks_per_h;
-        if (pt_grid < 1) pt_grid = 1;
-        size_t pt_smem = (size_t)kPtRowsPerBlock * G_total * sizeof(int);
-        CUDA_CHECK(cudaFuncSetAttribute(
-            tprefix_smem_fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            (int)pt_smem));
-        tprefix_smem_fn<<<pt_grid, kPtThreads, pt_smem, stream>>>(
-            tile_counts.data_ptr<int>(), row_ptr.data_ptr<int>(),
-            H, total_rows, G_total);
-
-        scat_fn<<<G, W * kWarpSize, smem_bytes, stream>>>(
-            q2k.data_ptr<int>(), cu_q.data_ptr<int>(), row_map.data_ptr<int>(),
-            tile_counts.data_ptr<int>(), q_idx.data_ptr<int>(),
-            qsplit_idx_ptr, split_counts_ptr,
-            H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp,
-            max_seqlen_q,
-            q2k_head_stride, q2k_q_stride);
+        scatter_fn<<<grid, W * kWarpSize, scatter_smem, stream>>>(
+            q2k.data_ptr<int>(), cu_q.data_ptr<int>(), row_map, row_ptr.data_ptr<int>(),
+            tile_counts, q_idx.data_ptr<int>(), qsplit_idx_ptr, split_counts_ptr,
+            H, B, S_Q, total_rows, max_kv_blocks, num_tiles, q2k_head_stride, q2k_q_stride);
     };
 
-    if (kWarps_pick == 4) {
-        launch_hist_scatter(std::integral_constant<int, 4>{});
-    } else if (kWarps_pick == 2) {
-        launch_hist_scatter(std::integral_constant<int, 2>{});
+    if (tile_warps == 8) {
+        launch_tiles(std::integral_constant<int, 8>{});
+    } else if (tile_warps == 4) {
+        launch_tiles(std::integral_constant<int, 4>{});
+    } else if (tile_warps == 2) {
+        launch_tiles(std::integral_constant<int, 2>{});
     } else {
-        launch_hist_scatter(std::integral_constant<int, 1>{});
+        launch_tiles(std::integral_constant<int, 1>{});
     }
 }
 

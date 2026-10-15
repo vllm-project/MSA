@@ -70,6 +70,8 @@ FULL_CASES = (
     PrefillCase("b8_ragged_kv1", (64, 1, 200, 129, 7, 512, 33, 1_000),
                 (64, 5_000, 200, 1_129, 7, 512, 3_033, 1_000), num_kv_heads=1, seed=18),
     PrefillCase("b1_q4096_k32768", (4_096,), (32_768,), seed=19),
+    # More KV rows (pages) than 8-warp CSR tiles keep smem row counts for: 4-warp tiles.
+    PrefillCase("b2_k1m_rows_over_14k", (64, 64), (1_000_000, 900_000), seed=20),
 )
 
 
