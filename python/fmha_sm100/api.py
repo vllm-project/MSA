@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 from .jit import _dlpack_dtype_code, _PACK_FACTORS, get_fmha_variant, get_reduction_module, get_plan_fn, get_sparse_topk_module
-from .nvfp4_kv import nvfp4_head_slot_views
+from .nvfp4_kv import nvfp4_head_slot_views, nvfp4_kv_views
 from .sparse_fmha_adapter import sparse_fmha, sparse_fmha_plan
 from . import q8kv4_decode_adapter
 from . import q8kv4_prefill_adapter
@@ -750,29 +750,6 @@ def _fmha_sm100_plan(
 
 
 
-def _check_nvfp4_kv_views(
-    k: torch.Tensor, v: torch.Tensor, k_sf: torch.Tensor, v_sf: torch.Tensor
-) -> None:
-    """Validate caller-built NVFP4 data and block-scale views.
-
-    Data views are uint8 ``[pages, Hkv, 128, 64]``, scale views uint8
-    ``[pages, Hkv, 128, 8]``, all with contiguous rows. The kernel takes one
-    page stride and one data / one scale head stride from the K views, so V
-    must match K stride for stride.
-    """
-    pages, heads = k.shape[:2]
-    for name, t, row in (("k", k, 64), ("v", v, 64), ("k_sf", k_sf, 8), ("v_sf", v_sf, 8)):
-        if (t.dtype != torch.uint8 or tuple(t.shape) != (pages, heads, 128, row)
-                or t.stride(3) != 1 or t.stride(2) != row):
-            raise ValueError(
-                f"NVFP4 {name} view must be uint8 [pages, Hkv, 128, {row}] with "
-                f"contiguous rows; got shape {tuple(t.shape)} strides {tuple(t.stride())}")
-    if not (k.stride(0) == v.stride(0) == k_sf.stride(0) == v_sf.stride(0)):
-        raise ValueError("NVFP4 K/V data and scale views must share one page stride")
-    if k.stride(1) != v.stride(1) or k_sf.stride(1) != v_sf.stride(1):
-        raise ValueError("NVFP4 K and V views must share the data and scale head strides")
-
-
 def _fmha_sm100(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -798,18 +775,12 @@ def _fmha_sm100(
         return sparse_fmha(q=q, k=k, v=v, plan_info=plan_info, out=out, max_score=max_score, 
                 sm_scale=sm_scale, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale, o_scale=o_scale,
                 kv_indices=kv_indices, output_maxscore=output_maxscore, output_o=output_o, q_offset_override=q_offset_override,
-                kv_block_indexes=kv_block_indexes, check_input_valid=check_input_valid)
+                kv_block_indexes=kv_block_indexes, check_input_valid=check_input_valid,
+                k_sf=k_sf, v_sf=v_sf)
 
     is_nvfp4 = k.dtype == torch.uint8
     if is_nvfp4:
-        if (k_sf is None) != (v_sf is None):
-            raise ValueError("NVFP4 k_sf and v_sf must be passed together")
-        if k_sf is None:
-            k, k_sf, v, v_sf = nvfp4_head_slot_views(k, v)
-        else:
-            # Caller-built data and scale views; the page and head strides come
-            # from the views.
-            _check_nvfp4_kv_views(k, v, k_sf, v_sf)
+        k, k_sf, v, v_sf = nvfp4_kv_views(k, v, k_sf, v_sf)
         k_global_scale, v_global_scale = k_scale, v_scale
         k_scale = v_scale = 1.0
         # Sparse NVFP4 decode runs on the Q8KV4 kernel when the plan carries one and the call
@@ -1236,11 +1207,12 @@ def fmha_sm100(
     packs two E2M1 values, and each block scale covers 16 values. K scales use
     ``token*8+group``; V scales use ``(token//4)*32+group*4+token%4`` within
     each head.
-    Alternatively pass the views yourself: ``k``/``v`` as uint8
-    ``[pages, Hkv, 128, 64]`` data and ``k_sf``/``v_sf`` as uint8
-    ``[pages, Hkv, 128, 8]`` block scales. The kernel then takes the page
-    stride and the data and scale head strides from the views, so any page
-    layout whose per-head data and scale runs are contiguous works.
+    Alternatively pass the views yourself, for decode and prefill alike:
+    ``k``/``v`` as uint8 ``[pages, Hkv, 128, 64]`` data and ``k_sf``/``v_sf``
+    as uint8 ``[pages, Hkv, 128, 8]`` block scales (see ``nvfp4_kv_views``).
+    The kernels then take the page stride and the data and scale head strides
+    from the views, so any page layout whose per-head data and scale runs are
+    contiguous works.
     ``k_scale`` and ``v_scale`` are CUDA float32 scalar tensors for NVFP4:
     ``value = E2M1(code) * E4M3(block_scale) * global_scale``.
     Use BF16 or E4M3 Q for prefill and E4M3 Q for decode. No cache conversion is needed.

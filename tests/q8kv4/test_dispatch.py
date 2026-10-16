@@ -11,7 +11,7 @@ from fmha_sm100.api import fmha_sm100, fmha_sm100_plan, nvfp4_head_slot_views
 from fmha_sm100.decode_q8kv4 import BatchDecodeWithPagedKVCacheWrapper, plan_decode, run_decode
 from fmha_sm100.q8kv4_decode_adapter import PLAN_KEY
 
-from .cases import HEAD_DIM, KV_HEADS, PAGE_SIZE, SM_SCALE, SMOKE_CASES, flat_page_table, global_scale, make_inputs, pack_head_slot_pages, pack_vllm_pages
+from .cases import HEAD_DIM, KV_HEADS, PAGE_SIZE, SM_SCALE, SMOKE_CASES, flat_page_table, global_scale, make_inputs, pack_head_slot_pages, pack_vllm_pages, unpack_views
 from .conftest import run_timed
 from .reference import PageDequantizer, assert_close_to_reference, sparse_decode_reference
 
@@ -47,10 +47,11 @@ class ApiHarness:
                                num_kv_heads=KV_HEADS, causal=True, qo_offset=kv - qo, page_size=PAGE_SIZE,
                                kv_block_num=CASE.topk, **kwargs)
 
-    def run(self, plan, *, q=None, topk=None, out=None, label="api", **kwargs):
+    def run(self, plan, *, q=None, topk=None, out=None, kv=None, label="api", **kwargs):
         inputs = self.inputs
+        k, v = (self.k_packed, self.v_packed) if kv is None else kv
         def call():
-            o, _ = fmha_sm100(inputs.q if q is None else q, self.k_packed, self.v_packed, plan,
+            o, _ = fmha_sm100(inputs.q if q is None else q, k, v, plan,
                               kv_indices=self.kv_indices, kv_block_indexes=inputs.topk_indices if topk is None else topk,
                               out=out, sm_scale=SM_SCALE, k_scale=self.unit, v_scale=self.unit, **kwargs)
             return o
@@ -160,3 +161,15 @@ def test_nvfp4_cache_must_be_per_head_kv_slots(harness):
                                         (harness.k_packed.stride(0), PAGE_SIZE * 72, 72, 1))
     with pytest.raises(ValueError, match="per-head K/V slots"):
         nvfp4_head_slot_views(cache[:, :KV_HEADS], cache[:, KV_HEADS:])
+
+
+def test_caller_built_views_serve_both_decode_kernels(harness):
+    """With k_sf / v_sf, fmha_sm100 reads the caller's data and scale views, here of the
+    side-packed layout (padded page stride, storage offset), on the Q8KV4 and kv_mode 3 kernels
+    alike, bitwise equal to the head-slot cache."""
+    k_side, v_side = pack_vllm_pages(harness.inputs, pad_bytes=256, offset_bytes=4096)
+    (k_data, k_sf), (v_data, v_sf) = unpack_views(k_side), unpack_views(v_side)
+    views = {"kv": (k_data, v_data), "k_sf": k_sf.view(torch.uint8), "v_sf": v_sf.view(torch.uint8)}
+    for label, plan in (("q8kv4", harness.plan()), ("kv_mode3", harness.plan(decode_backend="kv_mode3"))):
+        slots = harness.run(plan, label=f"api {label} slots")
+        assert torch.equal(harness.run(plan, label=f"api {label} views", **views), slots), label

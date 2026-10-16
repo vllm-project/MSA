@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 # SPDX-License-Identifier: MIT
-"""Caller-built NVFP4 K/V views for ``fmha_sm100``: shape and stride contract."""
+"""Caller-built NVFP4 K/V views for ``fmha_sm100`` decode and prefill: shape and stride contract."""
 
 import pytest
 import torch
 
-from fmha_sm100.api import _check_nvfp4_kv_views
+from fmha_sm100.nvfp4_kv import nvfp4_kv_views
 
 PAGES, HEADS, PAGE_SIZE, SLOT_BYTES = 3, 4, 128, 128 * 72
 
@@ -29,8 +29,12 @@ def _head_slot_views(kv_cache: torch.Tensor):
 
 def test_head_slot_views_are_accepted():
     kv_cache = torch.zeros(PAGES, 2 * HEADS, PAGE_SIZE, 72, dtype=torch.uint8)
-    k, k_sf, v, v_sf = _head_slot_views(kv_cache)
-    _check_nvfp4_kv_views(k, v, k_sf, v_sf)
+    views = _head_slot_views(kv_cache)
+    k, k_sf, v, v_sf = views
+    assert all(a is b for a, b in zip(nvfp4_kv_views(k, v, k_sf, v_sf), views))
+    derived = nvfp4_kv_views(kv_cache[:, 0::2], kv_cache[:, 1::2])
+    assert [(t.stride(), t.storage_offset()) for t in derived] == [
+        (t.stride(), t.storage_offset()) for t in views]
     assert k.stride(1) == k_sf.stride(1) == 2 * SLOT_BYTES
     assert v.storage_offset() == SLOT_BYTES and k_sf.storage_offset() == PAGE_SIZE * 64
 
@@ -44,10 +48,10 @@ def test_legacy_side_views_are_accepted():
         views.append(side.as_strided((PAGES, HEADS, PAGE_SIZE, 64), (side.stride(0), 8192, 64, 1)))
         views.append(side.as_strided((PAGES, HEADS, PAGE_SIZE, 8), (side.stride(0), 1024, 8, 1),
                                      side.storage_offset() + HEADS * 8192))
-    _check_nvfp4_kv_views(views[0], views[2], views[1], views[3])
+    nvfp4_kv_views(views[0], views[2], views[1], views[3])
 
 
-@pytest.mark.parametrize("bad", ["shape", "row", "page_stride", "head_stride", "dtype"])
+@pytest.mark.parametrize("bad", ["shape", "row", "page_stride", "head_stride", "dtype", "unpaired"])
 def test_mismatched_views_are_rejected(bad):
     kv_cache = torch.zeros(PAGES, 2 * HEADS, PAGE_SIZE, 72, dtype=torch.uint8)
     k, k_sf, v, v_sf = _head_slot_views(kv_cache)
@@ -62,5 +66,7 @@ def test_mismatched_views_are_rejected(bad):
             v_sf.shape, (k_sf.stride(0), 8 * PAGE_SIZE, 8, 1))
     elif bad == "dtype":
         k_sf = k_sf.view(torch.float8_e4m3fn)
+    elif bad == "unpaired":
+        v_sf = None
     with pytest.raises(ValueError):
-        _check_nvfp4_kv_views(k, v, k_sf, v_sf)
+        nvfp4_kv_views(k, v, k_sf, v_sf)

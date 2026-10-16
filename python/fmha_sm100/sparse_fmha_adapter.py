@@ -20,7 +20,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from .nvfp4_kv import nvfp4_head_slot_views
+from .nvfp4_kv import nvfp4_kv_views
 
 _MM_SPARSE_DIR = os.path.join(
     os.path.dirname(__file__), ".", "cute"
@@ -271,6 +271,8 @@ def sparse_fmha(
     kv_block_indexes: Optional[torch.Tensor] = None,
     q_offset_override = None,
     check_input_valid: bool = False,
+    k_sf: Optional[torch.Tensor] = None,
+    v_sf: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, None]:
     """Run sparse prefill through ``sparse_atten_func`` using an FMHA-style API.
 
@@ -310,6 +312,10 @@ def sparse_fmha(
         Runtime causal-offset override.  Tensor form has shape ``[batch_size]``.
     check_input_valid : bool, optional
         Reserved for compatibility with ``fmha_sm100``.
+    k_sf, v_sf : torch.Tensor, optional
+        NVFP4 only: caller-built block-scale views, with ``k`` / ``v`` the
+        matching data views (see ``nvfp4_kv_views``).  Without them ``k`` /
+        ``v`` are the per-head K/V slots.
 
     Returns
     -------
@@ -322,7 +328,7 @@ def sparse_fmha(
 
     is_nvfp4 = k.dtype == torch.uint8
     if is_nvfp4:
-        k, k_sf, v, v_sf = nvfp4_head_slot_views(k, v)
+        k, k_sf, v, v_sf = nvfp4_kv_views(k, v, k_sf, v_sf)
     qo_segment_lens = plan_info["qo_segment_lens"]
     cu_seqlens_q = plan_info["cu_seqlens_q"]
     cu_seqlens_k = plan_info["cu_seqlens_k"]

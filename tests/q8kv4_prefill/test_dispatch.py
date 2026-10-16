@@ -12,7 +12,7 @@ import torch
 from fmha_sm100.api import fmha_sm100, fmha_sm100_plan, nvfp4_head_slot_views
 from fmha_sm100.q8kv4_prefill_adapter import PLAN_KEY
 
-from .cases import HEAD_DIM, PAGE_SIZE, Q_HEADS_PER_KV, SM_SCALE, PrefillCase, global_scale, make_inputs, pack_head_slot_pages, pack_vllm_pages
+from .cases import HEAD_DIM, PAGE_SIZE, Q_HEADS_PER_KV, SM_SCALE, PrefillCase, global_scale, make_inputs, pack_head_slot_pages, pack_vllm_pages, unpack_views
 from .conftest import run_timed
 from .reference import assert_close_to_reference, sparse_prefill_reference
 from .runners import run_wrapper
@@ -62,13 +62,14 @@ class ApiHarness:
                                qo_offset=kv - qo if qo_offset is None else qo_offset,
                                page_size=PAGE_SIZE, kv_block_num=case.topk, **kwargs)
 
-    def run(self, plan, *, q=None, out=None, kv_block_indexes=None, label="api", **kwargs):
+    def run(self, plan, *, q=None, out=None, kv_block_indexes=None, kv=None, label="api", **kwargs):
         inputs = self.inputs
         kwargs = {"sm_scale": SM_SCALE, "k_scale": self.unit, "v_scale": self.unit, **kwargs}
         lists = inputs.kv_block_indexes if kv_block_indexes is None else kv_block_indexes
+        k, v = (self.k_packed, self.v_packed) if kv is None else kv
 
         def call():
-            o, _ = fmha_sm100(inputs.q if q is None else q, self.k_packed, self.v_packed, plan,
+            o, _ = fmha_sm100(inputs.q if q is None else q, k, v, plan,
                               kv_indices=inputs.kv_indices, kv_block_indexes=lists, out=out, **kwargs)
             return o
 
@@ -214,3 +215,18 @@ def test_mixed_decode_and_prefill_batch_routes_both_parts(device):
     decode_rows = sum(case.q_lens[:split])
     _within_fp8_noise(out[:decode_rows], harness.exact[:decode_rows], label="decode part")
     assert_close_to_reference(out[decode_rows:], harness.reference[decode_rows:], label="prefill part")
+
+
+def test_caller_built_views_serve_both_prefill_kernels(harness):
+    """With k_sf / v_sf, fmha_sm100 reads the caller's data and scale views, here of the
+    side-packed layout (padded page stride, storage offset) it rejects as slots, on the Q8KV4
+    and CuTe-DSL kernels alike, bitwise equal to the head-slot cache."""
+    k_side, v_side = pack_vllm_pages(harness.inputs, pad_bytes=256, offset_bytes=4096)
+    (k_data, k_sf), (v_data, v_sf) = unpack_views(k_side), unpack_views(v_side)
+    views = {"kv": (k_data, v_data), "k_sf": k_sf.view(torch.uint8), "v_sf": v_sf.view(torch.uint8)}
+    q_bf16 = harness.inputs.q.to(torch.bfloat16)
+    cute_dsl = harness.plan(prefill_backend="cute_dsl")
+    for label, plan, q in (("q8kv4", harness.plan(), None), ("cute_dsl", cute_dsl, None),
+                           ("cute_dsl bf16 q", cute_dsl, q_bf16)):
+        slots = harness.run(plan, q=q, label=f"api {label} slots")
+        assert torch.equal(harness.run(plan, q=q, label=f"api {label} views", **views), slots), label
