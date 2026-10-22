@@ -41,6 +41,12 @@ def plan_options(kwargs: dict) -> tuple[str, str | None, int]:
     return backend, kv_dtype, block_scale_shift
 
 
+def is_forced(backend: str, kv_dtype: str | None) -> bool:
+    """Whether decode on the plan must run the Q8KV4 kernel: planning and serving raise instead
+    of falling back, so the plan needs no kv_mode 3 work list."""
+    return backend == "q8kv4" and kv_dtype != "fp8"
+
+
 def _cuda_device(device) -> torch.device:
     """``fmha_sm100_plan``'s ``device``: None, a CUDA index, a string or a ``torch.device``."""
     if device is None:

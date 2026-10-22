@@ -39,6 +39,8 @@ blocks, causal, no max-score output) and `fmha_sm100` uses it for uint8 caches w
 too (E4M3 Q, block indexes present, no max-score output, no `q_offset_override`, `o_scale` of 1).
 Everything else runs on the kv_mode 3 kernel; `decode_backend="q8kv4"` raises instead of falling
 back, `"kv_mode3"` never plans this kernel, and `kv_dtype="fp8"` skips the plan for FP8 caches.
+A `"q8kv4"` decode plan carries no kv_mode 3 work list, so it is not bound by that kernel's 65536
+query-head rows.
 
 ## Direct API
 
@@ -84,7 +86,10 @@ callers that keep them together; its `run` accepts a `topk_indices` override.
 - `out`: `[B * q_len_per_req, Hq, 128]` bf16.
 
 Supported: head dim 128, page size 128, 8 or 16 Q heads per KV head, causal only. Runs are
-bitwise deterministic for identical inputs.
+bitwise deterministic for identical inputs. A plan holds at most 65536 sequences (a work item
+keeps the sequence index in 16 bits); a schedule without split KV, which large batches take unless
+their last wave is split, at most 65535 sequences x query tokens (gridDim.z). Planning raises past
+either.
 
 ## Tests and benchmark
 

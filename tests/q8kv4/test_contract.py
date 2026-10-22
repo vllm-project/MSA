@@ -104,3 +104,20 @@ def test_run_rejects_mismatched_tensors(device):
     with pytest.raises(ValueError, match="topk_indices must have shape"):
         wrapper.run(inputs.q, (inputs.k_codes, inputs.v_codes), kv_cache_sf=scales,
                     topk_indices=inputs.topk_indices[:, :, :8].contiguous())
+
+
+def test_plan_rejects_batches_past_the_kernel_limits(device):
+    """A work item keeps the sequence index in 16 bits, and a schedule without split KV launches
+    sequences x query tokens in gridDim.z (at most 65535). With 128 CTAs a multiple of 128 items
+    fills whole waves and keeps that schedule; a short last wave is split and runs on a CTA grid."""
+    def plan(batch, q_len, ctas=128):
+        return plan_decode(batch_size=batch, q_len_per_req=q_len, topk=16, device=device, num_q_heads=16,
+                           num_kv_heads=1, usable_sm_count=ctas)
+
+    plan(8176, 8)  # 65408 rows, whole waves
+    with pytest.raises(RuntimeError, match="gridDim.z"):
+        plan(8320, 8)  # 66560 rows, whole waves
+    plan(8200, 8)  # 65600 rows, split last wave
+    plan(65536, 1, ctas=127)  # split 4-item last wave
+    with pytest.raises(RuntimeError, match="at most 65536 sequences"):
+        plan(65537, 1, ctas=127)

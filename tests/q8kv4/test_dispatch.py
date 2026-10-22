@@ -11,7 +11,7 @@ from fmha_sm100.api import fmha_sm100, fmha_sm100_plan, nvfp4_head_slot_views
 from fmha_sm100.decode_q8kv4 import BatchDecodeWithPagedKVCacheWrapper, plan_decode, run_decode
 from fmha_sm100.q8kv4_decode_adapter import PLAN_KEY
 
-from .cases import HEAD_DIM, KV_HEADS, PAGE_SIZE, SM_SCALE, SMOKE_CASES, flat_page_table, global_scale, make_inputs, pack_head_slot_pages, pack_vllm_pages, unpack_views
+from .cases import HEAD_DIM, KV_HEADS, PAGE_SIZE, SM_SCALE, SMOKE_CASES, DecodeCase, flat_page_table, global_scale, make_inputs, pack_head_slot_pages, pack_vllm_pages, unpack_views
 from .conftest import run_timed
 from .reference import PageDequantizer, assert_close_to_reference, sparse_decode_reference
 
@@ -173,3 +173,50 @@ def test_caller_built_views_serve_both_decode_kernels(harness):
     for label, plan in (("q8kv4", harness.plan()), ("kv_mode3", harness.plan(decode_backend="kv_mode3"))):
         slots = harness.run(plan, label=f"api {label} slots")
         assert torch.equal(harness.run(plan, label=f"api {label} views", **views), slots), label
+
+
+def _requests(inputs, requests):
+    """The inputs restricted to some requests, sharing the cache."""
+    q_len = inputs.case.q_len
+    rows = torch.tensor([r * q_len + t for r in requests for t in range(q_len)], device=inputs.q.device)
+    index = torch.tensor(requests, device=inputs.q.device)
+    case = DecodeCase(inputs.case.name, tuple(inputs.case.seq_lens[r] for r in requests), q_len=q_len,
+                      topk=inputs.case.topk, seed=inputs.case.seed)
+    return inputs.__class__(**{**vars(inputs), "case": case, "q": inputs.q[rows], "page_table": inputs.page_table[index],
+                               "seq_lens": inputs.seq_lens[index], "topk_indices": inputs.topk_indices[rows]})
+
+
+def test_forced_q8kv4_plan_is_not_bound_by_the_kv_mode3_row_limit(harness, device):
+    """A decode_backend='q8kv4' plan has no kv_mode 3 work list, so a batch past that list's
+    65536 query-head rows (here 1024 x 8 x 64) plans and runs; auto still builds the list first."""
+    case = DecodeCase("b1024_q8", (1_000,) * 1024, q_len=8, seed=31)
+    inputs = make_inputs(case, device)
+    kv = inputs.seq_lens.cpu()
+    qo = torch.full_like(kv, case.q_len)
+
+    def plan(**kwargs):
+        return fmha_sm100_plan(qo, kv, inputs.num_q_heads, num_kv_heads=KV_HEADS, causal=True, qo_offset=kv - qo,
+                               page_size=PAGE_SIZE, kv_block_num=case.topk, **kwargs)
+
+    with pytest.raises(AssertionError):
+        plan()
+    forced = plan(decode_backend="q8kv4")
+    assert forced[3].get(PLAN_KEY) is not None and forced[3]["packed_work_info"] is None
+    k, v = pack_head_slot_pages(inputs)
+    kv_indices, _ = flat_page_table(inputs.page_table, case.seq_lens)
+    unit = global_scale(1.0, device)
+    out = run_timed("api forced b1024 q8", lambda: fmha_sm100(
+        inputs.q, k, v, forced, kv_indices=kv_indices, kv_block_indexes=inputs.topk_indices,
+        sm_scale=SM_SCALE, k_scale=unit, v_scale=unit)[0].clone())
+    requests = [0, 1, 511, 1022, 1023]
+    rows = torch.tensor([r * case.q_len + t for r in requests for t in range(case.q_len)], device=device)
+    subset = _requests(inputs, requests)
+    reference = sparse_decode_reference(
+        subset, PageDequantizer(subset.k_codes, subset.k_scale), PageDequantizer(subset.v_codes, subset.v_scale))
+    assert_close_to_reference(out[rows], reference, label="forced b1024 q8 vs reference")
+
+    small = harness.plan(decode_backend="q8kv4")
+    with pytest.raises(ValueError, match="no kv_mode 3 work list"):
+        fmha_sm100(harness.inputs.q, harness.k_packed.view(torch.float8_e4m3fn),
+                   harness.v_packed.view(torch.float8_e4m3fn), small, kv_indices=harness.kv_indices,
+                   kv_block_indexes=harness.inputs.topk_indices, sm_scale=SM_SCALE)

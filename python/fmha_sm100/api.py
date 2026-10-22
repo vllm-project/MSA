@@ -525,7 +525,8 @@ def _fmha_sm100_plan(
     sparse_kernel_mode: str = 'auto',
     use_fp8_kvcache: bool = False,
     device = None,
-    stream = None
+    stream = None,
+    kv_mode3_worklist: bool = True,
 ):
     device = torch.cuda.current_device() if device is None else device
     _reset_np_staging()
@@ -565,7 +566,8 @@ def _fmha_sm100_plan(
     if kv_block_num > 0 and page_size > 0:
         total_q = sum(qo_lens)
         total_q_packed = total_q * pack_factor if pack_factor > 1 else total_q
-        assert total_q_packed * num_qo_heads <= 65536
+        # The kv_mode 3 work list holds at most 65536 query-head rows.
+        assert not kv_mode3_worklist or total_q_packed * num_qo_heads <= 65536
         qo_offset_in = qo_offset.tolist() if qo_offset is not None else None
         qo_lens, kv_lens, qo_offset, kv_page_indptr_list = \
             _expand_for_per_token_sparse(qo_lens, kv_lens, qo_offset_in, page_size, pack_factor)
@@ -620,6 +622,19 @@ def _fmha_sm100_plan(
     if output_maxscore and maxscore_elems > (1 << 31):
         print(f"Too huge setting to output maxscore!")
         max_k_tiles = -1
+
+    if not kv_mode3_worklist:
+        # Metadata only, for a decode plan only the Q8KV4 kernel serves.
+        return _make_plan_info(
+            packed_work_range=None, packed_work_info=None,
+            kv_tile_begin_indices=None, kv_tile_end_indices=None,
+            kv_split_indices=None, num_kv_splits=1, workspace_o=None,
+            workspace_lse=None, max_qo_len=max_qo_len, predicted_speedup=1.0,
+            num_kv_splits_per_row=None, qo_segment_offsets=qo_segment_offsets,
+            kv_segment_offsets=kv_segment_offsets, kv_page_indptr=kv_page_indptr, max_k_tiles=max_k_tiles,
+            qo_segment_lens=_plan_buf_from_list(qo_lens, device), kv_segment_lens=kv_segment_lens,
+            qo_offset=qo_offset, pack_factor=pack_factor, orig_num_qo_heads=orig_num_qo_heads,
+            qo_len_uniform=qo_len_uniform, cute_workspace_buffer=cute_workspace_buffer)
 
     if num_kv_splits < 1 and qo_tile_size == 128:
         group_iters = []
@@ -799,6 +814,11 @@ def _fmha_sm100(
                 return out, None
             if q8kv4["backend"] == "q8kv4":
                 raise ValueError(f"decode_backend='q8kv4' cannot serve this call: {blocker}")
+
+    if plan_info["packed_work_info"] is None:
+        raise ValueError(
+            "this plan was built with decode_backend='q8kv4' and has no kv_mode 3 work list; "
+            "only the Q8KV4 kernel can serve it (NVFP4 cache)")
 
     nnz_qo, num_qo_heads, head_dim_qk = q.shape
     if kv_indices is None:
@@ -1047,7 +1067,9 @@ def fmha_sm100_plan(
         it (page size 128, 8 or 16 Q heads per KV head, uniform query lengths, at most 64
         blocks, causal, no max-score output) and keeps the kv_mode 3 kernel otherwise;
         ``"q8kv4"`` requires the Q8KV4 kernel and raises when the batch or a later call does
-        not fit; ``"kv_mode3"`` never plans it.
+        not fit; ``"kv_mode3"`` never plans it. A ``"q8kv4"`` decode plan has no kv_mode 3
+        work list, so it is not bound by that kernel's 65536 query-head rows; the Q8KV4
+        planner's own limits are in :func:`fmha_sm100.decode_q8kv4.plan_decode`.
     prefill_backend : str, optional
         ``"auto"`` (default) plans sparse NVFP4 prefill on the Q8KV4 kernel when the batch fits
         it (page size 128, 16 Q heads per KV head, 4/8/16/32 blocks, causal, no max-score
@@ -1084,6 +1106,9 @@ def fmha_sm100_plan(
 
     decode_backend, kv_dtype, block_scale_shift = q8kv4_decode_adapter.plan_options(kwargs)
     prefill_backend = q8kv4_prefill_adapter.plan_options(kwargs)
+    # A decode plan that only the Q8KV4 kernel may serve skips the kv_mode 3 work list.
+    decode_kwargs = {**kwargs, "kv_mode3_worklist": not q8kv4_decode_adapter.is_forced(
+        decode_backend, kv_dtype)}
 
     def attach_q8kv4(plan, decode_qo_lens, decode_kv_lens):
         q8kv4_decode_adapter.attach_plan(
@@ -1124,7 +1149,7 @@ def fmha_sm100_plan(
         decode_kv_segment_lens = kv_segment_lens[:split]
         decode_qo_offset = qo_offset[:split]
         decode = _fmha_sm100_plan(decode_qo_segment_lens, decode_kv_segment_lens, *args,
-                                    qo_offset=decode_qo_offset, **kwargs)
+                                    qo_offset=decode_qo_offset, **decode_kwargs)
         attach_q8kv4(decode, decode_qo_segment_lens, decode_kv_segment_lens)
         decode = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in decode.items()}
         prefill_qo_segment_lens = qo_segment_lens[split:]
@@ -1135,8 +1160,8 @@ def fmha_sm100_plan(
         attach_q8kv4_prefill(prefill, prefill_kv_segment_lens)
         return (True, split, batch_size, decode, prefill)
     else:
-        plan = _fmha_sm100_plan(qo_segment_lens, kv_segment_lens, *args, 
-                                    qo_offset=qo_offset, **kwargs)
+        plan = _fmha_sm100_plan(qo_segment_lens, kv_segment_lens, *args,
+                                    qo_offset=qo_offset, **decode_kwargs)
         attach_q8kv4(plan, qo_segment_lens, kv_segment_lens)
         attach_q8kv4_prefill(plan, kv_segment_lens)
         return (False, 0, batch_size, plan, None)

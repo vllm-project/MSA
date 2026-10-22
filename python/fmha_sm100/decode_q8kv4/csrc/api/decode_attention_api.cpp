@@ -146,6 +146,11 @@ struct StreamKSchedule {
   int tail_items = 0;
 };
 
+// Work items hold the sequence index in 16 bits (here and in the device planner).
+constexpr int kMaxPlanSequences = 1 << 16;
+// Without split KV the kernel puts every (sequence, query token) row in gridDim.z.
+constexpr int64_t kMaxGridZ = 65535;
+
 static inline uint64_t pack_work_info_host(int qo_tile, int head, int batch) {
   return (static_cast<uint64_t>(static_cast<uint32_t>(qo_tile)) << 32) |
          (static_cast<uint64_t>(head & 0xffff) << 16) | static_cast<uint64_t>(batch & 0xffff);
@@ -429,6 +434,9 @@ PlanInfo _make_decode_plan_impl(at::Tensor qo_segment_lens, at::Tensor kv_segmen
 
   // Build offsets
   int batch_len = qo_lens.size();
+  TORCH_CHECK(batch_len <= kMaxPlanSequences, "Q8KV4 sparse decode plans at most ",
+              kMaxPlanSequences, " sequences (a work item holds the sequence index in 16 bits); got ",
+              batch_len);
   std::vector<int32_t> qo_offsets(batch_len + 1);
   qo_offsets[0] = 0;
   for (int i = 0; i < batch_len; ++i)
@@ -515,6 +523,11 @@ PlanInfo _make_decode_plan_impl(at::Tensor qo_segment_lens, at::Tensor kv_segmen
 
   if (!use_stream_k) {
     // ---- Fixed split or no-split plan ----
+    int64_t const grid_rows = static_cast<int64_t>(batch_len) * q_tokens_per_batch;
+    TORCH_CHECK(num_kv_splits > 1 || grid_rows <= kMaxGridZ,
+                "Q8KV4 sparse decode without split KV launches sequences x query tokens = ",
+                batch_len, " x ", q_tokens_per_batch, " = ", grid_rows,
+                " rows in gridDim.z, above CUDA's ", kMaxGridZ);
     packed_work_range = allocate_plan_buffer(num_ctas, device, torch::kInt64);
     int64_t query_tiles = 0;
     for (int32_t packed_q_len : qo_lens) {

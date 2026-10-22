@@ -373,7 +373,8 @@ def plan_decode(
     The schedule depends only on the batch shape: ``batch_size`` requests of ``q_len_per_req``
     query tokens each, the head layout, and the TopK width (1..64). Lengths, page tables and
     TopK lists are run-time inputs of :func:`run_decode`, so one plan serves every layer of a
-    step.
+    step. A plan holds at most 65536 sequences, and a schedule without split KV at most 65535
+    sequences x query tokens (the kernel's gridDim.z); planning raises past either.
 
     ``block_scale_shift`` names the cache's block-scale convention: the kernel divides every
     E4M3 block scale by ``2 ** block_scale_shift`` before forming ``code * scale`` and folds the
