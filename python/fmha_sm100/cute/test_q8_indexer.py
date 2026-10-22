@@ -552,6 +552,53 @@ def test_decode_concurrent_streams_do_not_alias(fmt, num_heads):
         assert torch.equal(out, expected)
 
 
+@pytest.mark.parametrize("fmt,num_heads", DECODE_CASES)
+def test_decode_wrappers_share_a_score_buffer(fmt, num_heads):
+    """Graph-mode wrappers of two batch sizes share one score buffer: replaying one after the
+    other ran matches its own result, and a buffer too small for the batch is rejected."""
+
+    max_pages = 6
+    inputs = [
+        _make_decode(fmt, batch, max_pages, seed, num_heads=num_heads)
+        for batch, seed in ((64, 51), (96, 52))
+    ]
+    shared = torch.empty(
+        DECODE_WRAPPERS[fmt].score_buffer_size(96, max_pages, num_heads=num_heads),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    wrappers, outs, expected = [], [], []
+    for q, k, block_table, seq_lens in inputs:
+        own = DECODE_WRAPPERS[fmt](num_heads=num_heads)
+        own.plan(block_table, seq_lens)
+        expected.append(own.run(q, k.cache).clone())
+        wrapper = DECODE_WRAPPERS[fmt](
+            num_heads=num_heads,
+            use_cuda_graph=True,
+            block_table_buffer=torch.empty_like(block_table),
+            seq_lens_buffer=torch.empty_like(seq_lens),
+            score_buffer=shared,
+        )
+        wrapper.plan(block_table, seq_lens)
+        wrappers.append(wrapper)
+        outs.append(torch.empty_like(expected[-1]))
+    (q0, k0, _, _), (q1, k1, block_table, seq_lens) = inputs
+    wrappers[0].run(q0, k0.cache, out=outs[0])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrappers[0].run(q0, k0.cache, out=outs[0])
+    wrappers[1].run(q1, k1.cache, out=outs[1])
+    outs[0].fill_(-777)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(outs[0], expected[0])
+    assert torch.equal(outs[1], expected[1])
+
+    small = DECODE_WRAPPERS[fmt](num_heads=num_heads, score_buffer=shared[: shared.numel() - 1])
+    with pytest.raises(ValueError, match="score_buffer"):
+        small.plan(block_table, seq_lens)
+
+
 @pytest.mark.parametrize("num_heads", DECODE_HEADS["q8kv4"])
 @pytest.mark.parametrize("query_len", (1, 2, 4, 7))
 @pytest.mark.parametrize("batch,max_pages", [(1, 1), (5, 6), (129, 4)])

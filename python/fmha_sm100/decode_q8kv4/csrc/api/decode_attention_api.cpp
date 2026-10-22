@@ -273,6 +273,21 @@ static int get_runtime_sm_count(int device) {
 static std::unordered_map<int, int> g_num_cta;
 static std::mutex g_num_cta_mutex;
 
+// The CUTLASS kernels need no workspace (get_workspace_size is 0), so every plan on a device
+// passes the same buffer instead of allocating its own. Never freed: it outlives the plans.
+static auto *g_cute_workspace = new std::unordered_map<int, at::Tensor>();
+static std::mutex g_cute_workspace_mutex;
+
+static at::Tensor shared_cute_workspace(int device) {
+  std::lock_guard<std::mutex> lock(g_cute_workspace_mutex);
+  auto it = g_cute_workspace->find(device);
+  if (it == g_cute_workspace->end())
+    it = g_cute_workspace
+             ->emplace(device, allocate_plan_buffer(32 * 1024 * 1024, device, torch::kUInt8))
+             .first;
+  return it->second;
+}
+
 static int get_num_cta(int device) {
   std::lock_guard<std::mutex> lock(g_num_cta_mutex);
   auto [it, inserted] = g_num_cta.try_emplace(device, -1);
@@ -406,7 +421,7 @@ PlanInfo _make_decode_plan_impl(at::Tensor qo_segment_lens, at::Tensor kv_segmen
 
   PlanInfo info;
 
-  auto cute_workspace = allocate_plan_buffer(32 * 1024 * 1024, device, torch::kUInt8);
+  auto cute_workspace = shared_cute_workspace(device);
 
   int num_ctas = get_num_cta(device);
   if (usable_SM_count > 0)

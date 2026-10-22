@@ -330,7 +330,9 @@ class _BatchDecodeIndexerBase:
     that position divided by 128. The eight tokens of all ``num_heads`` heads
     are scored together, reading each K page once. A wrapper instance owns its
     workspace and buffers and must not be shared by concurrently running
-    streams.
+    streams. ``score_buffer`` (fp32, at least ``batch * 8 * num_heads *
+    max_pages`` elements) replaces the per-wrapper page-score scratch, so
+    wrappers of different batch sizes that never run concurrently can share it.
 
     Wrappers with ``_supports_query_len`` also plan requests of fewer queries
     (``query_len``): ``q`` and the output then hold only those, which take the
@@ -345,7 +347,12 @@ class _BatchDecodeIndexerBase:
         use_cuda_graph: bool = False,
         block_table_buffer: torch.Tensor | None = None,
         seq_lens_buffer: torch.Tensor | None = None,
+        score_buffer: torch.Tensor | None = None,
     ) -> None:
+        if score_buffer is not None:
+            _check_cuda_tensor(score_buffer, name="score_buffer", dtype=torch.float32)
+            if score_buffer.ndim != 1:
+                raise ValueError("score_buffer must be one-dimensional")
         if workspace_buffer is not None:
             _check_cuda_tensor(workspace_buffer, name="workspace_buffer", dtype=torch.uint8)
             if workspace_buffer.ndim != 1:
@@ -368,6 +375,7 @@ class _BatchDecodeIndexerBase:
         self._seq_lens_buffer = seq_lens_buffer
         self._block_table: torch.Tensor | None = None
         self._seq_lens: torch.Tensor | None = None
+        self._score_buffer = score_buffer
         self._scores: torch.Tensor | None = None
         self._num_valid_pages: torch.Tensor | None = None
         self._topk_indices: torch.Tensor | None = None
@@ -434,6 +442,13 @@ class _BatchDecodeIndexerBase:
             batch_size, _check_num_heads(num_heads, cls._supported_num_heads)
         )
 
+    @classmethod
+    def score_buffer_size(cls, batch_size: int, max_pages: int, *, num_heads: int = 1) -> int:
+        """Return the fp32 elements ``score_buffer`` needs for a batch."""
+
+        num_heads = _check_num_heads(num_heads, cls._supported_num_heads)
+        return batch_size * _DECODE_QUERY_LENGTH * num_heads * max_pages
+
     @staticmethod
     def _check_metadata(block_table: torch.Tensor, seq_lens: torch.Tensor) -> None:
         _check_cuda_tensor(seq_lens, name="seq_lens", dtype=torch.int32)
@@ -499,13 +514,24 @@ class _BatchDecodeIndexerBase:
 
         tokens = batch_size * query_len
         score_shape = (batch_size, _DECODE_QUERY_LENGTH * self._num_heads, max_pages)
-        if (
+        if self._score_buffer is not None:
+            score_elems = self.score_buffer_size(batch_size, max_pages, num_heads=self._num_heads)
+            if self._score_buffer.device != device or self._score_buffer.numel() < score_elems:
+                raise ValueError(
+                    f"score_buffer must be on {device} with at least {score_elems} elements"
+                )
+            self._scores = self._score_buffer[:score_elems].view(score_shape)
+        elif (
             self._scores is None
             or self._scores.shape != score_shape
             or self._scores.device != device
-            or self._topk_indices.shape[0] != tokens
         ):
             self._scores = torch.empty(score_shape, dtype=torch.float32, device=device)
+        if (
+            self._topk_indices is None
+            or self._topk_indices.shape[0] != tokens
+            or self._topk_indices.device != device
+        ):
             self._num_valid_pages = torch.empty(
                 (tokens * self._num_heads,), dtype=torch.int32, device=device
             )

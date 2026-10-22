@@ -121,3 +121,17 @@ def test_plan_rejects_batches_past_the_kernel_limits(device):
     plan(65536, 1, ctas=127)  # split 4-item last wave
     with pytest.raises(RuntimeError, match="at most 65536 sequences"):
         plan(65537, 1, ctas=127)
+
+
+def test_plans_share_one_kernel_workspace(device):
+    """A plan holds only its schedule; the kernel workspace is one buffer per device."""
+    def plan(batch):
+        return plan_decode(batch_size=batch, q_len_per_req=8, topk=16, device=device, num_q_heads=16,
+                           num_kv_heads=1)
+
+    plans = [plan(8)]
+    torch.cuda.synchronize(device)
+    before = torch.cuda.memory_allocated(device)
+    plans += [plan(batch) for batch in (129, 256, 512, 1024)]
+    torch.cuda.synchronize(device)
+    assert torch.cuda.memory_allocated(device) - before < 32 * 2**20  # was 32 MiB per plan
