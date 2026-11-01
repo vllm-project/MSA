@@ -86,8 +86,14 @@ struct IndexerGemmCollective : IndexerGemmConfig<Traits, SchedulerCounterOffset>
       int const page_count =
           kv_length > 0 ? (kv_length + Traits::kPageTokens - 1) / Traits::kPageTokens : 0;
       int const scored_page_count = max(page_count - 1, 0);
-      int const page_begin = work_tile_idx * Traits::kPagesPerWorkTile;
-      int const page_end = min(page_begin + Traits::kPagesPerWorkTile, params.max_pages);
+      // The plan split the request's scored pages into its work tiles; tiles
+      // of ceil(pages / tiles) pages cover them (at most the plan's tile size).
+      int const planned_pages = max(min(page_count, params.max_pages) - 1, 0);
+      int const request_tiles = params.scheduler_workspace_ptr[batch_idx + 1] -
+                                params.scheduler_workspace_ptr[batch_idx];
+      int const pages_per_work_tile = (planned_pages + request_tiles - 1) / request_tiles;
+      int const page_begin = work_tile_idx * pages_per_work_tile;
+      int const page_end = min(page_begin + pages_per_work_tile, params.max_pages);
       int const local_pages = max(min(page_end, scored_page_count) - page_begin, 0);
       int32_t const *page_table =
           params.page_table_ptr + static_cast<size_t>(batch_idx) * params.max_pages;

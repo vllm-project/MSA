@@ -69,6 +69,7 @@ template <class Traits> struct IndexerGemmRunner {
     params.batch = arguments.batch;
     params.query_length = arguments.query_length;
     params.max_pages = arguments.max_pages;
+    params.sm_count = arguments.sm_count;
 
     return cudaSuccess;
   }
@@ -153,7 +154,7 @@ template <class Traits> struct IndexerGemmRunner {
   }
 
   static cudaError_t run(IndexerGemmParams const &params, cudaStream_t stream) {
-    dim3 const grid(params.sm_count * 4, 1, 1);
+    dim3 const grid(params.sm_count * Traits::kCtasPerSm, 1, 1);
     cudaLaunchAttribute attributes[2]{};
     attributes[0].id = cudaLaunchAttributeClusterDimension;
     attributes[0].val.clusterDim.x = 1;

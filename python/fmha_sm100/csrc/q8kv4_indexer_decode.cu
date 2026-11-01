@@ -179,6 +179,11 @@ void q8kv4_indexer_plan(TensorView page_table, TensorView seq_lens, TensorView w
   arguments.batch = batch;
   arguments.query_length = static_cast<int>(query_length);
   arguments.max_pages = static_cast<int>(page_table.size(1));
+  // The work tile size depends on how many CTAs the run launches. The plan
+  // assumes the whole device; a run with fewer SMs only gets smaller tiles.
+  TVM_FFI_ICHECK(cudaDeviceGetAttribute(&arguments.sm_count, cudaDevAttrMultiProcessorCount,
+                                        page_table.device().device_id) == cudaSuccess)
+      << "Q8KV4 indexer plan: SM count query failed";
 
   cudaError_t const status = q8kv4_indexer::prepare_indexer_gemm(arguments, stream);
   TVM_FFI_ICHECK(status == cudaSuccess)

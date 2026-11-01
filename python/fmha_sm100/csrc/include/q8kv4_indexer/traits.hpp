@@ -20,7 +20,12 @@ struct IndexerGemmTraits {
   static constexpr int kTransportWarps = 1;
   static constexpr int kThreads = (kScoreWarps + kTransportWarps) * cutlass::NumThreadsPerWarp;
   static constexpr int kMaxPagesPerCta = 4;
+  static constexpr int kCtasPerSm = 4;
+  // Pages per work tile: at most kPagesPerWorkTile. Small launches use smaller
+  // tiles (down to kMinPagesPerWorkTile) so that the persistent grid's CTAs
+  // all get work; see indexer_gemm_pages_per_work_tile.
   static constexpr int kPagesPerWorkTile = 16;
+  static constexpr int kMinPagesPerWorkTile = 2;
   static constexpr int kPartialPageCapacity = kPagesPerWorkTile;
   static constexpr int kPartialQueryCapacity = kQueryLength + 1;
   static constexpr int kPartialWarpCapacity = kScoreWarps;
