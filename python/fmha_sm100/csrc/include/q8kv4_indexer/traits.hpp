@@ -32,7 +32,7 @@ struct IndexerGemmTraits {
   // than smaller tiles gain once a launch has more tiles than the resident
   // grid. The host knows the request count, so plan and run pick the same
   // variant without reading the lengths.
-  static constexpr int kAdaptiveTileMaxBatch = 16;
+  static constexpr int kAdaptiveTileMaxBatch = 8;
   static constexpr int kPartialPageCapacity = kPagesPerWorkTile;
   static constexpr int kPartialQueryCapacity = kQueryLength + 1;
   static constexpr int kPartialWarpCapacity = kScoreWarps;
