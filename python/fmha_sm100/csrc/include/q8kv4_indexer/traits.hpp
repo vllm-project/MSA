@@ -26,6 +26,13 @@ struct IndexerGemmTraits {
   // all get work; see indexer_gemm_pages_per_work_tile.
   static constexpr int kPagesPerWorkTile = 16;
   static constexpr int kMinPagesPerWorkTile = 2;
+  // Launches of up to this many requests use the adaptive work tile; larger
+  // ones keep fixed kPagesPerWorkTile-page tiles. The run loop of the adaptive
+  // tile needs more registers than four CTAs per SM allow, which costs more
+  // than smaller tiles gain once a launch has more tiles than the resident
+  // grid. The host knows the request count, so plan and run pick the same
+  // variant without reading the lengths.
+  static constexpr int kAdaptiveTileMaxBatch = 16;
   static constexpr int kPartialPageCapacity = kPagesPerWorkTile;
   static constexpr int kPartialQueryCapacity = kQueryLength + 1;
   static constexpr int kPartialWarpCapacity = kScoreWarps;

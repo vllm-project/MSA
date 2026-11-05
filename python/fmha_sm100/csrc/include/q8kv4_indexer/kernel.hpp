@@ -62,7 +62,7 @@ CUTE_DEVICE void write_decode_num_valid_pages(IndexerGemmParams const &params, i
   }
 }
 
-template <class Traits>
+template <class Traits, bool kAdaptiveTile>
 __global__ void __launch_bounds__(Traits::kPrepareThreads)
     prepare_indexer_gemm_scheduler(const __grid_constant__ IndexerGemmParams params) {
   __shared__ int32_t warp_prefix[Traits::kPrepareWarps];
@@ -71,24 +71,26 @@ __global__ void __launch_bounds__(Traits::kPrepareThreads)
   int const lane_idx = thread_idx & 31;
   int const warp_idx = thread_idx >> 5;
   int const active_warps = static_cast<int>(blockDim.x) >> 5;
-  // The launch's total scored pages pick the work tile size.
   int const scored_pages =
       thread_idx < params.batch ? indexer_gemm_scored_pages<Traits>(params, thread_idx) : 0;
-  int warp_total = scored_pages;
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    warp_total += __shfl_xor_sync(0xffffffffu, warp_total, offset);
+  int pages_per_work_tile = Traits::kPagesPerWorkTile;
+  if constexpr (kAdaptiveTile) {
+    // The launch's total scored pages pick the work tile size.
+    int warp_total = scored_pages;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      warp_total += __shfl_xor_sync(0xffffffffu, warp_total, offset);
+    }
+    if (lane_idx == 0) {
+      warp_prefix[warp_idx] = warp_total;
+    }
+    __syncthreads();
+    int total_pages = 0;
+    for (int w = 0; w < active_warps; ++w) {
+      total_pages += warp_prefix[w];
+    }
+    __syncthreads();
+    pages_per_work_tile = indexer_gemm_pages_per_work_tile<Traits>(total_pages, params.sm_count);
   }
-  if (lane_idx == 0) {
-    warp_prefix[warp_idx] = warp_total;
-  }
-  __syncthreads();
-  int total_pages = 0;
-  for (int w = 0; w < active_warps; ++w) {
-    total_pages += warp_prefix[w];
-  }
-  __syncthreads();
-  int const pages_per_work_tile =
-      indexer_gemm_pages_per_work_tile<Traits>(total_pages, params.sm_count);
   int tile_count = indexer_gemm_scheduler_tile_count<Traits>(scored_pages, pages_per_work_tile);
   for (int offset = 1; offset < 32; offset <<= 1) {
     int const addend = __shfl_up_sync(0xffffffffu, tile_count, offset);
@@ -140,18 +142,18 @@ __global__ void __launch_bounds__(256)
   }
 }
 
-template <class Traits, int SchedulerCounterOffset>
+template <class Traits, int SchedulerCounterOffset, bool kAdaptiveTile>
 __global__ void __launch_bounds__(Traits::kThreads)
     indexer_gemm_kernel(const __grid_constant__ IndexerGemmParams params) {
-  using Collective = IndexerGemmCollective<Traits, SchedulerCounterOffset>;
+  using Collective = IndexerGemmCollective<Traits, SchedulerCounterOffset, kAdaptiveTile>;
   using SharedStorage = typename Collective::SharedStorage;
   extern __shared__ __align__(1024) uint8_t shared_memory[];
   SharedStorage &storage = *reinterpret_cast<SharedStorage *>(shared_memory);
   Collective::run(params, storage);
 }
 
-template <class Traits, int SchedulerCounterOffset> struct IndexerGemmKernel {
-  using Collective = IndexerGemmCollective<Traits, SchedulerCounterOffset>;
+template <class Traits, int SchedulerCounterOffset, bool kAdaptiveTile> struct IndexerGemmKernel {
+  using Collective = IndexerGemmCollective<Traits, SchedulerCounterOffset, kAdaptiveTile>;
   using SharedStorage = typename Collective::SharedStorage;
   static constexpr int kThreadCount = Traits::kThreads;
   static constexpr int kSharedStorageBytes = sizeof(SharedStorage);
