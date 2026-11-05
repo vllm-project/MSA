@@ -40,7 +40,7 @@ The current public support contract is intentionally narrow:
 | NVFP4 KV prefill | Forward-only, BF16 or FP8 e4m3 Q + packed NVFP4 K/V, flat and paged KV |
 | Paged FP8 decode | Forward-only, FP8 e4m3 Q/K/V → BF16 O, `qhead_per_kv=16`, `page_size=128`, SM100 |
 | FP4 indexer | SM100 block-score API, MXFP4/NVFP4, `D=128`, paged K, `blk_kv=128` |
-| Q8KV4/Q8KV8 paged indexers | SM100/SM103, FP8 e4m3 Q + NVFP4 or FP8 K, vLLM index-K cache, top-16 pages, 8-token MTP decode and varlen prefill |
+| Q8KV4/Q8KV8 paged indexers | SM100/SM103/SM107, FP8 e4m3 Q + NVFP4 or FP8 K, vLLM index-K cache, top-16 pages, 8-token MTP decode and varlen prefill |
 | Tests and benchmarks | CUDA required |
 
 ## Installation
@@ -450,6 +450,11 @@ the TopK:
 prefill.plan(..., score_out=scores[rows_lo:rows_hi])  # fp32 [total_q * num_heads, >= max_pages]
 prefill.run_scores(index_q, index_k_cache)            # writes pages before each row's local page
 ```
+
+The prefill score kernel writes `score_out` with TMA bulk stores, so its data
+pointer and its row pitch must be 16-byte aligned (a pitch that is a multiple
+of four floats); `plan` rejects other buffers. Entries at or after a row's
+local page are never written.
 
 ### Q8KV Input And Output Contract
 
