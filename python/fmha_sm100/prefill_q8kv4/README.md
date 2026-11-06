@@ -105,6 +105,22 @@ are the same as with interleaved memory. Reserve the largest batch up front with
 it. `FMHA_SM100_PREFILL_Q8KV4_LOCALITY_DOMAINS=0` keeps the buffer interleaved (for
 comparisons). One workspace must not be used from two streams at once.
 
+### MXFP8 output
+
+`run_prefill(..., out_mxfp8=(data, scale))` writes the output as MXFP8 from the combine's epilogue,
+so an MXFP8 GEMM needs no separate quantize kernel: E4M3 `data` `[total_q, Hq, 128]` and `scale`, a
+flat 16-byte aligned uint8 buffer of UE8M0 scales in FlashInfer's 128x4 swizzled layout. The bytes
+equal `mxfp8_quantize(out.view(total_q, -1), is_sf_swizzled_layout=True)` of the BF16 output,
+padding rows included. Without `out`, the BF16 output is not written and `None` is returned in its
+place; with both, both are written.
+
+A batch of decode tokens followed by prefill tokens can fill one activation: decode writes rows
+`[0, nd)` of `data` and `scale`, then `run_prefill(out_mxfp8=(data[nd:], scale),
+out_mxfp8_first_row=nd)` writes the rest. `scale` spans the whole activation, at least
+`round_up(nd + total_q, 128) * Hq * 4` bytes; `data` holds only this call's rows. The call leaves
+the scales of rows before `nd` alone and zeroes the padding rows past its last row, so the prefill
+must hold the activation's last rows and must follow the decode on the same stream.
+
 ## Data contract
 
 - `q`: `[total_q, Hq, 128]` E4M3, contiguous; request `b`'s query chunk occupies

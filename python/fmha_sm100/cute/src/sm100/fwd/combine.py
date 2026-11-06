@@ -25,6 +25,7 @@ import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass import Float32, Int32, Int64, Boolean, const_expr
 
+from src.common import mxfp8_quant as mx
 from src.common import utils
 from src.common.aot_cache import save_aot, try_load_aot
 from src.common.cute_dsl_utils import assume_tensor_aligned, compile_with_timing, torch2cute_dtype_map
@@ -1591,6 +1592,10 @@ class SparseAttentionForwardCombine:
     domain ``p % num_domains``, and hands the kernel the domain of every SM: a CTA then claims a tile
     whose pages live in the domain of its own SM, from per-domain counters, and takes a tile of
     another domain only once its own are gone.
+
+    The output can also, or instead, be written as MXFP8: after the shuffles each lane holds 8
+    consecutive BF16 columns of its row, so the four lanes of a pair group hold one aligned
+    32-column block.
     """
 
     def __init__(
@@ -1723,7 +1728,7 @@ class SparseAttentionForwardCombine:
         self,
         mO_partial: cute.Tensor,
         mLSE_partial: cute.Tensor,
-        mO: cute.Tensor,
+        mO: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor] = None,
         mLSE_temperature_partial: Optional[cute.Tensor] = None,
         mLSE_temperature: Optional[cute.Tensor] = None,
@@ -1733,13 +1738,31 @@ class SparseAttentionForwardCombine:
         mSmDomains: Optional[cute.Tensor] = None,
         mTileCounters: Optional[cute.Tensor] = None,
         tiles_per_page_log2: Int32 = Int32(0),
+        mO_mxfp8: Optional[cute.Tensor] = None,
+        mO_mxfp8_scale: Optional[cute.Tensor] = None,
+        mxfp8_first_row: Int32 = Int32(0),
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
         if const_expr(mO_partial.element_type != self.dtype_partial):
             raise TypeError("O partial tensor must match dtype_partial")
-        if const_expr(mO.element_type != self.dtype):
+        if const_expr(mO is not None and mO.element_type != self.dtype):
             raise TypeError("O tensor must match dtype")
+        if const_expr((mO_mxfp8 is None) != (mO_mxfp8_scale is None)):
+            raise ValueError("MXFP8 O data and scale tensors must both be provided or both be None")
+        if const_expr(mO is None and mO_mxfp8 is None):
+            raise ValueError("the combine needs O and/or its MXFP8 form")
+        if const_expr(mO_mxfp8 is not None):
+            if const_expr(self.dtype is not cutlass.BFloat16 or self.elems_per_copy != 8):
+                raise ValueError("MXFP8 O needs a BF16 output and 8 values per thread")
+            if const_expr(self.head_dim != 128):
+                raise ValueError("MXFP8 O needs head_dim 128 (4 MXFP8 blocks per 16-lane row)")
+            if const_expr(mO_mxfp8.element_type != cutlass.Uint8):
+                raise TypeError("MXFP8 O data must be uint8")
+            if const_expr(mO_mxfp8_scale.element_type != cutlass.Uint8):
+                raise TypeError("MXFP8 O scale must be uint8")
+            if const_expr(len(mO_mxfp8.shape) != 3):
+                raise ValueError("MXFP8 O data must be (total_q, nheads, headdim)")
         if const_expr(mLSE_partial.element_type != Float32):
             raise TypeError("LSE partial tensor must be Float32")
         if const_expr(mLSE is not None and mLSE.element_type != Float32):
@@ -1760,7 +1783,7 @@ class SparseAttentionForwardCombine:
             raise ValueError("O partial tensor must be (num_splits, total_q, nheads, headdim)")
         if const_expr(len(mLSE_partial.shape) != 3):
             raise ValueError("LSE partial tensor must be (num_splits, total_q, nheads)")
-        if const_expr(len(mO.shape) != 3):
+        if const_expr(mO is not None and len(mO.shape) != 3):
             raise ValueError("O tensor must be (total_q, nheads, headdim)")
         if const_expr(mLSE is not None and len(mLSE.shape) != 2):
             raise ValueError("LSE tensor must be (total_q, nheads)")
@@ -1786,7 +1809,9 @@ class SparseAttentionForwardCombine:
         ):
             raise TypeError("sm_domains and tile_counters must be Int32")
 
-        mO_partial, mO = [assume_tensor_aligned(t) for t in (mO_partial, mO)]
+        mO_partial = assume_tensor_aligned(mO_partial)
+        if const_expr(mO is not None):
+            mO = assume_tensor_aligned(mO)
         num_head = mO_partial.shape[2]
         total_flat = mO_partial.shape[1] * num_head
         self._setup_attributes()
@@ -1870,6 +1895,9 @@ class SparseAttentionForwardCombine:
             mSmDomains,
             mTileCounters,
             tiles_per_page_log2,
+            mO_mxfp8,
+            mO_mxfp8_scale,
+            mxfp8_first_row,
             tma_atom_O_partial,
             tma_atom_LSE,
             tma_atom_LSE_temperature,
@@ -1899,7 +1927,7 @@ class SparseAttentionForwardCombine:
         mO_partial_tma: cute.Tensor,
         mLSE_partial_tma: cute.Tensor,
         mLSE_temperature_partial_tma: Optional[cute.Tensor],
-        mO: cute.Tensor,
+        mO: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
         mLSE_temperature: Optional[cute.Tensor],
         mSplitCounts: Optional[cute.Tensor],
@@ -1908,6 +1936,9 @@ class SparseAttentionForwardCombine:
         mSmDomains: Optional[cute.Tensor],
         mTileCounters: Optional[cute.Tensor],
         tiles_per_page_log2: Int32,
+        mO_mxfp8: Optional[cute.Tensor],
+        mO_mxfp8_scale: Optional[cute.Tensor],
+        mxfp8_first_row: Int32,
         tma_atom_O_partial: cute.CopyAtom,
         tma_atom_LSE: Optional[cute.CopyAtom],
         tma_atom_LSE_temperature: Optional[cute.CopyAtom],
@@ -1927,7 +1958,9 @@ class SparseAttentionForwardCombine:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         m_block, _, _ = cute.arch.block_idx()
         total_tiles, _, _ = cute.arch.grid_dim()
-        total_flat = mO.shape[0] * mO.shape[1]
+        has_mxfp8 = const_expr(mO_mxfp8 is not None)
+        mO_shape = mO_mxfp8.shape if has_mxfp8 else mO.shape
+        total_flat = mO_shape[0] * mO_shape[1]
         has_temperature = const_expr(mLSE_temperature_partial_tma is not None)
         steer_tiles = const_expr(mTileCounters is not None)
 
@@ -2249,10 +2282,17 @@ class SparseAttentionForwardCombine:
         rO = cute.make_rmem_tensor(tOcO_store.shape, self.dtype)
         elems_per_store = const_expr(cute.size(tiled_copy_out.layout_tv_tiled[1]))
         num_vals = const_expr(cute.size(tOcO, mode=[0]))
+        num_store_k = const_expr(cute.size(tOcO_store, mode=[2]))
         assert num_vals == 8 and cute.size(tOcO_store, mode=[1]) == num_rows
         lane_in_pair_group = tidx % Int32(4)
+        if const_expr(has_mxfp8):
+            # Per row: this lane's 8 E4M3 bytes and its block's scale.
+            rQ = cute.make_rmem_tensor((num_rows, num_store_k, 2), cutlass.Uint32)
+            rE = cute.make_rmem_tensor((num_rows, num_store_k), cutlass.Uint32)
+            scale_base = mO_mxfp8_scale.iterator.toint()
+            scale_cols = Int32(mO_shape[1]) * Int32(self.head_dim // mx.MXFP8_BLOCK)
         for m in cutlass.range(num_rows, unroll_full=True):
-            for k in cutlass.range(cute.size(tOcO_store, mode=[2]), unroll_full=True):
+            for k in cutlass.range(num_store_k, unroll_full=True):
                 o0, o1 = tOrO[0, m, k], tOrO[1, m, k]
                 o2, o3 = tOrO[2, m, k], tOrO[3, m, k]
                 o4, o5 = tOrO[4, m, k], tOrO[5, m, k]
@@ -2267,42 +2307,88 @@ class SparseAttentionForwardCombine:
                 word2 = utils.cvt_f16x2_f32(o4, o5, self.dtype)
                 word3 = utils.cvt_f16x2_f32(o6, o7, self.dtype)
 
-                partner0 = cute.arch.shuffle_sync_bfly(word1, offset=1)
-                partner1 = cute.arch.shuffle_sync_bfly(word0, offset=1)
-                partner2 = cute.arch.shuffle_sync_bfly(word3, offset=1)
-                partner3 = cute.arch.shuffle_sync_bfly(word2, offset=1)
-                stage0, stage1 = word0, word1
-                stage2, stage3 = word2, word3
-                if lane_in_pair_group % Int32(2) != Int32(0):
-                    stage0, stage2 = partner0, partner2
-                if lane_in_pair_group % Int32(2) != Int32(1):
-                    stage1, stage3 = partner1, partner3
+                # The transpose stays inside a 32-value block, so the block's amax and each
+                # value's E4M3 are the same on either side of it. Pairs of E4M3 fit two to a word:
+                # transposed after quantizing it takes 3 shuffles, not the 8 of BF16 words.
+                if const_expr(has_mxfp8):
+                    # Every lane runs the block reduction; rows past the last one hold zeros.
+                    q0, q1, e = mx.quantize_bf16x8_lane_of_4(word0, word1, word2, word3)
+                    rQ[m, k, 0], rQ[m, k, 1] = mx.transpose_e4m3_pairs_lane_of_4(
+                        q0, q1, lane_in_pair_group
+                    )
+                    rE[m, k] = e
+                if const_expr(mO is not None):
+                    partner0 = cute.arch.shuffle_sync_bfly(word1, offset=1)
+                    partner1 = cute.arch.shuffle_sync_bfly(word0, offset=1)
+                    partner2 = cute.arch.shuffle_sync_bfly(word3, offset=1)
+                    partner3 = cute.arch.shuffle_sync_bfly(word2, offset=1)
+                    stage0, stage1 = word0, word1
+                    stage2, stage3 = word2, word3
+                    if lane_in_pair_group % Int32(2) != Int32(0):
+                        stage0, stage2 = partner0, partner2
+                    if lane_in_pair_group % Int32(2) != Int32(1):
+                        stage1, stage3 = partner1, partner3
 
-                partner0 = cute.arch.shuffle_sync_bfly(stage2, offset=2)
-                partner1 = cute.arch.shuffle_sync_bfly(stage3, offset=2)
-                partner2 = cute.arch.shuffle_sync_bfly(stage0, offset=2)
-                partner3 = cute.arch.shuffle_sync_bfly(stage1, offset=2)
-                out0, out1 = stage0, stage1
-                out2, out3 = stage2, stage3
-                if lane_in_pair_group // Int32(2) != Int32(0):
-                    out0, out1 = partner0, partner1
-                if lane_in_pair_group // Int32(2) != Int32(1):
-                    out2, out3 = partner2, partner3
+                    partner0 = cute.arch.shuffle_sync_bfly(stage2, offset=2)
+                    partner1 = cute.arch.shuffle_sync_bfly(stage3, offset=2)
+                    partner2 = cute.arch.shuffle_sync_bfly(stage0, offset=2)
+                    partner3 = cute.arch.shuffle_sync_bfly(stage1, offset=2)
+                    out0, out1 = stage0, stage1
+                    out2, out3 = stage2, stage3
+                    if lane_in_pair_group // Int32(2) != Int32(0):
+                        out0, out1 = partner0, partner1
+                    if lane_in_pair_group // Int32(2) != Int32(1):
+                        out2, out3 = partner2, partner3
 
-                rO_pairs = cute.recast_tensor(rO[None, m, k], Int32)
-                rO_pairs[0] = out0
-                rO_pairs[1] = out1
-                rO_pairs[2] = out2
-                rO_pairs[3] = out3
+                    rO_pairs = cute.recast_tensor(rO[None, m, k], Int32)
+                    rO_pairs[0] = out0
+                    rO_pairs[1] = out1
+                    rO_pairs[2] = out2
+                    rO_pairs[3] = out3
 
         for m in cutlass.range(num_rows, unroll_full=True):
             idx = tile_begin + tOcO_store[0, m, 0][0]
             if idx < total_flat:
                 row_q, row_h = divmod(idx, head_divmod)
-                mO_row = cute.tiled_divide(mO[row_q, row_h, None], (elems_per_store,))
-                for k in cutlass.range(cute.size(tOcO_store, mode=[2]), unroll_full=True):
-                    k_idx = tOcO_store[0, 0, k][1] // elems_per_store
-                    cute.copy(thr_copy_out, rO[None, m, k], mO_row[None, k_idx])
+                if const_expr(mO is not None):
+                    mO_row = cute.tiled_divide(mO[row_q, row_h, None], (elems_per_store,))
+                    for k in cutlass.range(num_store_k, unroll_full=True):
+                        k_idx = tOcO_store[0, 0, k][1] // elems_per_store
+                        cute.copy(thr_copy_out, rO[None, m, k], mO_row[None, k_idx])
+                if const_expr(has_mxfp8):
+                    for k in cutlass.range(num_store_k, unroll_full=True):
+                        # 8 E4M3 bytes per lane: a warp writes whole 32-byte sectors.
+                        mx.st_global_v2_u32(
+                            utils.elem_pointer(
+                                mO_mxfp8, (row_q, row_h, tOcO_store[0, 0, k][1])
+                            ).toint(),
+                            rQ[m, k, 0],
+                            rQ[m, k, 1],
+                        )
+                        col = tOcO_store[0, 0, k][1]
+                        if col % Int32(mx.MXFP8_BLOCK) == 0:
+                            mx.st_global_u8(
+                                scale_base
+                                + Int64(
+                                    mx.sf_offset_128x4(
+                                        mxfp8_first_row + row_q,
+                                        row_h * Int32(4) + col // Int32(mx.MXFP8_BLOCK),
+                                        scale_cols,
+                                    )
+                                ),
+                                rE[m, k],
+                            )
+
+        # The CTA of the last flat row clears the padding rows' scales.
+        if const_expr(has_mxfp8):
+            if tile_begin + self.tile_m >= total_flat:
+                mx.zero_padding_scales(
+                    scale_base,
+                    mxfp8_first_row + Int32(mO_shape[0]),
+                    scale_cols,
+                    tidx,
+                    self.num_threads,
+                )
 
     @cute.jit
     def claim_tile(
@@ -2371,6 +2457,8 @@ def combine(
     output_scale=None,
     use_pdl=False,
     locality=None,
+    o_mxfp8=None,
+    o_mxfp8_first_row=0,
 ):
     """K2: merge the sparse forward's split partials into the final output.
 
@@ -2383,7 +2471,7 @@ def combine(
             epilogue's STG.128 order; the rows of a split slab are contiguous, the slabs may be
             padded apart (any 16-byte-aligned split stride).
         lse_partial: [num_splits, total_q, head_q] FP32, contiguous.
-        o_out: [total_q, head_q, 128] BF16 or F16, contiguous.
+        o_out: [total_q, head_q, 128] BF16 or F16, contiguous, or None with ``o_mxfp8``.
         lse_out: [total_q, head_q] FP32, or None.
         lse_temperature_partial, lse_temperature_out: optional temperature-scaled LSE partials
             and output shaped like ``lse_partial`` and ``lse_out``; both or neither.
@@ -2394,6 +2482,14 @@ def combine(
         use_pdl: wait on the producer grid (programmatic dependent launch) before reading.
         locality: optional :class:`LocalityHints` for a partial buffer striped over the memory
             locality domains; every CTA then reads its tile from the domain of its own SM.
+        o_mxfp8: optional ``(data, scale)`` receiving the output as MXFP8, bit for bit what
+            ``flashinfer.mxfp8_quantize(o_out.view(total_q, head_q * 128),
+            is_sf_swizzled_layout=True)`` returns: ``data`` [total_q, head_q, 128] float8_e4m3fn
+            or uint8 (contiguous rows), ``scale`` a flat, 16-byte aligned uint8 buffer of UE8M0
+            scales in the 128x4 swizzled layout, padding rows zeroed. A BF16 output only.
+        o_mxfp8_first_row: row of ``scale`` that holds the first row of ``data``: the rows
+            before it belong to an earlier kernel filling the same MXFP8 activation. The rows
+            written here are the activation's last, so its padding rows are cleared here.
     """
     if o_partial_fake.ndim != 4:
         raise ValueError(
@@ -2418,12 +2514,37 @@ def combine(
         raise TypeError(
             f"o_partial_fake dtype must be torch.bfloat16 or torch.float16, got {o_partial_fake.dtype}"
         )
-    if o_out.dtype not in (torch.bfloat16, torch.float16):
-        raise TypeError(f"o_out dtype must be torch.bfloat16 or torch.float16, got {o_out.dtype}")
-    if tuple(o_out.shape) != (total_q, head_q, dim):
-        raise ValueError(
-            f"o_out must have shape {(total_q, head_q, dim)}, got {tuple(o_out.shape)}"
-        )
+    if o_out is None and o_mxfp8 is None:
+        raise ValueError("the combine needs o_out or o_mxfp8")
+    if o_out is not None:
+        if o_out.dtype not in (torch.bfloat16, torch.float16):
+            raise TypeError(
+                f"o_out dtype must be torch.bfloat16 or torch.float16, got {o_out.dtype}"
+            )
+        if tuple(o_out.shape) != (total_q, head_q, dim):
+            raise ValueError(
+                f"o_out must have shape {(total_q, head_q, dim)}, got {tuple(o_out.shape)}"
+            )
+    o_q = o_sf = None
+    if o_mxfp8 is not None:
+        o_q, o_sf = o_mxfp8
+        if o_out is not None and o_out.dtype != torch.bfloat16:
+            raise TypeError("o_mxfp8 needs a bfloat16 o_out")
+        if o_mxfp8_first_row < 0:
+            raise ValueError("o_mxfp8_first_row must not be negative")
+        if o_q.dtype not in (torch.uint8, torch.float8_e4m3fn) or tuple(o_q.shape) != (
+            total_q,
+            head_q,
+            dim,
+        ):
+            raise ValueError(f"o_mxfp8 data must be uint8/e4m3 {(total_q, head_q, dim)}")
+        if o_q.stride()[1:] != (dim, 1) or o_q.stride(0) % 16 or o_q.data_ptr() % 16:
+            raise ValueError("o_mxfp8 data rows must be contiguous and 16-byte aligned")
+        padded_rows = (o_mxfp8_first_row + total_q + 127) // 128 * 128
+        scale_numel = padded_rows * head_q * dim // 32
+        if o_sf.dtype != torch.uint8 or o_sf.ndim != 1 or o_sf.numel() < scale_numel:
+            raise ValueError(f"o_mxfp8 scale must be a flat uint8 [>= {scale_numel}] tensor")
+        o_q = o_q.view(torch.uint8)
     if lse_partial.dtype != torch.float32:
         raise TypeError(f"lse_partial must be torch.float32, got {lse_partial.dtype}")
     if tuple(lse_partial.shape) != (num_splits, total_q, head_q):
@@ -2472,9 +2593,10 @@ def combine(
             raise TypeError(f"output_scale must be torch.float32, got {output_scale.dtype}")
         if output_scale.numel() < 1:
             raise ValueError("output_scale must contain at least one element")
-    device = o_out.device
-    if not o_out.is_cuda:
-        raise ValueError("o_out must be a CUDA tensor")
+    o_ref = o_out if o_out is not None else o_q
+    device = o_ref.device
+    if not o_ref.is_cuda:
+        raise ValueError("the output must be a CUDA tensor")
     _check_cuda_aligned(o_partial_fake, name="o_partial_fake", device=device)
     for name, tensor in (
         ("lse_partial", lse_partial),
@@ -2484,12 +2606,17 @@ def combine(
         ("lse_temperature_out", lse_temperature_out),
         ("split_counts", split_counts),
         ("output_scale", output_scale),
+        ("o_mxfp8 scale", o_sf),
     ):
         if tensor is not None:
             _check_cuda_contiguous(tensor, name=name, device=device)
+    if o_q is not None and o_q.device != device:
+        raise ValueError(f"o_mxfp8 data must be on {device}, got {o_q.device}")
 
     partial_dtype = _get_cutlass_dtype(o_partial_fake.dtype)
-    out_dtype = _get_cutlass_dtype(o_out.dtype)
+    out_dtype = _get_cutlass_dtype(torch.bfloat16 if o_out is None else o_out.dtype)
+    has_o = o_out is not None
+    has_mxfp8 = o_mxfp8 is not None
     has_lse = lse_out is not None
     has_temperature = lse_temperature_out is not None
     has_split_counts = split_counts is not None
@@ -2546,6 +2673,8 @@ def combine(
         num_domains,
         lse_split_aligned,
     )
+    if has_mxfp8:
+        key = key + ("o_bf16", has_o, "o_mxfp8")
     if key not in _combine_compile_cache:
         loaded = try_load_aot(key)
         if loaded is not None:
@@ -2574,8 +2703,24 @@ def combine(
             mLSE_partial = make_fake_tensor(
                 Float32, (num_splits, total_q_sym, nheads_sym), divisibility=1, leading_dim=2
             )
-            mO = make_fake_tensor(
-                out_dtype, (total_q_sym, nheads_sym, dim), divisibility=128 // out_dtype.width
+            mO = (
+                make_fake_tensor(
+                    out_dtype, (total_q_sym, nheads_sym, dim), divisibility=128 // out_dtype.width
+                )
+                if has_o
+                else None
+            )
+            mO_mxfp8, mO_mxfp8_scale = (
+                (
+                    make_fake_tensor(
+                        cutlass.Uint8, (total_q_sym, nheads_sym, dim), divisibility=16
+                    ),
+                    make_fake_tensor(
+                        cutlass.Uint8, (cute.sym_int64(),), divisibility=16, leading_dim=0
+                    ),
+                )
+                if has_mxfp8
+                else (None, None)
             )
             mLSE = (
                 make_fake_tensor(Float32, (total_q_sym, nheads_sym), divisibility=1, leading_dim=1)
@@ -2629,6 +2774,9 @@ def combine(
                 mSmDomains,
                 mTileCounters,
                 Int32(tiles_per_page_log2),
+                mO_mxfp8,
+                mO_mxfp8_scale,
+                Int32(o_mxfp8_first_row),
                 stream,
                 options="--enable-tvm-ffi",
             )
@@ -2648,4 +2796,7 @@ def combine(
             None if locality is None else locality.sm_domains,
             None if locality is None else locality.tile_counters,
             tiles_per_page_log2,
+            o_q,
+            o_sf,
+            o_mxfp8_first_row,
         )

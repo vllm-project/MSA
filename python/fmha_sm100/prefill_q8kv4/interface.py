@@ -300,7 +300,9 @@ def run_prefill(
     o_partial: torch.Tensor | None = None,
     lse_partial: torch.Tensor | None = None,
     workspace: PrefillWorkspace | None = None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+    out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+    out_mxfp8_first_row: int = 0,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Run the Q8KV4 forward over a prepared k2q CSR and schedule, then combine the splits.
 
     ``paged_kv_cache`` holds the packed E2M1 K/V data views ``[pages, Hkv, 128, 64]`` and
@@ -326,6 +328,15 @@ def run_prefill(
     The split partials go to ``workspace`` (a :class:`PrefillWorkspace`, reused across calls and
     striped over the memory locality domains where the device has several), else to
     ``o_partial``/``lse_partial``, else to fresh allocations.
+
+    ``out_mxfp8`` (``(data, scale)``) also writes the output as MXFP8 for an MXFP8 GEMM: ``data``
+    is float8_e4m3fn (or uint8) ``[total_q, heads, 128]`` and ``scale`` a flat, 16-byte aligned
+    uint8 buffer of UE8M0 scales in FlashInfer's 128x4 swizzled layout, padding rows zeroed: bit
+    for bit ``mxfp8_quantize(out.view(total_q, -1), is_sf_swizzled_layout=True)`` of the BF16
+    output. With ``out_mxfp8`` and no ``out``, the BF16 output is not written and ``None`` is
+    returned in its place. ``out_mxfp8_first_row`` is the row of ``scale`` that holds ``data``'s
+    first row, for an activation whose earlier rows another kernel fills (decode tokens before
+    prefill tokens): ``scale`` then spans the whole activation and ``data`` only this call's rows.
     """
     if len(paged_kv_cache) != 2 or len(kv_cache_sf) != 2:
         raise ValueError("paged_kv_cache and kv_cache_sf must be (K, V) pairs")
@@ -380,7 +391,7 @@ def run_prefill(
         )
     if lse_partial is None:
         lse_partial = torch.empty((topk, total_q, num_q_heads), dtype=torch.float32, **options)
-    if out is None:
+    if out is None and out_mxfp8 is None:
         out = torch.empty((total_q, num_q_heads, _HEAD_DIM), dtype=torch.bfloat16, **options)
 
     _, combine = _sparse_stack()
@@ -415,6 +426,8 @@ def run_prefill(
         split_counts=schedule.split_counts,
         use_pdl=True,
         locality=locality,
+        o_mxfp8=out_mxfp8,
+        o_mxfp8_first_row=out_mxfp8_first_row,
     )
     return out, lse
 
