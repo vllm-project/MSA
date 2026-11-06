@@ -20,9 +20,11 @@
 
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_types.h"
+#include "mxfp8_output.cuh"
 
 #include <cfloat>
 #include <cuda_runtime_api.h>
+#include <type_traits>
 
 namespace cutlass::fmha::kernel {
 
@@ -66,7 +68,26 @@ struct Sm100FmhaReductionKernel {
     int pack_factor = 1;
     const float *k_global_scale_ptr = nullptr;
     const float *v_global_scale_ptr = nullptr;
+    // Optional MXFP8 output (see the attention kernel's o_mxfp8_ptr); BF16 ElementOut only.
+    uint8_t *ptr_O_mxfp8 = nullptr;
+    uint8_t *ptr_O_mxfp8_scale = nullptr;
+    int mxfp8_rows = 0;
   };
+
+  // One warp is one 32-value MXFP8 block of a (token, head) row; lane 0 writes its scale.
+  CUTLASS_DEVICE static void store_mxfp8(Params const &params, ElementOut value, int token,
+                                         int col, int row_values) {
+    namespace mx = fmha_sm100::decode_q8kv4::sm100::common;
+    static_assert(std::is_same_v<ElementOut, cutlass::bfloat16_t>, "MXFP8 output needs BF16 O");
+    uint32_t scale;
+    uint8_t const q = mx::mxfp8_quantize_lane(value.raw(), scale);
+    params.ptr_O_mxfp8[static_cast<int64_t>(token) * row_values + col] = q;
+    if ((threadIdx.x & (cutlass::NumThreadsPerWarp - 1)) == 0) {
+      params.ptr_O_mxfp8_scale[mx::mxfp8_scale_offset(token, col / mx::kMxfp8Block,
+                                                      row_values / mx::kMxfp8Block)] =
+          static_cast<uint8_t>(scale);
+    }
+  }
 
   static dim3 get_grid_shape(Params const& params) {
     return dim3(params.num_qo_heads, params.total_qo_len, 1);
@@ -83,6 +104,14 @@ struct Sm100FmhaReductionKernel {
     float const scale_softmax_log2 = params.scale_softmax_log2 * *params.k_global_scale_ptr;
     float const inv_scale_o = params.inv_scale_o * *params.v_global_scale_ptr;
 
+    if (params.ptr_O_mxfp8 != nullptr && blockIdx.x == 0 && blockIdx.y == 0) {
+      int const heads =
+          params.pack_factor > 1 ? params.num_qo_heads_orig : params.num_qo_heads;
+      fmha_sm100::decode_q8kv4::sm100::common::mxfp8_zero_padding_scales(
+          params.ptr_O_mxfp8_scale, params.mxfp8_rows,
+          heads * params.head_dim_vo / fmha_sm100::decode_q8kv4::sm100::common::kMxfp8Block,
+          threadIdx.x, MaxThreadsPerBlock);
+    }
     if (abs_row >= params.total_qo_len || d >= params.head_dim_vo) return;
 
     int num_splits = warp_uniform(params.num_kv_splits_per_row[abs_row]);
@@ -93,7 +122,10 @@ struct Sm100FmhaReductionKernel {
     // to unpacked (actual_tok, unpacked_head); plain path uses packed strides.
     ElementOut* o_ptr_used;
     int64_t dst_off;
-    if (params.ptr_O_direct != nullptr) {
+    int out_token;
+    int out_head;
+    int out_heads;
+    if (params.pack_factor > 1) {
       int pf            = params.pack_factor;
       int rem_hr        = params.num_qo_heads / params.num_kv_heads;  // packed h_r
       int kv_head       = head_idx / rem_hr;
@@ -106,22 +138,38 @@ struct Sm100FmhaReductionKernel {
               + (int64_t)unpacked_head * params.head_dim_vo
               + d;
       o_ptr_used = params.ptr_O_direct;
+      out_token = actual_tok;
+      out_head = unpacked_head;
+      out_heads = params.num_qo_heads_orig;
     } else {
       dst_off = (int64_t)abs_row * params.stride_o_n
               + (int64_t)head_idx * params.stride_o_h
               + d;
       o_ptr_used = params.ptr_O;
+      out_token = abs_row;
+      out_head = head_idx;
+      out_heads = params.num_qo_heads;
     }
+    // Uniform across the block: every exit below stores, so the MXFP8 warps stay converged.
+    auto store = [&](ElementOut value) {
+      if (o_ptr_used != nullptr) {
+        o_ptr_used[dst_off] = value;
+      }
+      if (params.ptr_O_mxfp8 != nullptr) {
+        store_mxfp8(params, value, out_token, out_head * params.head_dim_vo + d,
+                    out_heads * params.head_dim_vo);
+      }
+    };
 
     // Fast path: single split — just scale and copy, no merge needed
     if (num_splits == 1) {
       int stats_base = warp_uniform(abs_row * params.num_qo_heads + head_idx);
       float lse = params.ptr_lse[stats_base];
       if (lse == -INFINITY) {
-        o_ptr_used[dst_off] = ElementOut(0.f);
+        store(ElementOut(0.f));
       } else {
         float o_s = static_cast<float>(params.ptr_O_partial[partial_off]);
-        o_ptr_used[dst_off] = ElementOut(o_s * inv_scale_o);
+        store(ElementOut(o_s * inv_scale_o));
       }
       return;
     }
@@ -183,12 +231,12 @@ struct Sm100FmhaReductionKernel {
     }
 
     if (running_w == 0.f) {
-      o_ptr_used[dst_off] = ElementOut(0.f);
+      store(ElementOut(0.f));
       return;
     }
 
     float inv_w = warp_uniform(1.f / running_w);
-    o_ptr_used[dst_off] = ElementOut(running_o * inv_w * inv_scale_o);
+    store(ElementOut(running_o * inv_w * inv_scale_o));
   }
 };
 
@@ -211,7 +259,8 @@ launch_fmha_reduction(const ElementPartial *ptr_O_partial, ElementOut *ptr_O, co
                       int total_qo_len, int num_qo_heads, int head_dim_vo, int stride_o_n,
                       int stride_o_h, int stride_partial_n, int stride_partial_h,
                       ElementOut *ptr_O_direct, int num_qo_heads_orig, int num_kv_heads,
-                      int pack_factor, cudaStream_t stream) {
+                      int pack_factor, uint8_t *ptr_O_mxfp8, uint8_t *ptr_O_mxfp8_scale,
+                      int mxfp8_rows, cudaStream_t stream) {
   if (total_qo_len <= 0) return cudaSuccess;
   using ReductionKernel =
       cutlass::fmha::kernel::Sm100FmhaReductionKernel<ElementPartial, ElementOut>;
@@ -220,6 +269,9 @@ launch_fmha_reduction(const ElementPartial *ptr_O_partial, ElementOut *ptr_O, co
       inv_scale_o,       num_kv_splits, total_qo_len,     num_qo_heads,          head_dim_vo,
       stride_o_n,        stride_o_h,    stride_partial_n, stride_partial_h,      ptr_O_direct,
       num_qo_heads_orig, num_kv_heads,  pack_factor,      k_global_scale,        v_global_scale};
+  params.ptr_O_mxfp8 = ptr_O_mxfp8;
+  params.ptr_O_mxfp8_scale = ptr_O_mxfp8_scale;
+  params.mxfp8_rows = mxfp8_rows;
   dim3 grid = ReductionKernel::get_grid_shape(params);
   dim3 block = ReductionKernel::get_block_shape();
   fmha_reduction_kernel<ElementPartial, ElementOut><<<grid, block, 0, stream>>>(params);

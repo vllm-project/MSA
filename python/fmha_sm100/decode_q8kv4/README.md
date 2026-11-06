@@ -60,6 +60,17 @@ serves every layer of a step. `run_decode` takes the tensors per call and is all
 (`plan(topk_indices, page_table, seq_lens, ...)` then `run(q, (k, v), kv_cache_sf=...)`) for
 callers that keep them together; its `run` accepts a `topk_indices` override.
 
+### MXFP8 output
+
+`run_decode(..., out_mxfp8=(data, scale))`, the wrapper's `run` and `fmha_sm100(...)` write the
+output as MXFP8 for an MXFP8 GEMM, so it needs no separate quantize kernel: E4M3 `data`
+`[rows, Hq * 128]` or `[rows, Hq, 128]`, and `scale`, a flat 16-byte aligned uint8 buffer of at
+least `round_up(rows, 128) * Hq * 4` UE8M0 scales in FlashInfer's 128x4 swizzled layout. The bytes
+equal `mxfp8_quantize(out.view(rows, -1), is_sf_swizzled_layout=True)` of the BF16 output, padding
+rows included. Without `out`, the BF16 output is not written and `None` is returned; with both,
+both are written. MXFP8 output is its own JIT variant, so BF16 callers run a kernel without its
+epilogue; `warmup(..., decode_output_mxfp8=True)` builds it ahead of time.
+
 ## Data contract
 
 - `q`: `[B * q_len_per_req, Hq, 128]` E4M3, the `q_len_per_req` tokens of a request last in its

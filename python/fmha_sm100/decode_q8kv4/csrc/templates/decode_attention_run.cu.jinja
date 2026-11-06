@@ -26,7 +26,8 @@ void FMHAVariantRun_{{ variant_name }}(
     ffi::TensorView v_scale, ffi::TensorView k_global_scale, ffi::TensorView v_global_scale,
     int64_t pack_factor, int64_t q_tokens_per_batch, bool qo_len_uniform,
     Optional<ffi::TensorView> maybe_kv_split_count, Optional<ffi::TensorView> maybe_merge_counter,
-    int64_t merge_item_base, int64_t stream_ptr) {
+    int64_t merge_item_base, Optional<ffi::TensorView> maybe_o_mxfp8,
+    Optional<ffi::TensorView> maybe_o_mxfp8_scale, int64_t stream_ptr) {
   bool is_paged = maybe_kv_indices.has_value();
   int head_dim_qk = q.size(2);
   int head_dim_vo = head_dim_qk;
@@ -132,7 +133,16 @@ void FMHAVariantRun_{{ variant_name }}(
 
       params.tma_direct_o_enabled = qo_len_uniform && (params.max_qo_len > 0);
       params.total_qo_len_orig = static_cast<int>(maybe_o.value().size(0));
+    } else if (!maybe_o.has_value()) {
+      // MXFP8-only output: the unpacked layout comes from q.
+      params.num_qo_heads_orig = num_qo_heads;
+      params.total_qo_len_orig = static_cast<int>(q.size(0));
     }
+  }
+  if (maybe_o_mxfp8.has_value()) {
+    params.o_mxfp8_ptr = maybe_o_mxfp8.value().data_ptr();
+    params.o_mxfp8_scale_ptr = maybe_o_mxfp8_scale.value().data_ptr();
+    params.o_mxfp8_rows = static_cast<int>(maybe_o_mxfp8.value().size(0));
   }
 
   params.k_scale_ptr = k_scale.data_ptr();

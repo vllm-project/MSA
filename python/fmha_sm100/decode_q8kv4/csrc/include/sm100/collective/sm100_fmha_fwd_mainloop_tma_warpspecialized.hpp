@@ -192,6 +192,9 @@ CUTLASS_DEVICE void run_fwd_mainloop_device(Sm100FmhaFwdKernelParams<Traits> con
                 work_tile.kv_tile_end, work_tile.kv_split_idx, work_tile.kv_split_count);
           }
         }
+        Sm100FmhaCorrectionTmaWarpspecialized<Traits>::commit_staged_o(
+            storage, params, state,
+            (warp_idx - Traits::kCorrectionWarpStart) * cutlass::NumThreadsPerWarp + lane_idx);
       } else if (warp_idx >= Traits::kTransformKvWarpStart &&
                  warp_idx < Traits::kTransformKvWarpStart + Traits::kNumTransformKvWarps) {
         configure_transform_register_budget<Traits>();
@@ -255,6 +258,9 @@ CUTLASS_DEVICE void run_fwd_mainloop_device(Sm100FmhaFwdKernelParams<Traits> con
         Sm100FmhaCorrectionTmaWarpspecialized<Traits>{}.run_tile(
             storage, params, batch_idx, kv_head_idx, q_token_idx, lane_idx,
             warp_idx - Traits::kCorrectionWarpStart, state);
+        Sm100FmhaCorrectionTmaWarpspecialized<Traits>::commit_staged_o(
+            storage, params, state,
+            (warp_idx - Traits::kCorrectionWarpStart) * cutlass::NumThreadsPerWarp + lane_idx);
       } else if (warp_idx >= Traits::kTransformKvWarpStart &&
                  warp_idx < Traits::kTransformKvWarpStart + Traits::kNumTransformKvWarps) {
         configure_transform_register_budget<Traits>();
@@ -377,6 +383,9 @@ CUTLASS_DEVICE void run_fwd_mainloop_device(Sm100FmhaFwdKernelParams<Traits> con
           work_tile_info = cute::get<0>(next_work);
           advance_scheduler_consumer(work_id_consumer_state, cute::get<1>(next_work));
         } while (work_tile_info.is_valid_tile);
+        Sm100FmhaCorrectionTmaWarpspecialized<Traits>::commit_staged_o(
+            storage, params, state,
+            (warp_idx - Traits::kCorrectionWarpStart) * cutlass::NumThreadsPerWarp + lane_idx);
       } else if (warp_idx >= Traits::kTransformKvWarpStart &&
                  warp_idx < Traits::kTransformKvWarpStart + Traits::kNumTransformKvWarps) {
         configure_transform_register_budget<Traits>();

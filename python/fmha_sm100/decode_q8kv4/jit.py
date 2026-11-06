@@ -161,7 +161,9 @@ def _recipe(name: str, nvcc_flags: str, templates=(), **key) -> _jit_cache.Recip
     )
 
 
-def _nvcc_flags(dequant_mode: str, arch: str, block_scale_shift: int = 0) -> str:
+def _nvcc_flags(
+    dequant_mode: str, arch: str, block_scale_shift: int = 0, output_mxfp8: bool = False
+) -> str:
     include_dirs = [
         _SM100_INCLUDE,
         _SM100_INCLUDE / "common",
@@ -199,6 +201,7 @@ def _nvcc_flags(dequant_mode: str, arch: str, block_scale_shift: int = 0) -> str
         # min-blocks hint; the other targets do not and keep it (see the forward decode kernel).
         f"-DMINIMAX_MSA_Q8KV4_MIN_BLOCKS_HINT={0 if arch == '107a' else 1}",
         f"-DMINIMAX_MSA_Q8KV4_BLOCK_SCALE_SHIFT={block_scale_shift}",
+        f"-DMINIMAX_MSA_Q8KV4_OUTPUT_MXFP8={int(output_mxfp8)}",
         "-Xptxas",
         "-O3",
         "-Xcompiler",
@@ -232,6 +235,7 @@ def _write_ninja(
     dequant_mode: str,
     arch: str,
     block_scale_shift: int = 0,
+    output_mxfp8: bool = False,
 ) -> None:
     nvcc = _cuda_home() / "bin/nvcc"
     objects = [cache_dir / f"source_{index}.o" for index in range(len(sources))]
@@ -242,7 +246,7 @@ def _write_ninja(
     content = f"""ninja_required_version = 1.5
 
 nvcc = {nvcc}
-nvcc_flags = {_nvcc_flags(dequant_mode, arch, block_scale_shift)}
+nvcc_flags = {_nvcc_flags(dequant_mode, arch, block_scale_shift, output_mxfp8)}
 
 {_NINJA_RULES}
 {builds}
@@ -261,10 +265,12 @@ class JitSpec:
     target_arch: str
     gqa_ratio: int = 16
     block_scale_shift: int = 0
+    output_mxfp8: bool = False
 
     @property
     def _component(self) -> str:
-        return f"{self.variant_name}_gqa{self.gqa_ratio}_shift{self.block_scale_shift}"
+        suffix = "_mxfp8" if self.output_mxfp8 else ""
+        return f"{self.variant_name}_gqa{self.gqa_ratio}_shift{self.block_scale_shift}{suffix}"
 
     @property
     def uri(self) -> str:
@@ -290,7 +296,9 @@ class JitSpec:
     def recipe(self) -> _jit_cache.Recipe:
         return _recipe(
             self.uri,
-            _nvcc_flags(self.dequant_mode, self.target_arch, self.block_scale_shift),
+            _nvcc_flags(
+                self.dequant_mode, self.target_arch, self.block_scale_shift, self.output_mxfp8
+            ),
             templates=(
                 _TEMPLATES / "decode_attention_inst.cu.jinja",
                 _TEMPLATES / "decode_attention_run.cu.jinja",
@@ -327,6 +335,7 @@ class JitSpec:
             self.dequant_mode,
             self.target_arch,
             self.block_scale_shift,
+            self.output_mxfp8,
         )
         _run_ninja(cache_dir, f"{self.variant_name} JIT module")
         return so_path
@@ -339,6 +348,7 @@ def gen_jit_spec(
     gqa_ratio: int = 16,
     device=None,
     block_scale_shift: int = 0,
+    output_mxfp8: bool = False,
 ) -> JitSpec:
     if not 1 <= int(topk) <= MAX_TOPK:
         raise ValueError(f"Q8KV4 decode attention requires 1 <= TopK <= {MAX_TOPK}, got {topk}")
@@ -356,6 +366,7 @@ def gen_jit_spec(
         arch,
         gqa_ratio,
         int(block_scale_shift),
+        bool(output_mxfp8),
     )
 
 
@@ -380,6 +391,7 @@ class _VariantManager:
         gqa_ratio: int = 16,
         device=None,
         block_scale_shift: int = 0,
+        output_mxfp8: bool = False,
     ) -> _VariantWrapper:
         spec = gen_jit_spec(
             topk=topk,
@@ -387,6 +399,7 @@ class _VariantManager:
             gqa_ratio=gqa_ratio,
             device=device,
             block_scale_shift=block_scale_shift,
+            output_mxfp8=output_mxfp8,
         )
         cached = self._loaded.get(spec.uri)
         if cached is not None:
@@ -411,6 +424,7 @@ def get_fmha_fwd_variant(
     gqa_ratio: int = 16,
     device=None,
     block_scale_shift: int = 0,
+    output_mxfp8: bool = False,
 ):
     return _variant_manager.get(
         topk=topk,
@@ -418,6 +432,7 @@ def get_fmha_fwd_variant(
         gqa_ratio=gqa_ratio,
         device=device,
         block_scale_shift=block_scale_shift,
+        output_mxfp8=output_mxfp8,
     )
 
 

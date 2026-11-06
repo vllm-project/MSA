@@ -29,6 +29,11 @@ template <int HeadGroup = 16> struct Sm100FmhaQ8Kv4BaseTraits {
   static constexpr int kBlockScaleShift = MINIMAX_MSA_Q8KV4_BLOCK_SCALE_SHIFT;
   static_assert(kBlockScaleShift >= 0 && kBlockScaleShift <= 7,
                 "the block-scale shift is an E4M3 exponent offset.");
+#ifndef MINIMAX_MSA_Q8KV4_OUTPUT_MXFP8
+#error "The Q8KV4 JIT must define MINIMAX_MSA_Q8KV4_OUTPUT_MXFP8"
+#endif
+  // A separate variant, so a BF16-only caller runs a kernel without the MXFP8 epilogue.
+  static constexpr bool kOutputMxfp8 = MINIMAX_MSA_Q8KV4_OUTPUT_MXFP8 != 0;
 
   static constexpr int kNumThreads = 512;
   static constexpr int kNumWarps = kNumThreads / cutlass::NumThreadsPerWarp;
