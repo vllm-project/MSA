@@ -19,7 +19,7 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import arith, llvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync
 from cutlass.cute.typing import Float16, Float32, Int32, Int64
 from cutlass.cutlass_dsl import BaseDSL, T, dsl_user_op
@@ -128,25 +128,35 @@ def _e2m1x8_f16x2_scaled_to_e4m3x8(
 
 
 @dsl_user_op
-def _e2m1x8_f16x2_scaled_to_f16x8(
-    packed: Int32, scale_f16x2: Int32, *, loc=None, ip=None
+def _e2m1x8_f16_half_scaled_to_f16x8(
+    packed: Int32, scale_pair: Int32, half: int, *, loc=None, ip=None
 ) -> tuple[Int32, Int32, Int32, Int32]:
-    """Eight E2M1 values times an f16x2 block scale, kept as four f16x2 words (exact)."""
+    """Eight E2M1 values times the f16 scale in half ``half`` of an f16x2 pair, kept as four
+    f16x2 words (exact).
 
+    The broadcast {s, s} folds into the multiplies' .H0_H0 / .H1_H1 operand selector, so a
+    pair of scales needs one conversion and no byte permute.
+    """
+
+    broadcast = "{sl, sl}" if half == 0 else "{sh, sh}"
     out = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
-        [Int32(packed).ir_value(loc=loc, ip=ip), Int32(scale_f16x2).ir_value(loc=loc, ip=ip)],
+        [Int32(packed).ir_value(loc=loc, ip=ip), Int32(scale_pair).ir_value(loc=loc, ip=ip)],
         "{\n\t"
         ".reg .b8 byte0, byte1, byte2, byte3;\n\t"
+        ".reg .b16 sl, sh;\n\t"
+        ".reg .b32 sf;\n\t"
+        "mov.b32 {sl, sh}, $5;\n\t"
+        f"mov.b32 sf, {broadcast};\n\t"
         "mov.b32 {byte0, byte1, byte2, byte3}, $4;\n\t"
         "cvt.rn.f16x2.e2m1x2 $0, byte0;\n\t"
         "cvt.rn.f16x2.e2m1x2 $1, byte1;\n\t"
         "cvt.rn.f16x2.e2m1x2 $2, byte2;\n\t"
         "cvt.rn.f16x2.e2m1x2 $3, byte3;\n\t"
-        "mul.rn.f16x2 $0, $0, $5;\n\t"
-        "mul.rn.f16x2 $1, $1, $5;\n\t"
-        "mul.rn.f16x2 $2, $2, $5;\n\t"
-        "mul.rn.f16x2 $3, $3, $5;\n\t"
+        "mul.rn.f16x2 $0, $0, sf;\n\t"
+        "mul.rn.f16x2 $1, $1, sf;\n\t"
+        "mul.rn.f16x2 $2, $2, sf;\n\t"
+        "mul.rn.f16x2 $3, $3, sf;\n\t"
         "}\n",
         "=r,=r,=r,=r,r,r",
         has_side_effects=False,
@@ -178,6 +188,50 @@ def _e4m3x4_to_f16x4(word: Int32, *, loc=None, ip=None) -> tuple[Int32, Int32]:
         Int32(llvm.extractvalue(T.i32(), out, [0], loc=loc, ip=ip)),
         Int32(llvm.extractvalue(T.i32(), out, [1], loc=loc, ip=ip)),
     )
+
+
+@dsl_user_op
+def _select_f32(pred, a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    """``pred ? a : b`` without a branch."""
+    return Float32(
+        arith.select(
+            pred.ir_value(loc=loc, ip=ip), a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip),
+            loc=loc, ip=ip,
+        )
+    )
+
+
+def _reduce_scatter_max_dsl(loaded, lane_idx: Int32) -> Float32:
+    """Max over the page's 32 rows of this warp, by a 3-level shuffle reduce-scatter.
+
+    ``loaded`` are the 32 values of one ``Ld16x256b`` read (two 16-lane loads, in the copy's register order). The result is the max for query
+    ``8 * (g // 2) + 2 * (lane % 4) + g % 2``, ``g = lane // 4``. Plain Python loops, unrolled at trace time.
+    """
+    f = list(loaded)
+    # 4-row max per slot s = 2 * rep + j: rows {l/4, l/4+8} of both loads, column 8 rep + 2 (l%4) + j
+    m = []
+    for rep in range(4):
+        for j in range(2):
+            a0, a1 = 4 * rep + j, 4 * rep + 2 + j
+            m.append(
+                cute.arch.fmax(cute.arch.fmax(cute.arch.fmax(f[a0], f[a1]), f[16 + a0]), f[16 + a1])
+            )
+
+    def level(src, count, bit):
+        # the lane with `bit` set keeps the upper half of its slots and sends the lower half
+        pred = (lane_idx & Int32(bit)) != Int32(0)
+        out = []
+        for k in range(count):
+            snd = _select_f32(pred, src[k], src[k + count])
+            kp = _select_f32(pred, src[k + count], src[k])
+            rcv = cute.arch.shuffle_sync_bfly(snd, offset=bit, mask=-1, mask_and_clamp=31)
+            out.append(cute.arch.fmax(kp, rcv))
+        return out
+
+    n = level(m, 4, 16)   # 8 slots -> 4   (lane bit 4)
+    o = level(n, 2, 8)    # 4 slots -> 2   (lane bit 3)
+    r = level(o, 1, 4)    # 2 slots -> 1   (lane bit 2)
+    return r[0]
 
 
 class _NamedBarrier(enum.IntEnum):
@@ -256,6 +310,10 @@ class Q8KV4DecodeIndexerSm100:
     k_dtype = cutlass.Float8E4M3FN
     k_per_tmem_col = e4m3_per_tmem_col
     dequant_store_halves = 1
+    # Score warps read the accumulator as 16x256b fragments (4 rows per thread), take the row
+    # max in registers and reduce-scatter the 8 row groups with shuffles, instead of 32 CREDUX
+    # + 32 UR->R moves. h4 on SM107 only.
+    use_xpose_reduce = False
 
     def __init__(self, *, sm_count: int, num_heads: int) -> None:
         if sm_count <= 0:
@@ -311,6 +369,7 @@ class Q8KV4DecodeIndexerSm100:
                 self.raw_stages = 6
         self.grid_ctas = sm_count * self.target_ctas_per_sm
         self.use_qmul4 = _HAS_QMUL4 and not is_rubin
+        self.use_xpose_reduce = is_rubin and self.use_fp16_mma and num_heads == 4
         # SM107's FP16 dequant path needs more registers; without a register
         # bound only one CTA fits per SM there and the grid runs in two waves.
         self.min_blocks_per_mp = self.target_ctas_per_sm if is_rubin else 1
@@ -699,29 +758,47 @@ class Q8KV4DecodeIndexerSm100:
         # The plan writes the scheduler prefix sums just before this launch, so
         # they are read only after the PDL wait. Lane 0 of every warp reads
         # them; a read before the wait could give warps different page counts.
+        # The request holding this CTA's first page: the largest b with prefix[b] <= first page,
+        # by a 32-ary warp search (each lane samples one prefix entry per round). The first
+        # round's samples depend only on the batch, so they load together with the total.
+        search_step = (batch_size + Int32(self.threads_per_warp - 1)) // Int32(self.threads_per_warp)
+        search_index = lane_idx * search_step
+        search_sample = Int32(0x7FFFFFFF)
+        if search_index < batch_size:
+            search_sample = mScheduler[search_index]
         total_pages = Int32(0)
         if lane_idx == Int32(0):
             total_pages = mScheduler[batch_size]
         total_pages = cute.arch.shuffle_sync(total_pages, 0)
-        pages_per_worker = (total_pages + Int32(self.grid_ctas - 1)) // Int32(self.grid_ctas)
+        # Even split: every CTA gets floor(total / grid) pages and the first total % grid
+        # CTAs one more, so the CTAs that share an SM carry equal work (ceil-sized blocks left
+        # the trailing CTAs empty and some SMs with three busy CTAs, others with two).
+        pages_per_worker = total_pages // Int32(self.grid_ctas)
+        extra_pages = total_pages - pages_per_worker * Int32(self.grid_ctas)
         global_page_begin = worker_idx * pages_per_worker
-        num_pages = Int32(0)
-        if global_page_begin < total_pages:
-            global_page_end = global_page_begin + pages_per_worker
-            if global_page_end > total_pages:  # noqa: PLR1730
-                global_page_end = total_pages
-            num_pages = global_page_end - global_page_begin
+        num_pages = pages_per_worker
+        if worker_idx < extra_pages:
+            global_page_begin += worker_idx
+            num_pages += Int32(1)
+        else:
+            global_page_begin += extra_pages
 
         batch_idx = Int32(0)
-        if lane_idx == Int32(0):
-            batch_hi = batch_size
-            while batch_idx < batch_hi:
-                batch_mid = (batch_idx + batch_hi) // Int32(2)
-                if mScheduler[batch_mid + 1] <= global_page_begin:
-                    batch_idx = batch_mid + Int32(1)
-                else:
-                    batch_hi = batch_mid
-        batch_idx = cute.arch.shuffle_sync(batch_idx, 0)
+        search_upper = batch_size
+        while search_upper - batch_idx > Int32(1):
+            # Lane 0's sample is prefix[batch_idx] <= global_page_begin, so the ballot is nonzero.
+            below = cute.arch.vote_ballot_sync(search_sample <= global_page_begin)
+            last = Int32(31) - Int32(cute.arch.clz(below))
+            batch_idx = batch_idx + last * search_step
+            if batch_idx + search_step < search_upper:  # noqa: PLR1730
+                search_upper = batch_idx + search_step
+            search_step = (search_upper - batch_idx + Int32(self.threads_per_warp - 1)) // Int32(
+                self.threads_per_warp
+            )
+            search_index = batch_idx + lane_idx * search_step
+            search_sample = Int32(0x7FFFFFFF)
+            if search_index < search_upper:
+                search_sample = mScheduler[search_index]
         logical_page_begin = global_page_begin - mScheduler[batch_idx]
         thr_mma = tiled_mma.get_slice(0)
         tmem_ptr = tmem.retrieve_ptr(Float32)
@@ -795,6 +872,17 @@ class Q8KV4DecodeIndexerSm100:
         cScores = cute.make_identity_tensor((self.m_tile, self.n_tile))
         tCcScores = thr_mma.partition_C(cScores)
         tTR_cScores = thr_tmem_copy.partition_D(tCcScores)
+        if cutlass.const_expr(self.use_xpose_reduce):
+            # B: the same accumulator read as 16x256b (two 16-lane loads per warp, x4 = 32 columns):
+            # register k of a load holds row lane // 4 + 8 * ((k // 2) % 2),
+            # column 8 * (k // 4) + 2 * (lane % 4) + k % 2.
+            xpose_load_atom = cute.make_copy_atom(tcgen05.Ld16x256bOp(tcgen05.Repetition.x4), Float32)
+            xpose_tiled_copy = tcgen05.make_tmem_copy(
+                xpose_load_atom, tCtAcc_staged[(None, None, None, 0)]
+            )
+            thr_xpose_copy = xpose_tiled_copy.get_slice(copy_tidx)
+            tXp_tAcc_staged = thr_xpose_copy.partition_S(tCtAcc_staged)
+            tXp_cScores = thr_xpose_copy.partition_D(tCcScores)
 
         # Small steps leave most CTAs without pages: on SM107 those go straight
         # to the final barrier and TMEM free (num_pages >= 0 elsewhere).
@@ -986,40 +1074,113 @@ class Q8KV4DecodeIndexerSm100:
                     rScores.iterator,
                     cute.make_layout(self.num_queries),
                 )
+                # Lane 0 stores the warp's partial maxima as 16-byte vectors: one
+                # (stage, warp) row of sPartialMax is num_queries contiguous floats.
+                rPartialMax = cute.make_rmem_tensor((self.num_queries,), Float32)
+                partial_vec = 4
+                partial_store = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=partial_vec * 32
+                )
+                partial_memspace = sPartialMax.iterator.memspace
+                partial_row_base = sPartialMax.iterator.toint() + score_warp_idx * Int32(
+                    self.num_queries * 4
+                )
+                if cutlass.const_expr(self.use_xpose_reduce):
+                    # The 32 loaded values of a page, and the query this lane owns after the
+                    # reduce-scatter (g = lane // 4).
+                    rXpose = cute.make_rmem_tensor(tXp_cScores.shape, Float32)
+                    rXposeFlat = cute.make_tensor(rXpose.iterator, cute.make_layout(32))
+                    xpose_group = lane_idx // Int32(4)
+                    xpose_query = (
+                        Int32(8) * (xpose_group // Int32(2))
+                        + Int32(2) * (lane_idx % Int32(4))
+                        + (xpose_group % Int32(2))
+                    )
                 current_batch = batch_idx
                 logical_page = logical_page_begin
                 global_page = global_page_begin
                 last_global_page = global_page_begin + num_pages - Int32(1)
                 pages_remaining = num_pages
+                # Lane j caches prefix[batch_idx + j + 1] and seq_lens[batch_idx + j] for the
+                # CTA's first 32 requests, so request boundaries take a ballot and shuffles
+                # rather than dependent global loads (past the window: the global loads).
+                window_batch = batch_idx + lane_idx
+                window_prefix_end = Int32(0x7FFFFFFF)
+                window_seq_len = Int32(0)
+                if window_batch < batch_size:
+                    window_prefix_end = mScheduler[window_batch + 1]
+                    window_seq_len = mSeqLens[window_batch]
                 local_block = Int32(0)
+                seq_len = cute.arch.shuffle_sync(window_seq_len, 0)
                 if (
                     num_pages > Int32(0)
                     and score_warp_idx == Int32(0)
                     and lane_idx < Int32(self.num_queries)
                 ):
-                    seq_len = mSeqLens[current_batch]
                     query_position = (
                         seq_len - Int32(self.query_length) + lane_idx // Int32(self.num_heads)
                     )
                     local_block = query_position // Int32(self.page_size)
                 while pages_remaining > Int32(0):
-                    segment_pages = mScheduler[current_batch + 1] - global_page
+                    window_offset = current_batch - batch_idx
+                    segment_end = cute.arch.shuffle_sync(window_prefix_end, window_offset)
+                    if window_offset >= Int32(self.threads_per_warp):
+                        segment_end = mScheduler[current_batch + 1]
+                    segment_pages = segment_end - global_page
                     if segment_pages > pages_remaining:  # noqa: PLR1730
                         segment_pages = pages_remaining
                     for _ in cutlass.range(segment_pages, unroll=1):
-                        partial_stage = global_page % Int32(2)
+                        partial_stage = global_page & Int32(1)
                         acc_full = acc_consumer.wait_and_advance()
-                        cute.copy(
-                            tmem_tiled_copy,
-                            tTR_tAcc_staged[(None, None, None, None, acc_full.index)],
-                            rScores,
-                        )
-                        cute.arch.fence_view_async_tmem_load()
-                        for query_idx in cutlass.range_constexpr(self.num_queries):
-                            partial_max = cute.arch.warp_redux_sync(rScoresFlat[query_idx], "fmax")
-                            if lane_idx == Int32(0):
-                                sPartialMax[partial_stage, score_warp_idx, query_idx] = partial_max
-                        acc_full.release()
+                        if cutlass.const_expr(self.use_xpose_reduce):
+                            cute.copy(
+                                xpose_tiled_copy,
+                                tXp_tAcc_staged[(None, None, None, None, acc_full.index)],
+                                rXpose,
+                            )
+                            cute.arch.fence_view_async_tmem_load()
+                            # The values are in registers: hand the stage back right away.
+                            acc_full.release()
+                            sPartialMax[partial_stage, score_warp_idx, xpose_query] = (
+                                _reduce_scatter_max_dsl([rXposeFlat[i] for i in range(32)], lane_idx)
+                            )
+                        else:
+                            cute.copy(
+                                tmem_tiled_copy,
+                                tTR_tAcc_staged[(None, None, None, None, acc_full.index)],
+                                rScores,
+                            )
+                            cute.arch.fence_view_async_tmem_load()
+                            # The scores are in registers: hand the accumulator stage back to the
+                            # MMA warp before reducing them.
+                            acc_full.release()
+                            for query_idx in cutlass.range_constexpr(self.num_queries):
+                                rPartialMax[query_idx] = cute.arch.warp_redux_sync(
+                                    rScoresFlat[query_idx], "fmax"
+                                )
+                            # Every lane holds the same 32 maxima (warp_redux_sync broadcasts), so all
+                            # lanes store them: same-address stores in one instruction write once, and
+                            # the lane-0 branch and its reconvergence go away.
+                            partial_row = partial_row_base + partial_stage * Int32(
+                                self.score_warps * self.num_queries * 4
+                            )
+                            for vec in cutlass.range_constexpr(self.num_queries // partial_vec):
+                                cute.copy(
+                                    partial_store,
+                                    cute.make_tensor(
+                                        rPartialMax.iterator + vec * partial_vec,
+                                        cute.make_layout(partial_vec),
+                                    ),
+                                    cute.make_tensor(
+                                        cute.make_ptr(
+                                            Float32,
+                                            partial_row + Int32(vec * partial_vec * 4),
+                                            mem_space=partial_memspace,
+                                            assumed_align=partial_vec * 4,
+                                        ),
+                                        cute.make_layout(partial_vec),
+                                    ),
+                                )
                         score_barrier.arrive_and_wait()
 
                         if score_warp_idx == Int32(0) and lane_idx < Int32(self.num_queries):
@@ -1038,14 +1199,33 @@ class Q8KV4DecodeIndexerSm100:
                         global_page += Int32(1)
                         logical_page += Int32(1)
                     pages_remaining -= segment_pages
-                    while (
-                        current_batch < batch_size - Int32(1)
-                        and mScheduler[current_batch + 1] <= global_page
-                    ):
-                        current_batch += Int32(1)
-                        logical_page = global_page - mScheduler[current_batch]
+                    # Requests of the window that end at or before global_page are done; the
+                    # prefix sums are monotonic, so their count is the next request's offset.
+                    window_done = Int32(
+                        cute.arch.popc(
+                            cute.arch.vote_ballot_sync(window_prefix_end <= global_page)
+                        )
+                    )
+                    if window_done < Int32(self.threads_per_warp):
+                        next_batch = batch_idx + window_done
+                        if next_batch > batch_size - Int32(1):  # noqa: PLR1730
+                            next_batch = batch_size - Int32(1)
+                        if next_batch != current_batch:
+                            current_batch = next_batch
+                            logical_page = global_page - cute.arch.shuffle_sync(
+                                window_prefix_end, window_done - Int32(1)
+                            )
+                    else:
+                        while (
+                            current_batch < batch_size - Int32(1)
+                            and mScheduler[current_batch + 1] <= global_page
+                        ):
+                            current_batch += Int32(1)
+                            logical_page = global_page - mScheduler[current_batch]
+                    seq_len = cute.arch.shuffle_sync(window_seq_len, current_batch - batch_idx)
                     if score_warp_idx == Int32(0) and lane_idx < Int32(self.num_queries):
-                        seq_len = mSeqLens[current_batch]
+                        if current_batch - batch_idx >= Int32(self.threads_per_warp):
+                            seq_len = mSeqLens[current_batch]
                         query_position = (
                             seq_len - Int32(self.query_length) + lane_idx // Int32(self.num_heads)
                         )
@@ -1209,7 +1389,13 @@ class Q8KV4DecodeIndexerSm100:
                 assumed_align=self.scales_per_token,
             )
             cute.copy(scale_load, cute.make_tensor(scale_ptr, rScales.layout), rScales)
-            if cutlass.const_expr(self.hoist_scale_cvt):
+            if cutlass.const_expr(self.use_fp16_mma):
+                # One conversion per two scales: pair p holds groups 2p (low half) and 2p + 1.
+                for scale_word in cutlass.range_constexpr(self.scales_per_token // word_bytes):
+                    lo_pair, hi_pair = _e4m3x4_to_f16x4(rScales[scale_word])
+                    rScalesF16x2[2 * scale_word] = lo_pair
+                    rScalesF16x2[2 * scale_word + 1] = hi_pair
+            elif cutlass.const_expr(self.hoist_scale_cvt):
                 for group in cutlass.range_constexpr(self.scales_per_token):
                     rScalesF16x2[group] = _e4m3_scale_to_f16x2(
                         rScales[group // word_bytes], group % word_bytes
@@ -1221,8 +1407,8 @@ class Q8KV4DecodeIndexerSm100:
                     group = word * values_per_word // self.scale_group
                     scale = rScales[group // word_bytes] >> Int32(8 * (group % word_bytes))
                     if cutlass.const_expr(self.use_fp16_mma):
-                        h0, h1, h2, h3 = _e2m1x8_f16x2_scaled_to_f16x8(
-                            rPacked[word], rScalesF16x2[group]
+                        h0, h1, h2, h3 = _e2m1x8_f16_half_scaled_to_f16x8(
+                            rPacked[word], rScalesF16x2[group // 2], group % 2
                         )
                         rK_words[4 * local_word] = h0
                         rK_words[4 * local_word + 1] = h1
