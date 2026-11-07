@@ -45,6 +45,7 @@ from src.sm100.q8kv8_indexer_decode import Q8KV8DecodeIndexerSm100
 from src.sm100.q8kv8_indexer_prefill import Q8KV8PrefillIndexerSm100
 from src.sm100.q8kv8_indexer_prefill_plan import (
     Q8KV8PrefillIndexerPlanBuild,
+    Q8KV8PrefillIndexerPlanFinalize,
     Q8KV8PrefillIndexerPlanReset,
 )
 
@@ -63,10 +64,20 @@ _TMA_ALIGNMENT = 16
 # seq_lens[lo:hi] only need int32 alignment.
 _SCALAR_ALIGNMENT = torch.int32.itemsize
 _PREFILL_TASK_CAPACITY_PAGE_CHUNK = 4
-# Target tasks per persistent cluster: clusters walk the largest-first task order
-# round-robin, so several smaller tasks per cluster even out the causal page
-# counts across SMs.
+# Target tasks per persistent cluster: the clusters claim tasks largest-first
+# from a shared queue, so several smaller tasks per cluster even out the causal
+# page counts across SMs.
 _PREFILL_TASKS_PER_CLUSTER = 4
+# A pair task carries a fixed cost (two Q tiles, pipeline refill), so it gets at
+# least this many pages of MMA work ...
+_PREFILL_PAIR_MIN_PAGE_CHUNK = 32
+# ... unless the chunk has to shrink (in multiples of the alignment) for the
+# tasks to cover every cluster at least this many times.
+_PREFILL_MIN_TASKS_PER_CLUSTER = 4
+# Chunk starts are TMA score-store coordinates (16-byte aligned columns) and the
+# kernel stages scores in 8-page groups, so chunk boundaries stay on multiples
+# of 8 pages.
+_PREFILL_PAGE_CHUNK_ALIGNMENT = 8
 _SUPPORTED_CAPABILITIES = frozenset({(10, 0), (10, 3), (10, 7)})
 # Kernels plus this interface, which fixes the compiled argument alignments.
 _CODEGEN_SOURCES = (
@@ -270,7 +281,11 @@ def bind_indexer_module_loader(loader) -> None:
 def _check_score_out(
     score_out: torch.Tensor, rows: int, max_pages: int, device: torch.device
 ) -> None:
-    """Validate a caller-owned prefill score buffer: fp32 ``[rows, >= max_pages]``."""
+    """Validate a caller-owned prefill score buffer: fp32 ``[rows, >= max_pages]``.
+
+    The score kernel writes the buffer with TMA bulk stores, so the data pointer
+    and the row pitch must be 16-byte aligned (a pitch that is a multiple of four
+    floats)."""
 
     _check_cuda_tensor(
         score_out, name="score_out", dtype=torch.float32, device=device, contiguous=False
@@ -281,8 +296,12 @@ def _check_score_out(
         )
     if score_out.stride(1) != 1 or score_out.stride(0) < score_out.shape[1]:
         raise ValueError("score_out must keep each row's pages contiguous and rows disjoint")
-    if score_out.data_ptr() % _SCALAR_ALIGNMENT:
-        raise ValueError(f"score_out must be {_SCALAR_ALIGNMENT}-byte aligned")
+    row_pitch_bytes = score_out.stride(0) * score_out.element_size()
+    if score_out.data_ptr() % _TMA_ALIGNMENT or row_pitch_bytes % _TMA_ALIGNMENT:
+        raise ValueError(
+            f"score_out data pointer and row pitch must be {_TMA_ALIGNMENT}-byte aligned "
+            f"(row pitch {row_pitch_bytes} bytes)"
+        )
 
 
 def _topk_select(
@@ -672,6 +691,23 @@ class _PrefillPlanState:
     scores: torch.Tensor
     num_valid_pages: torch.Tensor
     topk_indices: torch.Tensor
+    # Persistent clusters of the score kernel's launch on this device.
+    num_clusters: int
+    # Dynamic task queue: one self-resetting claim counter per plan, and the queue
+    # metadata the score kernel reads at entry (bucket offsets and counts, and the
+    # first wave of decoded descriptors).
+    work_counter: torch.Tensor
+    sched_meta: torch.Tensor
+
+
+def _prefill_num_clusters(device: torch.device) -> int:
+    """Persistent 2-CTA clusters the score kernel launches: one CTA per SM."""
+
+    return (
+        _sm_count(device)
+        * Q8KV8PrefillIndexerSm100.ctas_per_sm
+        // Q8KV8PrefillIndexerSm100.cta_group_size
+    )
 
 
 def _run_prefill_plan(state: _PrefillPlanState) -> None:
@@ -711,6 +747,17 @@ def _run_prefill_plan(state: _PrefillPlanState) -> None:
             options="--enable-tvm-ffi",
         ),
     )
+    finalize_args = (state.task_descriptors, state.task_counts, state.sched_meta)
+    finalize_compiled = _compile_or_load(
+        _cute_kernel_key("q8kv8_indexer_prefill_plan_finalize_sm100", capability, *plan_static),
+        lambda: cute.compile(
+            Q8KV8PrefillIndexerPlanFinalize(),
+            *_cute_arguments((), finalize_args),
+            Int32(state.num_clusters),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        ),
+    )
     reset_compiled(state.task_counts, state.plan_error)
     build_compiled(
         *build_args,
@@ -719,6 +766,7 @@ def _run_prefill_plan(state: _PrefillPlanState) -> None:
         state.num_heads,
         state.max_page_chunk,
     )
+    finalize_compiled(*finalize_args, state.num_clusters)
 
 
 class BatchPrefillIndexerQ8KV8Wrapper:
@@ -765,8 +813,9 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         ``score_out`` optionally replaces the wrapper's score buffer: fp32
         ``[total_q * num_heads, >= ceil(max_seqlen_k / 128)]`` with contiguous
         pages per row; the row pitch may be wider, so a slice of a larger
-        buffer works. Scores are written in place; entries the kernel does not
-        write keep their contents.
+        buffer works, as long as the data pointer and the row pitch are 16-byte
+        aligned. Scores are written in place; entries the kernel does not write
+        keep their contents.
         """
 
         _check_cuda_tensor(cu_seqlens_q, name="cu_seqlens_q", dtype=torch.int32)
@@ -794,28 +843,28 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         total_rows = total_q * self._num_heads
         q_tile_capacity = -(-total_rows // q_tile) + batch - 1
         task_capacity = q_tile_capacity * -(-max_pages // _PREFILL_TASK_CAPACITY_PAGE_CHUNK)
-        # On SM107, cap the planner's page chunk so every Q tile splits into at
-        # most clusters // q_tiles tasks: short-query batches then fill the
-        # machine in one wave instead of leaving most clusters idle. Host-known
+        # Cap the planner's page chunk so every Q-tile pair splits into about
+        # clusters * _PREFILL_TASKS_PER_CLUSTER // pairs tasks: short-query batches
+        # then fill the machine instead of leaving most clusters idle. Host-known
         # upper bounds only (no D2H); long-query batches keep the default chunk.
-        if _require_supported_device(device) == (10, 7):
-            num_clusters = (
-                _sm_count(device)
-                * Q8KV8PrefillIndexerSm100.launch_config((10, 7))[0]
-                // Q8KV8PrefillIndexerSm100.cta_group_size
-            )
-            chunks_per_q_tile = max(
-                1, num_clusters * _PREFILL_TASKS_PER_CLUSTER // q_tile_capacity
-            )
-            max_page_chunk = max(
-                Q8KV8PrefillIndexerPlanBuild.min_page_chunk,
-                min(
-                    Q8KV8PrefillIndexerPlanBuild.large_page_chunk,
-                    -(-max_pages // chunks_per_q_tile),
-                ),
-            )
-        else:
-            max_page_chunk = Q8KV8PrefillIndexerPlanBuild.large_page_chunk
+        num_clusters = _prefill_num_clusters(device)
+        pair_capacity = -(-q_tile_capacity // 2)
+        chunks_per_pair = max(1, num_clusters * _PREFILL_TASKS_PER_CLUSTER // pair_capacity)
+        max_page_chunk = max(
+            _PREFILL_PAIR_MIN_PAGE_CHUNK,
+            min(Q8KV8PrefillIndexerPlanBuild.large_page_chunk, -(-max_pages // chunks_per_pair)),
+        )
+        alignment = _PREFILL_PAGE_CHUNK_ALIGNMENT
+        max_page_chunk = -(-max_page_chunk // alignment) * alignment
+        # Small requests: the pair minimum would leave most clusters idle (two tiles
+        # of 583 pages are 19 pair tasks on 104 clusters). Shrink the chunk until the
+        # tasks cover every cluster _PREFILL_MIN_TASKS_PER_CLUSTER times.
+        min_tasks = num_clusters * _PREFILL_MIN_TASKS_PER_CLUSTER
+        while (
+            max_page_chunk > alignment
+            and pair_capacity * -(-max_pages // max_page_chunk) < min_tasks
+        ):
+            max_page_chunk -= alignment
         if score_out is not None:
             _check_score_out(score_out, total_rows, max_pages, device)
         options = {"device": device}
@@ -852,6 +901,18 @@ class BatchPrefillIndexerQ8KV8Wrapper:
             topk_indices=torch.empty(
                 (total_q, self._num_heads, _TOP_K), dtype=torch.int32, **options
             ),
+            num_clusters=num_clusters,
+            # Zeroed once per plan; every launch's last claim resets it, so graph
+            # replay needs no memset.
+            work_counter=torch.zeros((1,), dtype=torch.int32, **options),
+            sched_meta=torch.empty(
+                (
+                    Q8KV8PrefillIndexerPlanFinalize.meta_header_words
+                    + Q8KV8PrefillIndexerPlanFinalize.meta_task_words * num_clusters,
+                ),
+                dtype=torch.int32,
+                **options,
+            ),
         )
         _run_prefill_plan(self._state)
 
@@ -883,39 +944,36 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         _check_query(q, state.total_q, state.num_heads, device)
         _check_paged_cache(k_cache, dtype=torch.float8_e4m3fn, page_width=_HEAD_DIM, device=device)
         capability = _require_supported_device(device)
-        ctas_per_sm, k_stages, acc_stages = Q8KV8PrefillIndexerSm100.launch_config(capability)
-        num_persistent_clusters = (
-            _sm_count(device) * ctas_per_sm // Q8KV8PrefillIndexerSm100.cta_group_size
-        )
         # Q rows are token * num_heads + head, matching the scores and TopK rows.
         q_rows = q.view(state.total_q * state.num_heads, 1, _HEAD_DIM)
-        metadata = (
-            state.block_table,
-            state.scores,
-            state.task_descriptors,
-            state.task_counts,
+        # The score matrix is a TMA store operand; the rest is scalar-access metadata.
+        metadata = (state.task_descriptors, state.work_counter, state.sched_meta)
+        kernel_args = (
+            *_cute_arguments((q_rows, k_cache), (state.block_table,)),
+            _to_cute_tensor(state.scores, assumed_align=_TMA_ALIGNMENT),
+            *_cute_arguments((), metadata),
         )
         compiled = _compile_or_load(
             _cute_kernel_key(
                 "q8kv8_indexer_prefill_sm100",
                 capability,
-                num_persistent_clusters,
+                state.num_clusters,
                 Q8KV8PrefillIndexerSm100.q_tile,
-                k_stages,
-                acc_stages,
+                Q8KV8PrefillIndexerSm100.k_stages,
+                Q8KV8PrefillIndexerSm100.acc_stages,
             ),
             lambda: cute.compile(
                 Q8KV8PrefillIndexerSm100(
                     compute_capability=capability,
-                    num_persistent_clusters=num_persistent_clusters,
+                    num_persistent_clusters=state.num_clusters,
                 ),
-                *_cute_arguments((q_rows, k_cache), metadata),
+                *kernel_args,
                 Int32(state.num_heads),
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
             ),
         )
-        compiled(q_rows, k_cache, *metadata, state.num_heads)
+        compiled(q_rows, k_cache, state.block_table, state.scores, *metadata, state.num_heads)
         return state.scores
 
     def run(

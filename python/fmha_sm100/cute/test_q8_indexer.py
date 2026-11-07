@@ -891,6 +891,10 @@ PREFILL_CASES = {
     "batch_beyond_32": ([17 + 3 * i for i in range(40)], [128 * (i % 7) + i for i in range(40)]),
     "large_q_tile_chunks": ([16_384], [512]),
     "long_prefix": ([513, 2], [200_000, 131_071]),
+    # More single-tile tasks than clusters: the queue is claimed well past its first wave.
+    "many_short_requests": ([64] * 300, [2048 + 64 * (i % 5) for i in range(300)]),
+    # No request reaches a second page: the plan has no tasks and the kernel only exits.
+    "no_history": ([5, 100, 127], [0, 0, 0]),
 }
 
 
@@ -1085,9 +1089,72 @@ def test_prefill_rejects_invalid_score_out():
         torch.empty((rows, max_pages - 1), device="cuda"),
         torch.empty((max_pages + 1, rows), device="cuda").t(),
         torch.empty((rows, max_pages)),
+        # The score kernel stores by TMA: a row pitch that is not a multiple of 16 bytes ...
+        torch.empty((rows, max_pages + 2), device="cuda")[:, :max_pages],
+        # ... or a data pointer off the 16-byte grid is rejected.
+        torch.empty((rows * 4 + 1,), device="cuda")[1:].view(rows, 4),
     ):
         with pytest.raises((TypeError, ValueError), match="score_out"):
             _plan_prefill(BatchPrefillIndexerQ8KV8Wrapper(), inputs, score_out=bad)
+
+
+@pytest.mark.parametrize("num_heads", (1, 4))
+def test_prefill_few_clusters_match_full_launch(monkeypatch, num_heads):
+    """The task queue gives the same scores from any number of persistent clusters.
+
+    Fewer clusters than tasks wrap the queue many times (claims past the first wave, the
+    sentinel reaching every warp of every cluster); more clusters than tasks leave whole
+    clusters with only the sentinel. Both must match the full-device launch bit for bit."""
+
+    inputs = _make_prefill([3000, 64, 64, 2900], [20_000, 2048, 4096, 300], seed=23, num_heads=num_heads)
+    q, k_cache = inputs["q"], inputs["k"].cache
+    full = BatchPrefillIndexerQ8KV8Wrapper(num_heads=num_heads)
+    _plan_prefill(full, inputs)
+    expected = _run_prefill_scores(full, q, k_cache).clone()
+    torch.testing.assert_close(
+        expected, _prefill_reference(inputs, expected.shape[1]), atol=2e-4, rtol=2e-4, equal_nan=True
+    )
+    sm_count = q8_indexer_interface._sm_count(q.device)
+    for sms in (2, 6, 26, 30, 2 * sm_count):
+        monkeypatch.setattr(q8_indexer_interface, "_sm_count", lambda device, n=sms: n)
+        wrapper = BatchPrefillIndexerQ8KV8Wrapper(num_heads=num_heads)
+        _plan_prefill(wrapper, inputs)
+        assert wrapper._state.num_clusters == sms // 2
+        scores = _timed(f"prefill-{sms}-sms", lambda: _run_prefill_scores(wrapper, q, k_cache))
+        assert torch.equal(scores.nan_to_num(POISON), expected.nan_to_num(POISON))
+        # Graph replay reuses the plan's self-resetting work counter.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            wrapper._run_scores(q, k_cache)
+        for _ in range(3):
+            wrapper._state.scores.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(wrapper._state.scores.nan_to_num(POISON), expected.nan_to_num(POISON))
+
+
+@pytest.mark.parametrize("num_heads", (1, 4))
+def test_prefill_concurrent_streams_do_not_alias(num_heads):
+    """Independent wrappers on two streams match their serial results."""
+
+    inputs = [
+        _make_prefill([700, 3, 90], [128, 0, 4000], seed=seed, num_heads=num_heads) for seed in (41, 42)
+    ]
+    wrappers = [BatchPrefillIndexerQ8KV8Wrapper(num_heads=num_heads) for _ in inputs]
+    serial = []
+    for wrapper, case in zip(wrappers, inputs, strict=True):
+        _plan_prefill(wrapper, case)
+        serial.append(wrapper.run(case["q"], case["k"].cache).clone())
+    streams = [torch.cuda.Stream() for _ in inputs]
+    outputs = [torch.empty_like(result) for result in serial]
+    torch.cuda.synchronize()
+    for _ in range(5):
+        for stream, wrapper, case, out in zip(streams, wrappers, inputs, outputs, strict=True):
+            with torch.cuda.stream(stream):
+                wrapper.run(case["q"], case["k"].cache, out=out)
+    torch.cuda.synchronize()
+    for out, expected in zip(outputs, serial, strict=True):
+        assert torch.equal(out, expected)
 
 
 def test_prefill_compile_is_shape_independent():
