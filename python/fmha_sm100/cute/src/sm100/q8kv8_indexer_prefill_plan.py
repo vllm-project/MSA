@@ -12,7 +12,8 @@ from src.sm100.q8kv8_indexer_prefill import Q8KV8PrefillIndexerSm100
 
 
 class Q8KV8PrefillIndexerPlanReset:
-    """Reset device-resident queue counters and error state."""
+    """Reset device-resident queue counters, the score kernel's claim counter and
+    the error state."""
 
     num_buckets = Q8KV8PrefillIndexerSm100.num_task_buckets
     threads_per_cta = cute.arch.WARP_SIZE
@@ -22,9 +23,10 @@ class Q8KV8PrefillIndexerPlanReset:
         self,
         mTaskCounts: cute.Tensor,
         mPlanError: cute.Tensor,
+        mWorkCounter: cute.Tensor,
         stream: cuda.CUstream = None,
     ) -> None:
-        self.kernel(mTaskCounts, mPlanError).launch(
+        self.kernel(mTaskCounts, mPlanError, mWorkCounter).launch(
             grid=(1, 1, 1),
             block=(self.threads_per_cta, 1, 1),
             stream=stream,
@@ -36,12 +38,14 @@ class Q8KV8PrefillIndexerPlanReset:
         self,
         mTaskCounts: cute.Tensor,
         mPlanError: cute.Tensor,
+        mWorkCounter: cute.Tensor,
     ) -> None:
         lane_idx = cute.arch.lane_idx()
         if lane_idx < cutlass.Int32(self.num_buckets):
             mTaskCounts[lane_idx] = cutlass.Int32(0)
         if lane_idx == cutlass.Int32(0):
             mPlanError[0] = cutlass.Int32(0)
+            mWorkCounter[0] = cutlass.Int32(0)
 
 
 class Q8KV8PrefillIndexerPlanBuild:
