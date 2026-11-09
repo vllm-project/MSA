@@ -37,7 +37,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Int32
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_fake_tensor
 
 from src.common.aot_cache import save_aot, try_load_aot
 from src.sm100.q8kv4_indexer_decode import Q8KV4DecodeIndexerSm100
@@ -88,6 +88,12 @@ _CODEGEN_SOURCES = (
     "src/sm100/q8kv8_indexer_prefill_plan.py",
 )
 _COMPILE_CACHE: dict[tuple[object, ...], object] = {}
+_CUTE_DTYPES = {
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    torch.uint8: cutlass.Uint8,
+    torch.int32: cutlass.Int32,
+    torch.float32: cutlass.Float32,
+}
 
 
 @cache
@@ -136,20 +142,26 @@ def _stream_ptr(device: torch.device) -> int:
     return torch.cuda.current_stream(device).cuda_stream
 
 
-def _to_cute_tensor(tensor: torch.Tensor, *, assumed_align: int) -> cute.Tensor:
-    return from_dlpack(
-        tensor.detach(),
+def _fake_tensor(tensor: torch.Tensor, *, assumed_align: int) -> cute.Tensor:
+    """Compile-time TVM-FFI argument for ``tensor``: its dtype and rank, dynamic
+    extents and dynamic strides except a unit innermost stride. Reads no data;
+    the compiled kernel takes the torch tensor itself at launch."""
+
+    rank = tensor.ndim
+    return make_fake_tensor(
+        _CUTE_DTYPES[tensor.dtype],
+        tuple(cute.sym_int32() for _ in range(rank)),
+        (*(cute.sym_int64() for _ in range(rank - 1)), 1),
         assumed_align=assumed_align,
-        enable_tvm_ffi=True,
-    ).mark_layout_dynamic(leading_dim=tensor.ndim - 1)
+    )
 
 
 def _cute_arguments(
     tma_operands: tuple[torch.Tensor, ...], scalar_operands: tuple[torch.Tensor, ...]
 ) -> list[cute.Tensor]:
     return [
-        *(_to_cute_tensor(tensor, assumed_align=_TMA_ALIGNMENT) for tensor in tma_operands),
-        *(_to_cute_tensor(tensor, assumed_align=_SCALAR_ALIGNMENT) for tensor in scalar_operands),
+        *(_fake_tensor(tensor, assumed_align=_TMA_ALIGNMENT) for tensor in tma_operands),
+        *(_fake_tensor(tensor, assumed_align=_SCALAR_ALIGNMENT) for tensor in scalar_operands),
     ]
 
 
@@ -946,13 +958,7 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         capability = _require_supported_device(device)
         # Q rows are token * num_heads + head, matching the scores and TopK rows.
         q_rows = q.view(state.total_q * state.num_heads, 1, _HEAD_DIM)
-        # The score matrix is a TMA store operand; the rest is scalar-access metadata.
         metadata = (state.task_descriptors, state.work_counter, state.sched_meta)
-        kernel_args = (
-            *_cute_arguments((q_rows, k_cache), (state.block_table,)),
-            _to_cute_tensor(state.scores, assumed_align=_TMA_ALIGNMENT),
-            *_cute_arguments((), metadata),
-        )
         compiled = _compile_or_load(
             _cute_kernel_key(
                 "q8kv8_indexer_prefill_sm100",
@@ -967,7 +973,11 @@ class BatchPrefillIndexerQ8KV8Wrapper:
                     compute_capability=capability,
                     num_persistent_clusters=state.num_clusters,
                 ),
-                *kernel_args,
+                # The score matrix is a TMA store operand; the rest is scalar-access
+                # metadata.
+                *_cute_arguments((q_rows, k_cache), (state.block_table,)),
+                _fake_tensor(state.scores, assumed_align=_TMA_ALIGNMENT),
+                *_cute_arguments((), metadata),
                 Int32(state.num_heads),
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
