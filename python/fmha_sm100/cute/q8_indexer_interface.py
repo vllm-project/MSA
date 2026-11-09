@@ -37,7 +37,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Int32
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_fake_tensor
 
 from src.common.aot_cache import save_aot, try_load_aot
 from src.sm100.q8kv4_indexer_decode import Q8KV4DecodeIndexerSm100
@@ -88,6 +88,12 @@ _CODEGEN_SOURCES = (
     "src/sm100/q8kv8_indexer_prefill_plan.py",
 )
 _COMPILE_CACHE: dict[tuple[object, ...], object] = {}
+_CUTE_DTYPES = {
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    torch.uint8: cutlass.Uint8,
+    torch.int32: cutlass.Int32,
+    torch.float32: cutlass.Float32,
+}
 
 
 @cache
@@ -99,8 +105,22 @@ def _kernel_source_digest() -> str:
     return digest.hexdigest()[:16]
 
 
+def _device_index(device: torch.device) -> int:
+    return torch.cuda.current_device() if device.index is None else device.index
+
+
+@cache
+def _device_capability(index: int) -> tuple[int, int]:
+    return torch.cuda.get_device_capability(index)
+
+
+@cache
+def _device_sm_count(index: int) -> int:
+    return torch.cuda.get_device_properties(index).multi_processor_count
+
+
 def _require_supported_device(device: torch.device) -> tuple[int, int]:
-    capability = torch.cuda.get_device_capability(device)
+    capability = _device_capability(_device_index(device))
     if capability not in _SUPPORTED_CAPABILITIES:
         raise RuntimeError(
             "Q8KV4/Q8KV8 indexers support only SM100, SM103 and SM107, "
@@ -110,7 +130,7 @@ def _require_supported_device(device: torch.device) -> tuple[int, int]:
 
 
 def _sm_count(device: torch.device) -> int:
-    return torch.cuda.get_device_properties(device).multi_processor_count
+    return _device_sm_count(_device_index(device))
 
 
 def _prefill_score_pages(max_pages: int) -> int:
@@ -128,28 +148,41 @@ def _prefill_score_pitch(max_pages: int) -> int:
 
 
 def _is_capturing(device: torch.device) -> bool:
-    with torch.cuda.device(device):
+    index = _device_index(device)
+    if index == torch.cuda.current_device():
+        return torch.cuda.is_current_stream_capturing()
+    with torch.cuda.device(index):
         return torch.cuda.is_current_stream_capturing()
 
 
 def _stream_ptr(device: torch.device) -> int:
-    return torch.cuda.current_stream(device).cuda_stream
+    # The raw handle skips building a torch.cuda.Stream object on every launch.
+    return torch._C._cuda_getCurrentRawStream(_device_index(device))
 
 
-def _to_cute_tensor(tensor: torch.Tensor, *, assumed_align: int) -> cute.Tensor:
-    return from_dlpack(
-        tensor.detach(),
+def _fake(dtype: torch.dtype, rank: int, *, assumed_align: int) -> cute.Tensor:
+    """Compile-time TVM-FFI tensor argument: ``dtype`` and ``rank``, dynamic
+    extents and dynamic strides except a unit innermost stride. The compiled
+    kernel takes the torch tensor itself at launch."""
+
+    return make_fake_tensor(
+        _CUTE_DTYPES[dtype],
+        tuple(cute.sym_int32() for _ in range(rank)),
+        (*(cute.sym_int64() for _ in range(rank - 1)), 1),
         assumed_align=assumed_align,
-        enable_tvm_ffi=True,
-    ).mark_layout_dynamic(leading_dim=tensor.ndim - 1)
+    )
+
+
+def _fake_tensor(tensor: torch.Tensor, *, assumed_align: int) -> cute.Tensor:
+    return _fake(tensor.dtype, tensor.ndim, assumed_align=assumed_align)
 
 
 def _cute_arguments(
     tma_operands: tuple[torch.Tensor, ...], scalar_operands: tuple[torch.Tensor, ...]
 ) -> list[cute.Tensor]:
     return [
-        *(_to_cute_tensor(tensor, assumed_align=_TMA_ALIGNMENT) for tensor in tma_operands),
-        *(_to_cute_tensor(tensor, assumed_align=_SCALAR_ALIGNMENT) for tensor in scalar_operands),
+        *(_fake_tensor(tensor, assumed_align=_TMA_ALIGNMENT) for tensor in tma_operands),
+        *(_fake_tensor(tensor, assumed_align=_SCALAR_ALIGNMENT) for tensor in scalar_operands),
     ]
 
 
@@ -171,15 +204,13 @@ def _compile_or_load(key: tuple[object, ...], compile_fn):
     return compiled
 
 
+@cache
+def _kernel_key_toolchain() -> tuple[object, ...]:
+    return (cutlass.__version__, str(cutlass.CUDA_VERSION), _kernel_source_digest())
+
+
 def _cute_kernel_key(name: str, capability: tuple[int, int], *static) -> tuple[object, ...]:
-    return (
-        name,
-        cutlass.__version__,
-        str(cutlass.CUDA_VERSION),
-        _kernel_source_digest(),
-        capability,
-        *static,
-    )
+    return (name, *_kernel_key_toolchain(), capability, *static)
 
 
 def _check_cuda_tensor(
@@ -698,6 +729,10 @@ class _PrefillPlanState:
     # first wave of decoded descriptors).
     work_counter: torch.Tensor
     sched_meta: torch.Tensor
+    # Resolved once per plan so that run(), called once per layer, only launches.
+    capability: tuple[int, int]
+    score_kernel: object
+    topk_select: object
 
 
 def _prefill_num_clusters(device: torch.device) -> int:
@@ -710,18 +745,55 @@ def _prefill_num_clusters(device: torch.device) -> int:
     )
 
 
+def _prefill_score_kernel(
+    capability: tuple[int, int],
+    num_clusters: int,
+    num_heads: int,
+    block_table: torch.Tensor,
+    scores: torch.Tensor,
+    metadata: tuple[torch.Tensor, ...],
+):
+    return _compile_or_load(
+        _cute_kernel_key(
+            "q8kv8_indexer_prefill_sm100",
+            capability,
+            num_clusters,
+            Q8KV8PrefillIndexerSm100.q_tile,
+            Q8KV8PrefillIndexerSm100.k_stages,
+            Q8KV8PrefillIndexerSm100.acc_stages,
+        ),
+        lambda: cute.compile(
+            Q8KV8PrefillIndexerSm100(
+                compute_capability=capability,
+                num_persistent_clusters=num_clusters,
+            ),
+            # Q rows ``[rows, 1, 128]`` and the K pages are TMA loads and the score
+            # matrix a TMA store; the rest is scalar-access metadata.
+            _fake(torch.float8_e4m3fn, 3, assumed_align=_TMA_ALIGNMENT),
+            _fake(torch.float8_e4m3fn, 3, assumed_align=_TMA_ALIGNMENT),
+            _fake_tensor(block_table, assumed_align=_SCALAR_ALIGNMENT),
+            _fake_tensor(scores, assumed_align=_TMA_ALIGNMENT),
+            *_cute_arguments((), metadata),
+            Int32(num_heads),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        ),
+    )
+
+
 def _run_prefill_plan(state: _PrefillPlanState) -> None:
-    capability = _require_supported_device(state.block_table.device)
+    capability = state.capability
     plan_static = (
         Q8KV8PrefillIndexerPlanBuild.num_buckets,
         Q8KV8PrefillIndexerPlanBuild.q_tile,
         Q8KV8PrefillIndexerPlanBuild.descriptor_words,
     )
+    reset_args = (state.task_counts, state.plan_error, state.work_counter)
     reset_compiled = _compile_or_load(
         _cute_kernel_key("q8kv8_indexer_prefill_plan_reset_sm100", capability, *plan_static),
         lambda: cute.compile(
             Q8KV8PrefillIndexerPlanReset(),
-            *_cute_arguments((), (state.task_counts, state.plan_error)),
+            *_cute_arguments((), reset_args),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         ),
@@ -758,7 +830,7 @@ def _run_prefill_plan(state: _PrefillPlanState) -> None:
             options="--enable-tvm-ffi",
         ),
     )
-    reset_compiled(state.task_counts, state.plan_error)
+    reset_compiled(*reset_args)
     build_compiled(
         *build_args,
         state.num_candidate_q_tiles,
@@ -820,7 +892,7 @@ class BatchPrefillIndexerQ8KV8Wrapper:
 
         _check_cuda_tensor(cu_seqlens_q, name="cu_seqlens_q", dtype=torch.int32)
         device = cu_seqlens_q.device
-        _require_supported_device(device)
+        capability = _require_supported_device(device)
         if _is_capturing(device):
             raise RuntimeError("plan() must be called outside CUDA Graph capture")
         if cu_seqlens_q.ndim != 1 or cu_seqlens_q.numel() < 2:
@@ -868,19 +940,38 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         if score_out is not None:
             _check_score_out(score_out, total_rows, max_pages, device)
         options = {"device": device}
+        scores = (
+            score_out
+            if score_out is not None
+            else torch.empty(
+                (total_rows, _prefill_score_pitch(max_pages)), dtype=torch.float32, **options
+            )[:, : _prefill_score_pages(max_pages)]
+        )
+        task_descriptors = torch.empty(
+            (
+                Q8KV8PrefillIndexerPlanBuild.num_buckets,
+                task_capacity,
+                Q8KV8PrefillIndexerPlanBuild.descriptor_words,
+            ),
+            dtype=torch.int32,
+            **options,
+        )
+        # Zeroed by the plan's reset kernel; every launch's last claim resets it,
+        # so graph replay needs no memset.
+        work_counter = torch.empty((1,), dtype=torch.int32, **options)
+        sched_meta = torch.empty(
+            (
+                Q8KV8PrefillIndexerPlanFinalize.meta_header_words
+                + Q8KV8PrefillIndexerPlanFinalize.meta_task_words * num_clusters,
+            ),
+            dtype=torch.int32,
+            **options,
+        )
         self._state = _PrefillPlanState(
             cu_seqlens_q=cu_seqlens_q,
             seq_lens=seq_lens,
             block_table=block_table,
-            task_descriptors=torch.empty(
-                (
-                    Q8KV8PrefillIndexerPlanBuild.num_buckets,
-                    task_capacity,
-                    Q8KV8PrefillIndexerPlanBuild.descriptor_words,
-                ),
-                dtype=torch.int32,
-                **options,
-            ),
+            task_descriptors=task_descriptors,
             task_counts=torch.empty(
                 (Q8KV8PrefillIndexerPlanBuild.num_buckets,), dtype=torch.int32, **options
             ),
@@ -890,29 +981,24 @@ class BatchPrefillIndexerQ8KV8Wrapper:
             max_page_chunk=max_page_chunk,
             total_q=total_q,
             num_heads=self._num_heads,
-            scores=(
-                score_out
-                if score_out is not None
-                else torch.empty(
-                    (total_rows, _prefill_score_pitch(max_pages)), dtype=torch.float32, **options
-                )[:, : _prefill_score_pages(max_pages)]
-            ),
+            scores=scores,
             num_valid_pages=torch.empty((total_rows,), dtype=torch.int32, **options),
             topk_indices=torch.empty(
                 (total_q, self._num_heads, _TOP_K), dtype=torch.int32, **options
             ),
             num_clusters=num_clusters,
-            # Zeroed once per plan; every launch's last claim resets it, so graph
-            # replay needs no memset.
-            work_counter=torch.zeros((1,), dtype=torch.int32, **options),
-            sched_meta=torch.empty(
-                (
-                    Q8KV8PrefillIndexerPlanFinalize.meta_header_words
-                    + Q8KV8PrefillIndexerPlanFinalize.meta_task_words * num_clusters,
-                ),
-                dtype=torch.int32,
-                **options,
+            work_counter=work_counter,
+            sched_meta=sched_meta,
+            capability=capability,
+            score_kernel=_prefill_score_kernel(
+                capability,
+                num_clusters,
+                self._num_heads,
+                block_table,
+                scores,
+                (task_descriptors, work_counter, sched_meta),
             ),
+            topk_select=_indexer_module_loader("indexer_topk_select").indexer_topk_select,
         )
         _run_prefill_plan(self._state)
 
@@ -943,37 +1029,17 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         device = state.block_table.device
         _check_query(q, state.total_q, state.num_heads, device)
         _check_paged_cache(k_cache, dtype=torch.float8_e4m3fn, page_width=_HEAD_DIM, device=device)
-        capability = _require_supported_device(device)
-        # Q rows are token * num_heads + head, matching the scores and TopK rows.
-        q_rows = q.view(state.total_q * state.num_heads, 1, _HEAD_DIM)
-        # The score matrix is a TMA store operand; the rest is scalar-access metadata.
-        metadata = (state.task_descriptors, state.work_counter, state.sched_meta)
-        kernel_args = (
-            *_cute_arguments((q_rows, k_cache), (state.block_table,)),
-            _to_cute_tensor(state.scores, assumed_align=_TMA_ALIGNMENT),
-            *_cute_arguments((), metadata),
+        state.score_kernel(
+            # Q rows are token * num_heads + head, matching the scores and TopK rows.
+            q.view(state.total_q * state.num_heads, 1, _HEAD_DIM),
+            k_cache,
+            state.block_table,
+            state.scores,
+            state.task_descriptors,
+            state.work_counter,
+            state.sched_meta,
+            state.num_heads,
         )
-        compiled = _compile_or_load(
-            _cute_kernel_key(
-                "q8kv8_indexer_prefill_sm100",
-                capability,
-                state.num_clusters,
-                Q8KV8PrefillIndexerSm100.q_tile,
-                Q8KV8PrefillIndexerSm100.k_stages,
-                Q8KV8PrefillIndexerSm100.acc_stages,
-            ),
-            lambda: cute.compile(
-                Q8KV8PrefillIndexerSm100(
-                    compute_capability=capability,
-                    num_persistent_clusters=state.num_clusters,
-                ),
-                *kernel_args,
-                Int32(state.num_heads),
-                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-                options="--enable-tvm-ffi",
-            ),
-        )
-        compiled(q_rows, k_cache, state.block_table, state.scores, *metadata, state.num_heads)
         return state.scores
 
     def run(
@@ -987,12 +1053,20 @@ class BatchPrefillIndexerQ8KV8Wrapper:
 
         scores = self._run_scores(q, k_cache)
         state = self._state
+        device = scores.device
         if out is None:
             out = state.topk_indices
         else:
-            _check_topk_output(out, state.total_q, state.num_heads, scores.device)
+            _check_topk_output(out, state.total_q, state.num_heads, device)
         # The prefill chain runs eagerly and is not PDL-chained.
-        return _topk_select(scores, state.num_valid_pages, out, use_pdl=False)
+        state.topk_select(
+            scores,
+            state.num_valid_pages,
+            out.view(state.num_valid_pages.shape[0], _TOP_K),
+            False,
+            _stream_ptr(device),
+        )
+        return out
 
 
 __all__ = [
