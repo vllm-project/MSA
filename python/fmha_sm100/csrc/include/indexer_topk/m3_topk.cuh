@@ -20,6 +20,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 
 #include "topk_select.cuh"
 
@@ -179,12 +180,15 @@ struct WarpSelectSmem {
 #define M3_REG_PEEL_MAX 2
 #endif
 template <int N>
+__device__ __forceinline__ void warp_peel_sorted(unsigned (&key)[N], int* __restrict__ out15,
+                                                 unsigned* __restrict__ lst);
+
+template <int N>
 __device__ __noinline__ void warp_peel_row(int nvm,
                                            const float* __restrict__ rsc1,
                                            int* __restrict__ out15,
                                            unsigned* __restrict__ lst) {
   const int lane = static_cast<int>(threadIdx.x) & 31;
-  constexpr int SH = N < kSelK ? N : kSelK;
   float sc[N];
   float mymax = -INFINITY, mymin = INFINITY;
 #pragma unroll
@@ -211,6 +215,16 @@ __device__ __noinline__ void warp_peel_row(int nvm,
     key[i] = (idx < nvm) ? topk_sel::pack_key(sc[i], scale, bias, idx) : 0u;
   }
   topk_sel::sort_desc_u32<N>(key);
+  warp_peel_sorted<N>(key, out15, lst);
+}
+
+// The pop loop of warp_peel_row on keys already sorted per lane (key[0] the
+// lane max); also the per-warp and merge peels of split_rank_row.
+template <int N>
+__device__ __forceinline__ void warp_peel_sorted(unsigned (&key)[N], int* __restrict__ out15,
+                                                 unsigned* __restrict__ lst) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  constexpr int SH = N < kSelK ? N : kSelK;
   if constexpr (N <= M3_REG_PEEL_MAX) {
     // Narrow lanes: shifting a couple of registers beats a store + load.
 #pragma unroll
@@ -306,6 +320,90 @@ __device__ __forceinline__ void warp_rank_row(int nvm, const float* __restrict__
   }
 }
 
+
+// ---- split rows: one long decode row over the warps of a CTA ----
+//
+// Below kWarpPackedMinRows the warp family gives each row one warp, so a decode
+// batch with a few long requests waits on those warps' 48-64-key sorts while the
+// rest of the GPU idles. m3_split_kernel gives each row its own kSplitThreads
+// CTA. A row past the split threshold is ranked by all kSplitWarps warps:
+//   1. the CTA reduces the row's [min, max] -- the same set warp_peel_row uses --
+//      so scale, bias and every key equal warp_peel_row's;
+//   2. each warp packs, sorts and peels the top kSelK keys of its columns
+//      (column i*kSplitThreads + tid);
+//   3. warp 0 peels the top kSelK of those kSplitWarps*kSelK keys.
+// Keys are unique (the low half is ~col), so they are totally ordered and a key
+// in the row's top kSelK is in its own warp's top kSelK: the result is
+// warp_peel_row's, key for key. Rows at or below the threshold take
+// warp_rank_row on warp 0 unchanged. No cross-CTA state, so graph replay safe.
+#ifndef M3_SPLIT_MIN_NVM
+#define M3_SPLIT_MIN_NVM 512
+#endif
+constexpr int kSplitWarps = 4;
+constexpr int kSplitThreads = 32 * kSplitWarps;
+
+struct SplitSmem {
+  float hi[kSplitWarps], lo[kSplitWarps];
+  int cand[kSplitWarps * kSelK];  // each warp's kSelK keys
+  int sel[kSelK];                 // the row's kSelK keys
+  WarpSelectSmem lst[kSplitWarps];
+};
+
+// The whole CTA ranks one row of kSplitThreads < nvm <= N*kSplitThreads columns
+// (every warp holds >= 32 live columns). Called CTA-uniformly (the barriers).
+template <int N>
+__device__ __forceinline__ void split_rank_row(int nvm, const float* __restrict__ p,
+                                               SplitSmem& s) {
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid >> 5, lane = tid & 31;
+  float sc[N];
+  float mymax = -INFINITY, mymin = INFINITY;
+#pragma unroll
+  for (int i = 0; i < N; ++i) {
+    const int idx = i * kSplitThreads + tid;
+    sc[i] = (idx < nvm) ? __ldcg(p + idx) : -INFINITY;
+  }
+  // Branch-free (a dead column holds -inf, the identity of max), and the warp
+  // reconverged before the redux.sync calls.
+#pragma unroll
+  for (int i = 0; i < N; ++i) {
+    mymax = fmaxf(mymax, sc[i]);
+    mymin = fminf(mymin, (i * kSplitThreads + tid < nvm) ? sc[i] : INFINITY);
+  }
+  __syncwarp();
+  mymax = topk_sel::warp_max_f32(mymax);
+  mymin = topk_sel::warp_min_f32(mymin);
+  if (lane == 0) {
+    s.hi[warp] = mymax;
+    s.lo[warp] = mymin;
+  }
+  __syncthreads();
+  mymax = topk_sel::warp_max_f32(s.hi[lane % kSplitWarps]);
+  mymin = topk_sel::warp_min_f32(s.lo[lane % kSplitWarps]);
+  const float scale = (mymax > mymin) ? (65534.0f / (mymax - mymin)) : 0.0f;
+  const float bias = fmaf(-mymin, scale, 1.5f);
+  unsigned key[N];
+#pragma unroll
+  for (int i = 0; i < N; ++i) {
+    const int idx = i * kSplitThreads + tid;
+    key[i] = (idx < nvm) ? topk_sel::pack_key(sc[i], scale, bias, idx) : 0u;
+  }
+  topk_sel::sort_desc_u32<N>(key);
+  warp_peel_sorted<N>(key, s.cand + warp * kSelK, s.lst[warp].keys);
+  __syncthreads();
+  if (warp == 0) {
+    constexpr int M = (kSplitWarps * kSelK + 31) / 32;
+    unsigned k2[M];
+#pragma unroll
+    for (int j = 0; j < M; ++j) {
+      const int c = j * 32 + lane;
+      k2[j] = (c < kSplitWarps * kSelK) ? static_cast<unsigned>(s.cand[c]) : 0u;
+    }
+    topk_sel::sort_desc_u32<M>(k2);
+    warp_peel_sorted<M>(k2, s.sel, s.lst[0].keys);
+  }
+}
+
 // The widest warp-family row of a launch, or 0 for the block family.
 inline int m3_warp_max(int n_max, int rows) {
   const int nvm_max = n_max - 1;
@@ -376,6 +474,49 @@ __global__ __launch_bounds__(kThreads) void m3_topk_kernel(
       write_row(out_ids, row, tid, nvm, u.s.sel_ids);
     }
   }
+}
+
+// One row per kSplitThreads CTA (grid == rows). Rows of nvm > split_min_nvm
+// take split_rank_row (8 / 12 / 16 columns per thread up to 1024 / 1536 / 2048
+// candidates); the rest take warp_rank_row on warp 0, as in m3_topk_kernel.
+template <int kWarpMax>
+__global__ __launch_bounds__(kSplitThreads) void m3_split_kernel(
+    const float* __restrict__ scores, const int* __restrict__ row_n,
+    int* __restrict__ out_ids, int n_max, RowLayout layout, int rows, int split_min_nvm) {
+  __shared__ SplitSmem s;
+  const int tid = static_cast<int>(threadIdx.x);
+  wait_for_scores();
+  const int row = static_cast<int>(blockIdx.x);
+  const int nvm = row_nvm(row_n, out_ids, row, tid, n_max);  // CTA-uniform
+  if (nvm == 0) return;
+  const float* p = row_scores(scores, row, layout);
+  if (nvm <= split_min_nvm) {
+    if (tid < 32) {
+      warp_rank_row<kWarpMax>(nvm, p, s.sel, s.lst[0]);
+      write_row_keys(out_ids, row, tid, nvm, s.sel);
+    }
+    return;
+  }
+  if (nvm <= 8 * kSplitThreads) {
+    split_rank_row<8>(nvm, p, s);
+  } else if (nvm <= 12 * kSplitThreads) {
+    split_rank_row<12>(nvm, p, s);
+  } else {
+    split_rank_row<16>(nvm, p, s);
+  }
+  if (tid < 32) write_row_keys(out_ids, row, tid, nvm, s.sel);
+}
+
+// The split threshold: M3_SPLIT_MIN_NVM from the environment (0 = off = the
+// m3_topk_kernel path), else the compile-time default; at least kWarpSmallNvm
+// (split_rank_row's precondition nvm > kSplitThreads).
+inline int m3_split_min_nvm() {
+  static const int v = [] {
+    const char* e = std::getenv("M3_SPLIT_MIN_NVM");
+    const int x = e ? std::atoi(e) : M3_SPLIT_MIN_NVM;
+    return x <= 0 ? 0 : (x < kWarpSmallNvm ? kWarpSmallNvm : x);
+  }();
+  return v;
 }
 
 inline int m3_occ() {
@@ -1176,6 +1317,16 @@ inline void m3_launch_impl(const float* scores, const int* row_n, int* out, int 
         launch(wide::wide_kernel<kWarpMax>, (rows + wide::kRows - 1) / wide::kRows, kThreads, st,
                pdl, scores, row_n, out, layout, rows, n_max);
       }
+      return;
+    }
+  }
+  if constexpr (kWarpMax >= kWarpNarrowNvm) {
+    // Unpacked warp-family launches with long rows: one row per CTA, long rows
+    // split over its warps (m3_split_kernel). Rows <= 2048 by kWarpMax.
+    const int split = m3_split_min_nvm();
+    if (split > 0 && rows < kWarpPackedMinRows && n_max - 1 > split) {
+      launch(m3_split_kernel<kWarpMax>, rows, kSplitThreads, st, pdl, scores, row_n, out, n_max,
+             layout, rows, split);
       return;
     }
   }
