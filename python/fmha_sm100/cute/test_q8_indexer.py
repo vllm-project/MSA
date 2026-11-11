@@ -341,6 +341,13 @@ def _run_decode_scores(wrapper, q, k_cache):
         (129, 4, 512, 0.5, 2.0),
         (257, 3, 0, 2.0, 0.125),
         (1025, 2, 0, 0.5, 0.5),
+        # Decode-sized launches with long contexts: small adaptive work tiles
+        # (up to kAdaptiveTileMaxBatch = 8 requests), then fixed 16-page tiles.
+        (1, 400, 0, 0.5, 0.5),
+        (8, 160, 256, 1.0, 0.5),
+        (8, 64, 0, 0.5, 1.0),
+        (9, 64, 0, 0.5, 1.0),
+        (40, 64, 0, 0.5, 1.0),
     ],
 )
 def test_decode_matches_reference(fmt, num_heads, batch, max_pages, page_pad, q_scale, k_scale):

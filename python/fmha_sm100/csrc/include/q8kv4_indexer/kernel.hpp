@@ -7,14 +7,41 @@
 
 namespace q8kv4_indexer {
 
+// Pages a request scores (all but its last, local page).
 template <class Traits>
-CUTE_DEVICE int indexer_gemm_scheduler_tile_count(IndexerGemmParams const &params, int batch_idx) {
+CUTE_DEVICE int indexer_gemm_scored_pages(IndexerGemmParams const &params, int batch_idx) {
   int const kv_length = params.kv_lengths_ptr[batch_idx];
   int const page_count_unclamped =
       kv_length > 0 ? (kv_length + Traits::kPageTokens - 1) / Traits::kPageTokens : 0;
   int const page_count = min(page_count_unclamped, params.max_pages);
-  int const scored_pages = max(page_count - 1, 0);
-  return (scored_pages + Traits::kPagesPerWorkTile - 1) / Traits::kPagesPerWorkTile;
+  return max(page_count - 1, 0);
+}
+
+// Pages per work tile for a launch scoring total_pages pages: the largest
+// power of two up to kPagesPerWorkTile that still makes about 1.5 work tiles
+// per SM, but at least kMinPagesPerWorkTile. At decode batch sizes 16-page
+// tiles leave most of the persistent grid idle while a few CTAs walk their
+// tiles in several load rounds; much smaller tiles than this make the CTAs
+// wait on more separate page loads (measured on GB300). Each page is scored on
+// its own, so the tile size changes only which CTA scores a page, not the
+// scores.
+template <class Traits>
+CUTE_DEVICE int indexer_gemm_pages_per_work_tile(int total_pages, int sm_count) {
+#ifdef Q8KV4_INDEXER_FIXED_PAGES_PER_WORK_TILE
+  return Q8KV4_INDEXER_FIXED_PAGES_PER_WORK_TILE;
+#else
+  int const min_tiles = sm_count * 3 / 2;
+  int pages = Traits::kPagesPerWorkTile;
+  while (pages > Traits::kMinPagesPerWorkTile && (total_pages + pages - 1) / pages < min_tiles) {
+    pages >>= 1;
+  }
+  return pages;
+#endif
+}
+
+template <class Traits>
+CUTE_DEVICE int indexer_gemm_scheduler_tile_count(int scored_pages, int pages_per_work_tile) {
+  return (scored_pages + pages_per_work_tile - 1) / pages_per_work_tile;
 }
 
 // Candidate pages of each query row, its local page included: query i of
@@ -35,7 +62,7 @@ CUTE_DEVICE void write_decode_num_valid_pages(IndexerGemmParams const &params, i
   }
 }
 
-template <class Traits>
+template <class Traits, bool kAdaptiveTile>
 __global__ void __launch_bounds__(Traits::kPrepareThreads)
     prepare_indexer_gemm_scheduler(const __grid_constant__ IndexerGemmParams params) {
   __shared__ int32_t warp_prefix[Traits::kPrepareWarps];
@@ -44,10 +71,27 @@ __global__ void __launch_bounds__(Traits::kPrepareThreads)
   int const lane_idx = thread_idx & 31;
   int const warp_idx = thread_idx >> 5;
   int const active_warps = static_cast<int>(blockDim.x) >> 5;
-  int tile_count = 0;
-  if (thread_idx < params.batch) {
-    tile_count = indexer_gemm_scheduler_tile_count<Traits>(params, thread_idx);
+  int const scored_pages =
+      thread_idx < params.batch ? indexer_gemm_scored_pages<Traits>(params, thread_idx) : 0;
+  int pages_per_work_tile = Traits::kPagesPerWorkTile;
+  if constexpr (kAdaptiveTile) {
+    // The launch's total scored pages pick the work tile size.
+    int warp_total = scored_pages;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      warp_total += __shfl_xor_sync(0xffffffffu, warp_total, offset);
+    }
+    if (lane_idx == 0) {
+      warp_prefix[warp_idx] = warp_total;
+    }
+    __syncthreads();
+    int total_pages = 0;
+    for (int w = 0; w < active_warps; ++w) {
+      total_pages += warp_prefix[w];
+    }
+    __syncthreads();
+    pages_per_work_tile = indexer_gemm_pages_per_work_tile<Traits>(total_pages, params.sm_count);
   }
+  int tile_count = indexer_gemm_scheduler_tile_count<Traits>(scored_pages, pages_per_work_tile);
   for (int offset = 1; offset < 32; offset <<= 1) {
     int const addend = __shfl_up_sync(0xffffffffu, tile_count, offset);
     if (lane_idx >= offset) {
@@ -92,23 +136,24 @@ __global__ void __launch_bounds__(256)
     params.scheduler_workspace_ptr[0] = 0;
   }
   if (batch_idx < params.batch) {
-    params.scheduler_workspace_ptr[batch_idx + 1] =
-        indexer_gemm_scheduler_tile_count<Traits>(params, batch_idx);
+    // Large batches fill the grid with full-size tiles.
+    params.scheduler_workspace_ptr[batch_idx + 1] = indexer_gemm_scheduler_tile_count<Traits>(
+        indexer_gemm_scored_pages<Traits>(params, batch_idx), Traits::kPagesPerWorkTile);
   }
 }
 
-template <class Traits, int SchedulerCounterOffset>
+template <class Traits, int SchedulerCounterOffset, bool kAdaptiveTile>
 __global__ void __launch_bounds__(Traits::kThreads)
     indexer_gemm_kernel(const __grid_constant__ IndexerGemmParams params) {
-  using Collective = IndexerGemmCollective<Traits, SchedulerCounterOffset>;
+  using Collective = IndexerGemmCollective<Traits, SchedulerCounterOffset, kAdaptiveTile>;
   using SharedStorage = typename Collective::SharedStorage;
   extern __shared__ __align__(1024) uint8_t shared_memory[];
   SharedStorage &storage = *reinterpret_cast<SharedStorage *>(shared_memory);
   Collective::run(params, storage);
 }
 
-template <class Traits, int SchedulerCounterOffset> struct IndexerGemmKernel {
-  using Collective = IndexerGemmCollective<Traits, SchedulerCounterOffset>;
+template <class Traits, int SchedulerCounterOffset, bool kAdaptiveTile> struct IndexerGemmKernel {
+  using Collective = IndexerGemmCollective<Traits, SchedulerCounterOffset, kAdaptiveTile>;
   using SharedStorage = typename Collective::SharedStorage;
   static constexpr int kThreadCount = Traits::kThreads;
   static constexpr int kSharedStorageBytes = sizeof(SharedStorage);

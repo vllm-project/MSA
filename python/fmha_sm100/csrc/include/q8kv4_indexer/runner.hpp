@@ -15,8 +15,12 @@ namespace q8kv4_indexer {
 template <class Traits> struct IndexerGemmRunner {
   static constexpr int kInlineCounterOffset = Traits::kPrepareThreads + 1;
   static constexpr int kDynamicCounterOffset = -1;
-  using InlineKernel = IndexerGemmKernel<Traits, kInlineCounterOffset>;
-  using DynamicKernel = IndexerGemmKernel<Traits, kDynamicCounterOffset>;
+  using AdaptiveKernel = IndexerGemmKernel<Traits, kInlineCounterOffset, true>;
+  using InlineKernel = IndexerGemmKernel<Traits, kInlineCounterOffset, false>;
+  using DynamicKernel = IndexerGemmKernel<Traits, kDynamicCounterOffset, false>;
+
+  // Plan and run pick the same variant from the request count.
+  static bool adaptive_tile(int batch) { return batch <= Traits::kAdaptiveTileMaxBatch; }
 
   static bool can_plan(IndexerGemmArguments const &arguments) {
     return arguments.page_table_ptr != nullptr && arguments.kv_lengths_ptr != nullptr &&
@@ -69,6 +73,7 @@ template <class Traits> struct IndexerGemmRunner {
     params.batch = arguments.batch;
     params.query_length = arguments.query_length;
     params.max_pages = arguments.max_pages;
+    params.sm_count = arguments.sm_count;
 
     return cudaSuccess;
   }
@@ -112,13 +117,21 @@ template <class Traits> struct IndexerGemmRunner {
     static std::once_flag attribute_once;
     static cudaError_t attribute_status = cudaSuccess;
     std::call_once(attribute_once, [] {
-      attribute_status = cudaFuncSetAttribute(indexer_gemm_kernel<Traits, kInlineCounterOffset>,
-                                              cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                              InlineKernel::kSharedStorageBytes);
+      attribute_status =
+          cudaFuncSetAttribute(indexer_gemm_kernel<Traits, kInlineCounterOffset, true>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               AdaptiveKernel::kSharedStorageBytes);
       if (attribute_status == cudaSuccess) {
-        attribute_status = cudaFuncSetAttribute(indexer_gemm_kernel<Traits, kDynamicCounterOffset>,
-                                                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                DynamicKernel::kSharedStorageBytes);
+        attribute_status =
+            cudaFuncSetAttribute(indexer_gemm_kernel<Traits, kInlineCounterOffset, false>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 InlineKernel::kSharedStorageBytes);
+      }
+      if (attribute_status == cudaSuccess) {
+        attribute_status =
+            cudaFuncSetAttribute(indexer_gemm_kernel<Traits, kDynamicCounterOffset, false>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 DynamicKernel::kSharedStorageBytes);
       }
     });
     if (attribute_status != cudaSuccess) {
@@ -135,7 +148,11 @@ template <class Traits> struct IndexerGemmRunner {
     }
     if (params.batch <= Traits::kPrepareThreads) {
       int const prepare_threads = ((params.batch + 31) / 32) * 32;
-      prepare_indexer_gemm_scheduler<Traits><<<1, prepare_threads, 0, stream>>>(params);
+      if (adaptive_tile(params.batch)) {
+        prepare_indexer_gemm_scheduler<Traits, true><<<1, prepare_threads, 0, stream>>>(params);
+      } else {
+        prepare_indexer_gemm_scheduler<Traits, false><<<1, prepare_threads, 0, stream>>>(params);
+      }
       status = cudaGetLastError();
     } else {
       int constexpr prepare_threads = 256;
@@ -153,7 +170,7 @@ template <class Traits> struct IndexerGemmRunner {
   }
 
   static cudaError_t run(IndexerGemmParams const &params, cudaStream_t stream) {
-    dim3 const grid(params.sm_count * 4, 1, 1);
+    dim3 const grid(params.sm_count * Traits::kCtasPerSm, 1, 1);
     cudaLaunchAttribute attributes[2]{};
     attributes[0].id = cudaLaunchAttributeClusterDimension;
     attributes[0].val.clusterDim.x = 1;
@@ -169,11 +186,14 @@ template <class Traits> struct IndexerGemmRunner {
     launch_config.attrs = attributes;
     launch_config.numAttrs = 2;
     cudaError_t const launch_status =
-        params.batch <= Traits::kPrepareThreads
-            ? cudaLaunchKernelEx(&launch_config, indexer_gemm_kernel<Traits, kInlineCounterOffset>,
-                                 params)
-            : cudaLaunchKernelEx(&launch_config, indexer_gemm_kernel<Traits, kDynamicCounterOffset>,
-                                 params);
+        adaptive_tile(params.batch)
+            ? cudaLaunchKernelEx(&launch_config,
+                                 indexer_gemm_kernel<Traits, kInlineCounterOffset, true>, params)
+        : params.batch <= Traits::kPrepareThreads
+            ? cudaLaunchKernelEx(&launch_config,
+                                 indexer_gemm_kernel<Traits, kInlineCounterOffset, false>, params)
+            : cudaLaunchKernelEx(&launch_config,
+                                 indexer_gemm_kernel<Traits, kDynamicCounterOffset, false>, params);
     return launch_status == cudaSuccess ? cudaGetLastError() : launch_status;
   }
 };
