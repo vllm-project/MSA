@@ -36,12 +36,12 @@ __device__ __forceinline__ int f32_ordered(float v) {
 }
 __device__ __forceinline__ float warp_max_f32(float v) {
   int r;
-  asm("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(r) : "r"(f32_ordered(v)));
+  asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(r) : "r"(f32_ordered(v)));
   return __int_as_float(r ^ ((r >> 31) & 0x7FFFFFFF));
 }
 __device__ __forceinline__ float warp_min_f32(float v) {
   int r;
-  asm("redux.sync.min.s32 %0, %1, 0xffffffff;" : "=r"(r) : "r"(f32_ordered(v)));
+  asm volatile("redux.sync.min.s32 %0, %1, 0xffffffff;" : "=r"(r) : "r"(f32_ordered(v)));
   return __int_as_float(r ^ ((r >> 31) & 0x7FFFFFFF));
 }
 
