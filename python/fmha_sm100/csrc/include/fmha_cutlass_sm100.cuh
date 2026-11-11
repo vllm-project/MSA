@@ -84,12 +84,19 @@ struct FwdRunner {
 
   // NumQStages: 2 for Q-split (2,1,1), 1 for K-split (1,2,1)
   static constexpr int NumQStages = cute::size<0>(ThreadShape{});
-  static constexpr bool bNeedOutput = kSparseAttnMode != cutlass::fmha::collective::SparseAttnMode::OnlyScore;
+  static constexpr bool kIcp =
+      kSparseAttnMode == cutlass::fmha::collective::SparseAttnMode::OnlyScoreIcp;
+  static constexpr bool bNeedOutput =
+      kSparseAttnMode != cutlass::fmha::collective::SparseAttnMode::OnlyScore && !kIcp;
   static constexpr int kPackFactor = cutlass::fmha::collective::pack_factor_of<ActiveMask>::value;
+  // The ICP prefill scorer (not the short-query single-WG one) gets the deeper K ring.
+  using MainloopMask = std::conditional_t<kIcp && !SingleSoftmaxWarpGroup,
+                                          cutlass::fmha::collective::IcpPrefillMask<ActiveMask, 1024 / KVPageSize>,
+                                          ActiveMask>;
 
   using Mainloop = cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
       Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShapeQK, TileShapePV, StrideQ,
-      StrideK, StrideV, ActiveMask, ThreadShape, IsSplitKV, KVPageSize, kSparseAttnMode>;
+      StrideK, StrideV, MainloopMask, ThreadShape, IsSplitKV, KVPageSize, kSparseAttnMode>;
   using Epilogue = cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
       ElementOut, ElementAccumulatorPV, typename Mainloop::TileShapePV, NumQStages, IsSplitKV, bNeedOutput, kPackFactor>;
   using Operation =
@@ -146,7 +153,8 @@ struct FwdRunner {
                          float dequant_g_k = 1.0f,
                          float dequant_g_v = 1.0f,
                          const float* nvfp4_k_global_scale = nullptr,
-                         const float* nvfp4_v_global_scale = nullptr) {
+                         const float* nvfp4_v_global_scale = nullptr,
+                         cutlass::fmha::collective::IcpParams icp = {}) {
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.sm_count = (num_ctas > 0)
@@ -299,6 +307,10 @@ struct FwdRunner {
       }
 
       k3_install_nvfp4(arguments);
+      if constexpr (kIcp) {
+        icp.max_k_tiles = max_k_tiles;
+        arguments.mainloop.load.icp = icp;
+      }
 
       Operation op;
       size_t workspace_size = Operation::get_workspace_size(arguments);
@@ -506,7 +518,8 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
                          float dequant_g_k = 1.0f,
                          float dequant_g_v = 1.0f,
                          const float* nvfp4_k_global_scale = nullptr,
-                         const float* nvfp4_v_global_scale = nullptr) {
+                         const float* nvfp4_v_global_scale = nullptr,
+                         cutlass::fmha::collective::IcpParams icp = {}) {
   return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask,
                    ThreadShape, IsSplitKV, SingleSoftmaxWarpGroup, KVPageSize, kSparseAttnMode>::run(
       workspace_buffer, q, k, v, qo_segment_lens, kv_segment_lens,
@@ -526,7 +539,7 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
       pack_gqa, num_ctas,
       nvfp4_k_data, nvfp4_k_scale, nvfp4_v_data, nvfp4_v_scale,
       nvfp4_page_stride, nvfp4_head_stride_data, nvfp4_head_stride_scale,
-      dequant_g_k, dequant_g_v, nvfp4_k_global_scale, nvfp4_v_global_scale);
+      dequant_g_k, dequant_g_v, nvfp4_k_global_scale, nvfp4_v_global_scale, icp);
 }
 
 };  // namespace flashinfer

@@ -40,7 +40,10 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
                     Optional<ffi::TensorView> maybe_kv_block_indexes,
                     int64_t pack_factor,
                     bool qo_len_uniform,
-                    int64_t stream_ptr
+                    int64_t stream_ptr{% if sparse_mode == "OnlyScoreIcp" %},
+                    int64_t icp_rank,
+                    int64_t icp_c,
+                    bool compact_score{% endif %}
 {% if kv_mode >= 3 %}
                     ,
                     Optional<ffi::TensorView> maybe_nvfp4_k_data,
@@ -195,7 +198,32 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
   params.kv_block_indexes_ptr = kv_block_indexes_ptr;
   params.kv_block_num = maybe_kv_block_indexes.has_value()
                             ? static_cast<int>(maybe_kv_block_indexes.value().size(2))
-                            : 0;
+                            : 0;{% if sparse_mode == "OnlyScoreIcp" %}
+  // OnlyScoreIcp: kv_indices is the block table; rank and world size ride kv_block_num.
+  TVM_FFI_ICHECK((icp_c == 2 || icp_c == 4) && icp_rank >= 0 && icp_rank < icp_c
+                 && page_size == {{ page_size }}
+                 && (page_size * icp_c == 128 || page_size * icp_c == 256))
+      << "OnlyScoreIcp serves TP2/TP4 P128/P256 fragments; got icp_c=" << icp_c
+      << " icp_rank=" << icp_rank << " page_size=" << page_size;
+  TVM_FFI_ICHECK(!compact_score || page_size * icp_c == 256)
+      << "compact ICP scores require P256 fragments";
+  params.kv_block_num = static_cast<int>(icp_rank * 16 + icp_c
+                                         + (compact_score ? 256 : 0));
+  TVM_FFI_ICHECK(maybe_kv_indices.has_value() && !maybe_kv_page_indptr.has_value()
+                 && !maybe_kv_block_indexes.has_value())
+      << "OnlyScoreIcp takes the block table as kv_indices and no other page directory";
+  const auto& block_table = maybe_kv_indices.value();
+  TVM_FFI_ICHECK(encode_dlpack_dtype(block_table.dtype()) == int32_code
+                 && block_table.ndim() == 2 && block_table.stride(1) == 1
+                 && block_table.stride(0) > 0)
+      << "the ICP block table must be int32 [rows, row_stride] with unit column stride";
+  TVM_FFI_ICHECK(params.batch_size <= block_table.size(0))
+      << "ICP block table must have one row per query segment";
+  params.icp_block_table_row_stride = static_cast<int>(block_table.stride(0));
+  TVM_FFI_ICHECK(maybe_max_score.has_value()
+                 && maybe_max_score.value().size(0) == q.size(0)
+                 && maybe_max_score.value().size(1) == q.size(1))
+      << "OnlyScoreIcp writes a [T, H, K] max_score";{% endif %}
 
   params.pack_factor = static_cast<int>(pack_factor);
   params.num_ctas = static_cast<int>(packed_work_range.size(0));
@@ -283,7 +311,9 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
   params.gmem_bounds.kv_page_indptr_size = maybe_kv_page_indptr.has_value()
       ? static_cast<int>(maybe_kv_page_indptr.value().size(0)) : 0;
   params.gmem_bounds.kv_indices_size = maybe_kv_indices.has_value()
-      ? static_cast<int>(maybe_kv_indices.value().size(0)) : 0;
+      ? static_cast<int>(maybe_kv_indices.value().size(0)) : 0;{% if sparse_mode == "OnlyScoreIcp" %}
+  params.gmem_bounds.kv_indices_size =
+      static_cast<int>(maybe_kv_indices.value().size(0) * maybe_kv_indices.value().stride(0));{% endif %}
   params.gmem_bounds.max_score_numel = maybe_max_score.has_value()
       ? static_cast<int>(maybe_max_score.value().size(0)
                          * maybe_max_score.value().size(1)

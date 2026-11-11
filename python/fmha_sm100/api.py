@@ -12,7 +12,10 @@ import math
 from typing import Optional, Tuple, Union
 
 __all__ = [
-    "fmha_sm100_plan", "fmha_sm100", "sparse_topk_select", "nvfp4_head_slot_views",
+    "fmha_sm100_plan", "fmha_sm100", "sparse_topk_select", "sparse_topk_select_prefill",
+    "nvfp4_head_slot_views",
+    "fmha_index_score_sharded_plan", "fmha_index_score_sharded_plan_device",
+    "fmha_index_score_sharded",
     "_fmha_sm100_plan", "_fmha_sm100",
 ]
 
@@ -81,6 +84,8 @@ def _new_ws_cache():
 def _alloc_workspace_buf(tag, size, device, dtype):
     global _workspace_cache
     device_id = torch.device(device).index
+    if device_id is None:
+        device_id = torch.cuda.current_device()
     buf = _workspace_cache[device_id][tag]
     if buf is not None and buf.shape[0] >= size:
         return buf
@@ -527,6 +532,7 @@ def _fmha_sm100_plan(
     device = None,
     stream = None,
     kv_mode3_worklist: bool = True,
+    qo_tile_size: Optional[int] = None,
 ):
     device = torch.cuda.current_device() if device is None else device
     _reset_np_staging()
@@ -612,7 +618,8 @@ def _fmha_sm100_plan(
         plan_qo_offset = None
 
     max_qo_len = max(qo_lens)
-    qo_tile_size = 128 if max_qo_len <= 128 else 256
+    if qo_tile_size is None:
+        qo_tile_size = 128 if max_qo_len <= 128 else 256
     kv_tile_size = 256 if qo_tile_size == 128 else 128
 
     total_qo_len = qo_offsets[-1]
@@ -1542,3 +1549,151 @@ def sparse_topk_select(
     )
 
     return output_indices
+
+
+def sparse_topk_select_prefill(scores, num_valid_pages, carrier, *,
+                             force_begin_blocks=0, force_end_blocks=0,
+                             index_scale=1, index_offset=0):
+    """Write local Top16 into a caller-owned int32 [H,T,33] candidate carrier.
+
+    Scores are contiguous float32 [T,H,K], with int32 valid counts [T]. The
+    carrier can be a head-major query-chunk view: its final stride must be one.
+    Rows contain raw score bits, ascending logical IDs, and a ready marker of
+    one; padding uses -inf/-1. Cutoff ties prefer the lower logical block ID,
+    matching the distributed merge order.
+    The caller orders subsequent collective access on this CUDA stream.
+    """
+    get_sparse_topk_module().sparse_topk_select_prefill(
+        scores, num_valid_pages, carrier,
+        int(force_begin_blocks), int(force_end_blocks),
+        int(index_scale), int(index_offset),
+        torch.cuda.current_stream().cuda_stream,
+    )
+
+
+def fmha_index_score_sharded_plan(qo_segment_lens, kv_segment_lens, num_qo_heads,
+                                  *, qo_offset, device=None):
+    """Plan sharded index scores with Q128 tiles and no head packing or KV split."""
+    plan = _fmha_sm100_plan(
+        qo_segment_lens, kv_segment_lens, num_qo_heads,
+        num_kv_heads=-1, qo_offset=qo_offset, num_kv_splits=1,
+        output_maxscore=True, causal=True,
+        device=device, qo_tile_size=128,
+    )
+    plan["index_score_sharded_shape"] = (int(qo_segment_lens.sum()), num_qo_heads)
+    plan["index_score_sharded_columns"] = (int(kv_segment_lens.max()) + 127) // 128
+    return plan
+
+
+def fmha_index_score_sharded_plan_device(
+    qo_segment_lens, kv_segment_lens, qo_segment_offsets, kv_segment_offsets,
+    qo_offset, num_qo_heads, *, total_q, max_query_len, max_seq_len,
+    packed_work_range, packed_work_info, workspace,
+):
+    """Plan device-resident query segments into caller-owned reusable storage.
+
+    Lengths and offsets are int32 CUDA tensors. Host sizes are upper bounds;
+    no length value is copied to the host. Zero-length segments are allowed.
+    The caller keeps plan storage distinct for each concurrently live plan.
+    """
+    batch = qo_segment_lens.numel()
+    device = qo_segment_lens.device
+    for tensor, size in (
+        (qo_segment_lens, batch), (kv_segment_lens, batch),
+        (qo_segment_offsets, batch + 1), (kv_segment_offsets, batch + 1),
+        (qo_offset, batch),
+    ):
+        if (not tensor.is_cuda or tensor.device != device or tensor.dtype != torch.int32
+                or tensor.ndim != 1 or tensor.numel() != size or not tensor.is_contiguous()):
+            raise ValueError("expected contiguous int32 CUDA segment metadata")
+    if batch < 1 or total_q < 1 or not 0 < max_query_len <= total_q or max_seq_len < 1:
+        raise ValueError("invalid query/sequence bounds")
+    # sum(ceil(q_i / 128)) <= ceil(sum(q_i) / 128) + batch - 1.
+    work_items = ((total_q + 127) // 128 + batch - 1) * num_qo_heads
+    if (num_qo_heads < 1 or packed_work_info.numel() < work_items
+            or packed_work_range.numel() != _get_num_cta(device)):
+        raise ValueError("insufficient index-score plan storage")
+    for tensor in (packed_work_range, packed_work_info):
+        if (tensor.device != device or tensor.dtype != torch.int64
+                or tensor.ndim != 1 or not tensor.is_contiguous()):
+            raise ValueError("expected contiguous int64 CUDA work storage")
+    if (workspace.device != device or workspace.dtype != torch.uint8
+            or not workspace.is_contiguous() or workspace.numel() < 32 * 1024 * 1024):
+        raise ValueError("expected reusable FMHA workspace")
+    _call_plan(
+        qo_segment_offsets, qo_segment_lens, kv_segment_lens,
+        packed_work_range, packed_work_info, 128, 256, num_qo_heads,
+        packed_work_range.numel(), True, qo_offset, 1,
+        None, None, None, 0, None, None, None, 0, 1,
+    )
+    plan = _make_plan_info(
+        packed_work_range, packed_work_info, None, None, None, 1, None, None,
+        max_query_len, 1.0, None, qo_segment_offsets, kv_segment_offsets, None,
+        (max_seq_len + 127) // 128, qo_segment_lens, kv_segment_lens, qo_offset,
+        1, num_qo_heads, False, workspace,
+    )
+    plan["index_score_sharded_shape"] = (total_q, num_qo_heads)
+    plan["index_score_sharded_columns"] = (max_seq_len + 127) // 128
+    return plan
+
+
+def fmha_index_score_sharded(q, k, block_table, plan_info, *, rank,
+                             max_score, sm_scale, initialize=True, tp=2,
+                             compact=False):
+    """Score TP2/TP4 index K into bounded [T,H,B128] buffers.
+
+    q is FP8 [T,H,128]. K pages hold 128/tp interleaved P128 rows or
+    256/tp contiguous P256 rows; block_table contains physical page IDs.
+    Compact P256 scores use one local column per physical page; their TopK
+    caller restores the global B128 IDs with scale two and the rank offset.
+    With initialize=False, only the local causal prefix is defined. Compact
+    TP4 clears its half-width scratch because one rank in a B128 pair can have
+    no rows in the final page.
+    Scores are raw QK maxima, matching the ordinary OnlyScore path.
+    """
+    if tp not in (2, 4) or not 0 <= rank < tp:
+        raise ValueError("sharded index scoring requires TP2/TP4 and rank < tp")
+    if (q.ndim != 3 or q.shape[-1] != 128 or
+            q.dtype != torch.float8_e4m3fn or k.dtype != q.dtype or
+            k.ndim != 3 or k.shape[1] not in (128 // tp, 256 // tp) or k.shape[2] != 128 or
+            not q.is_contiguous() or not k.is_contiguous()):
+        raise ValueError("expected FP8 q [T,H,128] and k [pages,128/tp|256/tp,128]")
+    if (plan_info.get("index_score_sharded_shape") != tuple(q.shape[:2]) or
+            plan_info["pack_factor"] != 1 or plan_info["num_kv_splits"] != 1):
+        raise ValueError("use fmha_index_score_sharded_plan for this query shape")
+    blocks_per_page = k.shape[1] * tp // 128
+    if compact and blocks_per_page != 2:
+        raise ValueError("compact index scores require P256 shards")
+    score_columns = plan_info["index_score_sharded_columns"]
+    if compact:
+        score_columns = (score_columns + 1) // 2
+    if (max_score.ndim != 3 or tuple(max_score.shape[:2]) != tuple(q.shape[:2]) or
+            max_score.shape[-1] < max(1, score_columns) or
+            max_score.dtype != torch.float32):
+        raise ValueError("expected float32 score scratch [T,H,K]")
+    table_cols = (plan_info["index_score_sharded_columns"] + blocks_per_page - 1) // blocks_per_page
+    if (block_table.ndim != 2 or block_table.dtype != torch.int32 or
+            block_table.shape[0] != plan_info["qo_segment_lens"].shape[0] or
+            block_table.shape[1] < table_cols or
+            block_table.stride(1) != 1):
+        raise ValueError("expected one int32 block-table row per query segment")
+    if not q.is_cuda or any(t.device != q.device for t in (k, block_table, max_score)):
+        raise ValueError("index-scoring inputs and scratch must share one CUDA device")
+    k_pages = k.unsqueeze(1)
+    max_qo_len = plan_info["max_qo_len"]
+    variant = get_fmha_variant(_dlpack_dtype_code(q.dtype), 128, max_qo_len <= 64,
+                              4, k.shape[1], False, 1)
+    if initialize or (blocks_per_page == 2 and (not compact or tp == 4)):
+        max_score.fill_(float("-inf"))
+    variant.run(
+        plan_info["cute_workspace_buffer"], q, k_pages, k_pages,
+        plan_info["qo_segment_lens"], plan_info["kv_segment_lens"],
+        plan_info["qo_segment_offsets"], plan_info["kv_segment_offsets"],
+        plan_info["packed_work_range"], plan_info["packed_work_info"],
+        None, sm_scale, 1.0, 1.0, 1.0, 1.0, max_qo_len,
+        plan_info["qo_offset"], 1, None, None, None, None, None, None,
+        128, block_table, None, max_score, max_score.shape[-1], None,
+        1, bool(plan_info["qo_len_uniform"]),
+        torch.cuda.current_stream(q.device).cuda_stream,
+        rank, tp, bool(compact),
+    )

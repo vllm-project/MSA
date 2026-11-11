@@ -47,6 +47,7 @@ struct FMHACutlassSM100Params {
   // kv_indices_ptr[kv_indptr_ptr[b] + p]; batch_size + 1 entries.
   int *kv_indptr_ptr;
   int total_page_num;
+  int physical_page_size = 128;
   int *kv_block_indexes_ptr;
   int kv_block_num;
   int pack_factor = 1;

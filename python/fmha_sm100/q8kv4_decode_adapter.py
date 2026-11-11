@@ -65,7 +65,7 @@ def _plan_blocker(
         return "not a sparse (TopK) plan"
     if kv_block_num > _MAX_BLOCKS:
         return f"{kv_block_num} blocks exceed the kernel's {_MAX_BLOCKS}"
-    if page_size != _PAGE_SIZE:
+    if page_size not in (128, 256):
         return f"page size {page_size} (kernel: {_PAGE_SIZE})"
     if num_kv_heads <= 0 or num_qo_heads % num_kv_heads or (
         num_qo_heads // num_kv_heads not in _GQA_RATIOS
@@ -114,7 +114,7 @@ def attach_plan(
             raise ValueError(f"decode_backend='q8kv4' cannot plan this batch: {blocker}")
         return
     device = _cuda_device(device)
-    page_counts = [(length + _PAGE_SIZE - 1) // _PAGE_SIZE for length in kv_lens]
+    page_counts = [(length + page_size - 1) // page_size for length in kv_lens]
     plan[PLAN_KEY] = {
         "plan": plan_decode(
             batch_size=len(qo_lens),

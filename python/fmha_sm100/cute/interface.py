@@ -465,9 +465,11 @@ def _validate_csr_varlen_nvfp4_kv_inputs(
         if k.shape[-1] != packed_dim:
             raise ValueError(f"KVFP4 packed K/V last dimension must be D/2={packed_dim}")
         page_size = int(k.shape[2])
-        if page_size != int(blk_kv):
+        if page_size != int(blk_kv) and not (
+            kv_layout == "vllm" and page_size == 256 and int(blk_kv) == 128
+        ):
             raise ValueError(
-                f"KVFP4 Sparse Page Attention requires page_size == blk_kv, got {page_size} vs {blk_kv}"
+                f"KVFP4 page_size must equal blk_kv or use vLLM P256/B128, got {page_size} vs {blk_kv}"
             )
         head_kv = int(k.shape[1])
         required_scale_rows = int(k.shape[0]) * head_kv * page_size
@@ -2159,7 +2161,7 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
     schedule_enabled = k2q_row_ptr.shape[1] > 1
     page_size = int(k.shape[2]) if paged_kv else None
     if paged_kv:
-        _prepare_paged_kv_for_tma(k, v, n_block_size)
+        _prepare_paged_kv_for_tma(k, v, page_size)
     k_kernel = k
     v_kernel = v
     O_partial_flat = O_partial.reshape(-1, head_dim).contiguous()

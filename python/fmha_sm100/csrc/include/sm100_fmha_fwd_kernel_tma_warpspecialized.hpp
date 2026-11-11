@@ -263,6 +263,19 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     return apply_variable_length(params.problem_shape, batch_idx);
   }
 
+  // No KV tiles: kv_len == 0, or an ICP shard with no local pages. Every role
+  // uses this one predicate, so the loader's page clamp stays in bounds.
+  template <class LogicalProblemShape>
+  CUTLASS_DEVICE static bool is_empty_work(LogicalProblemShape const& logical_problem_shape,
+                                           Params const& params) {
+    if (get<1>(logical_problem_shape) == 0) return true;
+    if constexpr (CollectiveMainloop::kNeedIcp) {
+      return CollectiveMainloop::Load::icp_local_blocks_exact(
+                 int(get<1>(logical_problem_shape)), params.mainloop.load.kv_block_num) == 0;
+    }
+    return false;
+  }
+
   CUTLASS_DEVICE void operator()(const Params& params, char* smem) {
     GPU_TRACE_INIT;
 
@@ -339,6 +352,17 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
         /*barrier init*/ cute::true_type{}, /*mask calc*/ cute::true_type{});
 #endif
 
+    TmemAllocator tmem_allocator;
+    bool has_work = tile_scheduler.is_valid();
+    if constexpr (CollectiveMainloop::kNeedIcp) {
+      // Empty local ICP shards bypass the MMA pipelines. Allocate before the
+      // block barrier so the epilogue cannot race the TMEM allocation/free.
+      if (role == WarpRole::MMA && has_work) {
+        tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns,
+                                &shared_storage.tmem_base_ptr);
+      }
+    }
+
     __syncthreads();
 
     pipeline_load_q.init_masks(ClusterShape{});
@@ -384,7 +408,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        if (get<1>(logical_problem_shape) == 0) {  // kv_len == 0
+        if (is_empty_work(logical_problem_shape, params)) {  // kv_len == 0
           work_idx++;
           continue;
         }
@@ -526,9 +550,6 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
       pipeline_mma_s1.init_masks(ClusterShape{});
     }
 
-    TmemAllocator tmem_allocator;
-    bool has_work = tile_scheduler.is_valid();
-
     if (role == WarpRole::Epilogue && lane_predicate) {
       CollectiveEpilogue::prefetch_tma_descriptors(params.epilogue);
     }
@@ -582,7 +603,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        if (get<1>(logical_problem_shape) == 0) {
+        if (is_empty_work(logical_problem_shape, params)) {
           continue;
         }
 
@@ -627,7 +648,14 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        if (get<1>(logical_problem_shape) == 0) {
+        if constexpr (CollectiveMainloop::kNeedIcp && CollectiveMainloop::KVPageSize <= 64
+                      && !IsSplitKV) {
+          static_assert(NumWarpsCorrection == 4);
+          mainloop.complete_icp_score_rows(blk_coord, params.mainloop, logical_problem_shape,
+                                           params.problem_shape, epilogue);
+        }
+
+        if (is_empty_work(logical_problem_shape, params)) {
           mainloop.correction_empty(blk_coord, params.mainloop, logical_problem_shape,
                                     params.problem_shape, shared_storage.epilogue,
                                     pipeline_corr_epi, pipeline_corr_epi_producer_state, epilogue);
@@ -672,10 +700,12 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
     } else if (role == WarpRole::MMA) {
       warpgroup_reg_set<NumRegsOther>();
-      // Only allocate TMEM if this SM has work to do
-      if (has_work) {
-        tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns,
-                                &shared_storage.tmem_base_ptr);
+      if constexpr (!CollectiveMainloop::kNeedIcp) {
+        // Only allocate TMEM if this SM has work to do
+        if (has_work) {
+          tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns,
+                                  &shared_storage.tmem_base_ptr);
+        }
       }
 
       CUTLASS_PRAGMA_NO_UNROLL
@@ -689,7 +719,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        if (get<1>(logical_problem_shape) == 0) {
+        if (is_empty_work(logical_problem_shape, params)) {
           continue;
         }
 
@@ -781,7 +811,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
             continue;
           }
-          if (get<1>(logical_problem_shape) == 0) {  // kv_len == 0
+          if (is_empty_work(logical_problem_shape, params)) {  // kv_len == 0
             continue;
           }
 

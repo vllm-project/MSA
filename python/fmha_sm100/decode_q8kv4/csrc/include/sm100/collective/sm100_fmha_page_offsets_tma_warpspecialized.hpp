@@ -56,7 +56,8 @@ template <class Traits> struct Sm100FmhaPageOffsetsTmaWarpspecialized {
     int const page_idx = page_group * Traits::kPageOffsetsPerStage + lane_idx;
     int lookup = page_base;
     if (page_idx < pages_this_batch) {
-      int const page_for_lookup = logical_page >= 0 && logical_page < page_count ? logical_page : 0;
+      int const cache_page = logical_page >> params.physical_page_shift;
+      int const page_for_lookup = logical_page >= 0 && cache_page < page_count ? cache_page : 0;
       lookup += page_for_lookup;
     }
 #if MINIMAX_MSA_Q8KV4_HAS_QMUL4
@@ -75,7 +76,10 @@ template <class Traits> struct Sm100FmhaPageOffsetsTmaWarpspecialized {
     uint64_t *empty_barrier = page_offsets_empty_barrier(storage, stage);
     uint64_t *full_barrier = page_offsets_full_barrier(storage, stage);
     Sm100FmhaBarrier::wait(empty_barrier, producer_empty_phase(group_event), 600);
-    storage.smem_page_offsets_kv.data[stage][lane_idx] = physical_page;
+    // Encode the B128 subpage alongside its physical page, without a second shared array.
+    int const subpage = logical_page & ((1 << params.physical_page_shift) - 1);
+    storage.smem_page_offsets_kv.data[stage][lane_idx] =
+        (physical_page << params.physical_page_shift) | subpage;
     commit_scalar_group(full_barrier);
   }
 

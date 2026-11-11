@@ -105,9 +105,11 @@ class SparseAttentionForwardNvfp4KvSm100:
         if self.paged_kv:
             if page_size is None:
                 raise ValueError("page_size must be provided when paged_kv=True")
-            if page_size != n_block_size:
+            if page_size != n_block_size and not (
+                self.vllm_layout and page_size == 256 and n_block_size == 128
+            ):
                 raise ValueError(
-                    f"page_size ({page_size}) must equal blk_kv ({n_block_size})"
+                    f"page_size ({page_size}) must equal blk_kv ({n_block_size}) or use vLLM P256/B128"
                 )
         else:
             self.page_size = n_block_size
@@ -682,7 +684,7 @@ class SparseAttentionForwardNvfp4KvSm100:
             PagedKVManager.create(
                 mPageTable,
                 page_size=self.page_size,
-                n_block_size=self.n_block_size,
+                n_block_size=self.page_size,
             )
             if const_expr(self.paged_kv)
             else None
@@ -864,7 +866,7 @@ class SparseAttentionForwardNvfp4KvSm100:
             sRowMeta[7] = causal_q_offset
             if const_expr(self.paged_kv):
                 sPagedKvIdx[0] = paged_kv_manager.physical_block_index(
-                    row_batch_idx, row_kv_block_idx
+                    row_batch_idx, row_kv_block_idx // Int32(self.page_size // self.n_block_size)
                 )
             cute.arch.mbarrier_init(mbar_k_ptr, 1)
             cute.arch.mbarrier_init(mbar_v_ptr, 1)
@@ -1395,7 +1397,7 @@ class SparseAttentionForwardNvfp4KvSm100:
                     page = sPagedKvIdx[0]
                     scale_row = self._paged_kv_scale_row(
                         page,
-                        row,
+                        token % Int32(self.page_size),
                         head_kv_idx,
                         num_heads_kv,
                         mKScale, False,
@@ -1463,7 +1465,7 @@ class SparseAttentionForwardNvfp4KvSm100:
                 page = sPagedKvIdx[0]
                 scale_row = self._paged_kv_scale_row(
                     page,
-                    row,
+                    token % Int32(self.page_size),
                     head_kv_idx,
                     num_heads_kv,
                         mKScale, False,
@@ -1572,7 +1574,7 @@ class SparseAttentionForwardNvfp4KvSm100:
                     page = sPagedKvIdx[0]
                     scale_row = self._paged_kv_scale_row(
                         page,
-                        row,
+                        token % Int32(self.page_size),
                         head_kv_idx,
                         num_heads_kv,
                         mVScale, True,
@@ -1641,7 +1643,7 @@ class SparseAttentionForwardNvfp4KvSm100:
                 page = sPagedKvIdx[0]
                 scale_row = self._paged_kv_scale_row(
                     page,
-                    row,
+                    token % Int32(self.page_size),
                     head_kv_idx,
                     num_heads_kv,
                         mVScale, True,
@@ -1729,7 +1731,7 @@ class SparseAttentionForwardNvfp4KvSm100:
                         (self.n_block_size, self.head_dim // 2),
                         (None, 0),
                     )
-                    src_idx = Int32(0)
+                    src_idx = kv_block_idx % Int32(self.page_size // self.n_block_size)
                 else:
                     mK_cur = cute.domain_offset(
                         (k_batch_offset, 0),
@@ -1764,7 +1766,7 @@ class SparseAttentionForwardNvfp4KvSm100:
                         (self.head_dim // 2, self.n_block_size),
                         (0, None),
                     )
-                    src_idx = Int32(0)
+                    src_idx = kv_block_idx % Int32(self.page_size // self.n_block_size)
                 else:
                     mV_cur = cute.domain_offset(
                         (0, k_batch_offset),

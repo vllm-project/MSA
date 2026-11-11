@@ -75,5 +75,6 @@ cudaError_t {{ func_name }}(const FMHACutlassSM100Params& p) {
       static_cast<const uint8_t*>(p.nvfp4_v_data_ptr),
       static_cast<const uint8_t*>(p.nvfp4_v_scale_ptr),
       p.nvfp4_page_stride, p.nvfp4_head_stride_data, p.nvfp4_head_stride_scale,
-      p.dequant_g_k, p.dequant_g_v, p.nvfp4_k_global_scale, p.nvfp4_v_global_scale);
+      p.dequant_g_k, p.dequant_g_v, p.nvfp4_k_global_scale, p.nvfp4_v_global_scale{% if sparse_mode == "OnlyScoreIcp" %},
+      cutlass::fmha::collective::IcpParams{0, p.icp_block_table_row_stride}{% endif %});
 }

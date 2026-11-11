@@ -701,7 +701,8 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
     }
   }
   bool fmha_fwd_sparse_candidate =
-      (q.scalar_type() == at::kFloat8_e4m3fn || q.scalar_type() == at::kByte) && page_size == 128 &&
+      (q.scalar_type() == at::kFloat8_e4m3fn || q.scalar_type() == at::kByte) &&
+      (page_size == 128 || page_size == 256) &&
       head_dim_qk == 128 && head_dim_vo == 128 && (pack_factor == 8 || pack_factor == 16) &&
       fmha_fwd_q_tokens > 0 && num_kv_heads > 0 &&
       orig_num_qo_heads == num_kv_heads * pack_factor && fmha_fwd_layout_ok &&

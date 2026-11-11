@@ -86,6 +86,7 @@ template <class Traits> struct Sm100FmhaFwdKernelParams {
   int batch_size = 0;
   int total_qo_len = 0;
   int total_pages = 0;
+  int physical_page_shift = 0;
   int num_qo_heads = 0;
   int num_kv_heads = 0;
   int num_qo_heads_orig = 0;
@@ -397,10 +398,10 @@ template <class Traits> struct FMHACutlassSM100ParamsBuilder {
 
   static cudaError_t build_kv_desc(CUtensorMap &desc, void *ptr, int num_kv_heads,
                                    int stride_head_bytes, int stride_page_bytes, int total_pages,
-                                   bool unpack4b) {
+                                   int physical_page_size, bool unpack4b) {
     if (!unpack4b) {
       uint64_t global_dim[4] = {
-          static_cast<uint64_t>(Traits::kHeadDim), static_cast<uint64_t>(Traits::kPageSize / 2),
+          static_cast<uint64_t>(Traits::kHeadDim), static_cast<uint64_t>(physical_page_size / 2),
           static_cast<uint64_t>(num_kv_heads), static_cast<uint64_t>(total_pages)};
       uint64_t global_stride_bytes[3] = {static_cast<uint64_t>(Traits::kHeadDim),
                                          static_cast<uint64_t>(stride_head_bytes),
@@ -412,7 +413,7 @@ template <class Traits> struct FMHACutlassSM100ParamsBuilder {
     }
 
     uint64_t global_dim[4] = {
-        static_cast<uint64_t>(Traits::kHeadDim), static_cast<uint64_t>(Traits::kPageSize),
+        static_cast<uint64_t>(Traits::kHeadDim), static_cast<uint64_t>(physical_page_size),
         static_cast<uint64_t>(num_kv_heads), static_cast<uint64_t>(total_pages)};
     uint64_t global_stride_bytes[3] = {static_cast<uint64_t>(Traits::kHeadDim / 2),
                                        static_cast<uint64_t>(stride_head_bytes),
@@ -426,7 +427,7 @@ template <class Traits> struct FMHACutlassSM100ParamsBuilder {
 
   static cudaError_t build_scale_desc(CUtensorMap &desc, void *ptr, int num_kv_heads,
                                       int stride_head_bytes, int stride_page_bytes,
-                                      int total_pages) {
+                                      int total_pages, int physical_page_size) {
     constexpr int kScaleGroups = Traits::kHeadDim / Traits::kScaleGroupSize;
     constexpr int kScaleReshape = 16;
     static_assert(kScaleGroups == 8, "q8kv4 FMHA forward expects 8 scale bytes per token.");
@@ -434,7 +435,7 @@ template <class Traits> struct FMHACutlassSM100ParamsBuilder {
                   "scale TMA reshape must divide the KV tile.");
 
     uint64_t global_dim[4] = {static_cast<uint64_t>(kScaleGroups * kScaleReshape),
-                              static_cast<uint64_t>(Traits::kPageSize / kScaleReshape),
+                              static_cast<uint64_t>(physical_page_size / kScaleReshape),
                               static_cast<uint64_t>(num_kv_heads),
                               static_cast<uint64_t>(total_pages)};
     uint64_t global_stride_bytes[3] = {static_cast<uint64_t>(kScaleGroups * kScaleReshape),
@@ -509,6 +510,7 @@ template <class Traits> struct FMHACutlassSM100ParamsBuilder {
     dst.batch_size = src.batch_size;
     dst.total_qo_len = src.total_qo_len;
     dst.total_pages = src.total_page_num;
+    dst.physical_page_shift = src.physical_page_size == 256 ? 1 : 0;
     dst.num_qo_heads = src.num_qo_heads;
     dst.num_kv_heads = src.num_kv_heads;
     dst.num_qo_heads_orig = src.num_qo_heads_orig;
@@ -543,22 +545,24 @@ template <class Traits> struct FMHACutlassSM100ParamsBuilder {
       return status;
     }
     status = build_kv_desc(dst.tma.k, src.k_ptr, src.num_kv_heads, src.k_stride_h, src.k_stride_n,
-                           src.total_page_num, false);
+                           src.total_page_num, src.physical_page_size, false);
     if (status != cudaSuccess) {
       return status;
     }
     status = build_kv_desc(dst.tma.v, src.v_ptr, src.num_kv_heads, src.v_stride_h, src.v_stride_n,
-                           src.total_page_num, true);
+                           src.total_page_num, src.physical_page_size, true);
     if (status != cudaSuccess) {
       return status;
     }
     status = build_scale_desc(dst.tma.k_scale, src.k_scale_ptr, src.num_kv_heads,
-                              src.k_scale_stride_h, src.k_scale_stride_n, src.total_page_num);
+                              src.k_scale_stride_h, src.k_scale_stride_n, src.total_page_num,
+                              src.physical_page_size);
     if (status != cudaSuccess) {
       return status;
     }
     status = build_scale_desc(dst.tma.v_scale, src.v_scale_ptr, src.num_kv_heads,
-                              src.v_scale_stride_h, src.v_scale_stride_n, src.total_page_num);
+                              src.v_scale_stride_h, src.v_scale_stride_n, src.total_page_num,
+                              src.physical_page_size);
     if (status != cudaSuccess) {
       return status;
     }

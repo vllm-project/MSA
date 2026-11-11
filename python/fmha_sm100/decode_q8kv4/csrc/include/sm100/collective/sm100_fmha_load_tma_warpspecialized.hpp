@@ -173,7 +173,10 @@ template <class Traits> struct Sm100FmhaLoadTmaWarpspecialized {
         Sm100FmhaBarrier::arrive(full_barrier);
       }
     } else {
-      int const physical_page = storage.smem_page_offsets_kv.data[page.page_stage][page.page_lane];
+      int const encoded_page = storage.smem_page_offsets_kv.data[page.page_stage][page.page_lane];
+      int const physical_page = encoded_page >> params.physical_page_shift;
+      int const token_in_page = page.token_in_page +
+          (encoded_page & ((1 << params.physical_page_shift) - 1)) * Traits::kPageSize;
 
       if (tx_bytes == 0) {
         if (lane_predicate) {
@@ -187,10 +190,10 @@ template <class Traits> struct Sm100FmhaLoadTmaWarpspecialized {
         uint32_t const pred = static_cast<uint32_t>(lane_predicate);
 
         Sm100FmhaTma::load_4d_predicated(kv_desc, storage.smem_kv.raw_ptr(stage), full_barrier, 0,
-                                         is_v ? page.token_in_page : page.token_in_page / 2,
+                                         is_v ? token_in_page : token_in_page / 2,
                                          kv_head_idx, physical_page, pred);
         Sm100FmhaTma::load_4d_predicated(scale_desc, storage.smem_kv.scale_ptr(stage), full_barrier,
-                                         0, page.token_in_page / Traits::kScaleGroupSize,
+                                         0, token_in_page / Traits::kScaleGroupSize,
                                          kv_head_idx, physical_page, pred);
       }
     }

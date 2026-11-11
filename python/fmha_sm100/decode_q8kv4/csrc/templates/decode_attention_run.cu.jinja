@@ -107,6 +107,7 @@ void FMHAVariantRun_{{ variant_name }}(
                               : nullptr;
   params.kv_indptr_ptr = static_cast<int *>(kv_indptr.data_ptr());
   params.total_page_num = is_paged ? k.size(0) : 0;
+  params.physical_page_size = page_size;
   params.kv_block_indexes_ptr = kv_block_indexes_ptr;
   params.kv_block_num = maybe_kv_block_indexes.has_value()
                             ? static_cast<int>(maybe_kv_block_indexes.value().size(2))

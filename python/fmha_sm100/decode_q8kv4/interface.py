@@ -458,8 +458,9 @@ def run_decode(
     owns at least one page), and ``topk_indices`` (``[batch * q_len_per_req, Hkv, topk]``) the
     logical page ids relative to the request; all int32 on the plan's device.
 
-    K/V data are ``[physical_pages, Hkv, 128, 64]`` uint8 (two E2M1 per byte) and the block
-    scales ``[physical_pages, Hkv, 128, 8]`` E4M3 views whose token rows are contiguous; page
+    K/V data are ``[physical_pages, Hkv, P, 64]`` uint8 (two E2M1 per byte) and the block
+    scales ``[physical_pages, Hkv, P, 8]`` E4M3 views, with P=128 or 256. TopK indices still
+    name 128-token logical blocks. Token rows are contiguous; page
     and head strides may be padded or interleave data and scales within a page. K scales are
     linear per token; V scales are in token-quad order (:func:`interleave_v_scales`).
 
@@ -482,6 +483,9 @@ def run_decode(
         raise ValueError("kv_cache_sf must be a (K scale, V scale) tuple")
     k_cache, v_cache = paged_kv_cache
     k_scale, v_scale = kv_cache_sf
+    page_size = int(k_cache.shape[2]) if k_cache.ndim == 4 else -1
+    if page_size not in (128, 256):
+        raise ValueError("physical cache page size must be 128 or 256; sparse blocks stay 128")
     if kv_global_scale is None:
         k_global_scale = v_global_scale = plan.unit_scale
     else:
@@ -504,7 +508,7 @@ def run_decode(
             tensor,
             name=name,
             dtype=torch.uint8,
-            shape_tail=(plan.num_kv_heads, _PAGE_SIZE, _KV_DATA_ROW_BYTES),
+            shape_tail=(plan.num_kv_heads, page_size, _KV_DATA_ROW_BYTES),
             row_bytes=_KV_DATA_ROW_BYTES,
         )
     if k_cache.shape != v_cache.shape:
@@ -514,7 +518,7 @@ def run_decode(
             tensor,
             name=name,
             dtype=torch.float8_e4m3fn,
-            shape_tail=(plan.num_kv_heads, _PAGE_SIZE, _SCALE_GROUPS),
+            shape_tail=(plan.num_kv_heads, page_size, _SCALE_GROUPS),
             row_bytes=_KV_SCALE_ROW_BYTES,
         )
         if tensor.shape[0] != k_cache.shape[0]:

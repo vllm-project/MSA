@@ -168,16 +168,23 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   static constexpr bool IsSplitKV = IsSplitKV_;
   static constexpr int KVPageSize = KVPageSize_;
 
-  static constexpr bool kNeedMaxScore = (kSparseAttnMode == SparseAttnMode::OnlyScore || kSparseAttnMode == SparseAttnMode::Full);
-  static constexpr bool kNeedOutput = kSparseAttnMode != SparseAttnMode::OnlyScore;
+  // OnlyScoreIcp: OnlyScore's epilogue with Sparse's block-coordinate machinery.
+  static constexpr bool kNeedIcp = (kSparseAttnMode == SparseAttnMode::OnlyScoreIcp);
+  static constexpr bool kNeedMaxScore = (kSparseAttnMode == SparseAttnMode::OnlyScore || kSparseAttnMode == SparseAttnMode::Full || kNeedIcp);
+  static constexpr bool kNeedOutput = (kSparseAttnMode != SparseAttnMode::OnlyScore) && !kNeedIcp;
   static constexpr bool kNeedSparse = kSparseAttnMode == SparseAttnMode::Sparse;
+  static constexpr bool kNeedBlockCoord = kNeedSparse || kNeedIcp;
+  // OnlyScoreIcp packs world, rank, and the compact-score flag in kv_block_num.
+  CUTLASS_DEVICE static int icp_c_of(int packed) { return packed & 15; }
+  CUTLASS_DEVICE static int icp_rank_of(int packed) { return (packed >> 4) & 15; }
+  CUTLASS_DEVICE static bool icp_compact_score_of(int packed) { return packed & 256; }
   // OnlyScore mode: correction's only real work is writing max_score to GMEM
   // (rescale paths are kNeedOutput-gated). Let softmax do the GMEM write
   // directly from its tile_max register, and have correction skip its own
   // GMEM write. All TMEM round-trip and PipelineC handshakes are preserved
   // for safety (no sync elision in v1 — those are TODO for v2).
   static constexpr bool kFuseMaxScoreIntoSoftmax =
-      (kSparseAttnMode == SparseAttnMode::OnlyScore);
+      (kSparseAttnMode == SparseAttnMode::OnlyScore || kNeedIcp);
 
   struct SplitKVParams {
     float scale_output_splitkv = 1.0f;
@@ -226,6 +233,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   // K-split uses dynamic softmax warp count (controlled by kernel-level warp guard)
   static constexpr bool kEnablePaddingSkip = (get<0>(ThreadShape{}) == 1);
 
+  // OnlyScoreIcp K-split prefill: softmax returns S directly to MMA and hands
+  // correction one completion token per work item instead of one per K stage.
+  template <bool kSingleWG>
+  static constexpr bool kDirectScorePipeline =
+      kNeedIcp && !IsSplitKV && !kSingleWG
+      && get<0>(ThreadShape{}) == 1 && get<1>(ThreadShape{}) == 2;
+
   template <class BlkCoord, class ProblemShape>
   CUTLASS_DEVICE static int get_full_trip_count(BlkCoord const& blk_coord,
                                                  ProblemShape const& problem_shape,
@@ -237,6 +251,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       valid_sparse_blocks = min(valid_sparse_blocks, kv_block_num);
       valid_sparse_blocks = max(valid_sparse_blocks, 1);
       return (valid_sparse_blocks * KVPageSize + tile_kv - 1) / tile_kv;
+    } else if constexpr (kNeedIcp) {
+      return Load::icp_full_trip_count(blk_coord, problem_shape, kv_block_num);
     } else {
       return Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
     }
@@ -282,9 +298,18 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         : ( (get<0>(ThreadShape{}) == 1) ? 4 : 2 );
       // (StageCountKV_dynamic > StageCountKV_base) ? StageCountKV_dynamic : StageCountKV_base;
 
+  // Keep 128 KiB of K payload across ICP page sizes.
+  static constexpr int StageCountKV_prefill = kv_stage_count_of<Mask_>::value
+      ? kv_stage_count_of<Mask_>::value : StageCountKV_shipped;
+  static_assert(kv_stage_count_of<Mask_>::value == 0 ||
+                (kNeedIcp && !IsSplitKV && sizeof(Element_) == 1
+                 && (KVPageSize == 32 || KVPageSize == 64 || KVPageSize == 128)
+                 && get<0>(ThreadShape{}) == 1 && get<1>(ThreadShape{}) == 2),
+                "the deep K ring is restricted to the OnlyScoreIcp FP8 prefill scorer");
+
   static constexpr bool kDequantProducesKV = k2::kDequantProducesKV;
   static constexpr int StageCountKV =
-      kDequantProducesKV ? k2::kStageCountKvK2 : StageCountKV_shipped;
+      kDequantProducesKV ? k2::kStageCountKvK2 : StageCountKV_prefill;
   static_assert(!kDequantProducesKV || StageCountKV >= 4,
                 "StageCountKV < 4 leaves K-split without K_even and K_odd simultaneously");
 
@@ -611,7 +636,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     auto pipeline_kv_release_state = pipeline_kv_consumer_state;
 
     int mask_tile_count;
-    if constexpr (IsSplitKV || kNeedSparse) {
+    if constexpr (IsSplitKV || kNeedBlockCoord) {
       mask_tile_count = get_effective_trip_count(blk_coord, problem_shape,
                                                  kv_tile_begin, kv_tile_end, params.load.kv_block_num);
     } else {
@@ -770,7 +795,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       }
 
       // PV0: P0 * V_even -> O0
-      pipeline_corr.wait();
+      if constexpr (!kDirectScorePipeline<kSingleWG>) pipeline_corr.wait();
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);
       if constexpr(kNeedOutput) {
         // GPU_TRACE_SCOPE(GEMM_PV0);
@@ -813,7 +838,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         }
       }
 
-      pipeline_corr.wait();
+      if constexpr (!kDirectScorePipeline<kSingleWG>) pipeline_corr.wait();
       pipeline_s1.producer_acquire(pipeline_s1_producer_state);
       if constexpr(kNeedOutput) {
         // GPU_TRACE_SCOPE(GEMM_PV1);
@@ -872,7 +897,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     }
 
     // final PV0: P0 * V_last_even -> O0
-    pipeline_corr.wait();
+    if constexpr (!kDirectScorePipeline<kSingleWG>) pipeline_corr.wait();
     pipeline_s0.producer_acquire(pipeline_s0_producer_state);
     if constexpr(kNeedOutput) {
       GPU_TRACE_SCOPE(GEMM_PV0);
@@ -893,7 +918,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     }
 
     // final PV1: P1 * V_last -> O1
-    pipeline_corr.wait();
+    if constexpr (!kDirectScorePipeline<kSingleWG>) pipeline_corr.wait();
     pipeline_s1.producer_acquire(pipeline_s1_producer_state);
     if constexpr(kNeedOutput) {
       GPU_TRACE_SCOPE(GEMM_PV1);
@@ -940,7 +965,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     static auto _dummy_tStS_P() { return _dummy_tStS().compose(make_layout(make_shape(_128{}, _tilePlikeFP32()))); }
 
     using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b32x;
-    using TMEM_STORE = SM100_TMEM_STORE_32dp32b32x;
+    // The P tile is get<1>(TileShapeQK)/4 * sizeof(Element) columns: 16 for the page-64 ICP scorer.
+    using TMEM_STORE = std::conditional_t<(decltype(_tilePlikeFP32())::value >= 32),
+                                          SM100_TMEM_STORE_32dp32b32x,
+                                          std::conditional_t<(decltype(_tilePlikeFP32())::value >= 16),
+                                                             SM100_TMEM_STORE_32dp32b16x,
+                                                             SM100_TMEM_STORE_32dp32b8x>>;
     using TMEM_STORE_V = SM100_TMEM_STORE_32dp32b2x;
 
     static auto _dummy_load() { return make_tmem_copy(TMEM_LOAD{}, _dummy_tStS()); }
@@ -986,7 +1016,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       tTMEM_STOREtS_x4.data() = warp_uniform(tTMEM_STOREtS_x4.data().get());
     }
 
-    template <bool need_apply_mask, bool skip_computation = false, class Stage, class BlkCoord,
+    template <bool need_apply_mask, bool skip_computation = false,
+              bool direct_score_pipeline = false, class Stage, class BlkCoord,
               class CountingTensor, class ProblemShape>
     CUTLASS_DEVICE void step(float& row_max, float& row_sum, Stage stage, bool final_call,
                              BlkCoord const& blk_coord, CountingTensor const& cS,
@@ -1048,7 +1079,20 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       if constexpr (!skip_computation) {
         copy(tiled_tmem_load, l_tTMEM_LOADtS, tTMEM_LOADrS);
         if constexpr (need_apply_mask) {
-          Mask{}.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, problem_shape);
+          if constexpr (kNeedIcp) {
+            const int offset_q = Mask::get_qo_offset(problem_shape);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(tTMEM_LOADrS); ++i) {
+              auto pos = tTMEM_LOADcS(i);
+              int global_k = Load::icp_global_row(int(get<1>(pos)), params.load.kv_block_num);
+              if (global_k >= int(get<1>(problem_shape)) ||
+                  global_k > int(get<0>(pos)) + offset_q) {
+                tTMEM_LOADrS(i) = -INFINITY;
+              }
+            }
+          } else {
+            Mask{}.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, problem_shape);
+          }
         }
       }}
 
@@ -1095,7 +1139,20 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       // reads V0/V1 for the rescale path's old/new max math, which is also
       // kept for sync safety in v1).
       if constexpr (kFuseMaxScoreIntoSoftmax) {
-        if (ms_base != nullptr) {
+        // K-split stage 1 starts one tile past an odd tile count; ICP rows hold max_k_tiles.
+        bool in_row = true;
+        if constexpr (kNeedIcp) {
+          if (icp_compact_score_of(params.load.kv_block_num)) {
+            in_row = k_tile_idx < params.load.icp.max_k_tiles;
+          } else {
+            int block =
+                Load::icp_global_row(k_tile_idx * KVPageSize,
+                                     params.load.kv_block_num) /
+                128;
+            in_row = block < params.load.icp.max_k_tiles;
+          }
+        }
+        if (ms_base != nullptr && in_row) {
 #ifdef FMHA_GMEM_BOUNDS_CHECK
           gmem_stwt_checked(ms_base + k_tile_idx * ms_stride_k, tile_max,
                             ms_check_base, ms_check_numel, "max_score_stwt");
@@ -1124,8 +1181,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         copy(tiled_tmem_storev, tTMEM_STOREVrS, l_tTMEM_STOREVtS);
       }
 
-      pipeline_c.producer_commit(pipeline_c_producer_state);
-      ++pipeline_c_producer_state;
+      if constexpr (!direct_score_pipeline) {
+        pipeline_c.producer_commit(pipeline_c_producer_state);
+        ++pipeline_c_producer_state;
+      }
 
       Tensor tTMEM_STORErS_x4 = make_tensor<uint32_t>(shape(tTMEM_STOREcS));
 
@@ -1190,7 +1249,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       CUTE_STATIC_ASSERT_V(size<2>(tTMEM_STORErS_x4) <= _2{});
       CUTE_STATIC_ASSERT_V(size<1>(tTMEM_STORErS_x4) == _1{});
-      if constexpr (skip_computation) {
+      if constexpr (skip_computation && !direct_score_pipeline) {
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < size<2>(tTMEM_STORErS_x4); ++k) {
           copy(tiled_tmem_store, tTMEM_STORErS_x4(_, _, k), l_tTMEM_STOREtS_x4(_, _, k));
@@ -1200,12 +1259,19 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
             l_tTMEM_STOREtS_x4(_, _, size<2>(tTMEM_STORErS_x4) - 1));
       }
 
-      cutlass::arch::fence_view_async_tmem_store();
+      if constexpr (direct_score_pipeline) {
+        // No P/V-statistic store here: fence the S load before returning S to MMA.
+        cutlass::arch::fence_view_async_tmem_load();
+      } else {
+        cutlass::arch::fence_view_async_tmem_store();
+      }
 
       pipeline_s.consumer_release(pipeline_s_consumer_state);
       ++pipeline_s_consumer_state;
 
-      pipeline_c.producer_acquire(pipeline_c_producer_state);
+      if constexpr (!direct_score_pipeline) {
+        pipeline_c.producer_acquire(pipeline_c_producer_state);
+      }
 
       {GPU_TRACE_SCOPE(SOFTMAX_Sum);
       if constexpr (!skip_computation && kNeedOutput) {
@@ -1243,15 +1309,17 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       if (final_call) {
         pipeline_s.consumer_wait(pipeline_s_consumer_state);
 
-        Tensor tTMEM_STOREVrS = make_tensor<ElementQK>(shape(tTMEM_STOREVcS));
-        if constexpr (!skip_computation && kNeedOutput) {
-          tTMEM_STOREVrS(kIdxFinalRowMax) = row_max;
-          tTMEM_STOREVrS(kIdxFinalRowSum) = row_sum;
-        } else {
-          tTMEM_STOREVrS(kIdxFinalRowMax) = 0;
-          tTMEM_STOREVrS(kIdxFinalRowSum) = 0;
+        if constexpr (!direct_score_pipeline) {
+          Tensor tTMEM_STOREVrS = make_tensor<ElementQK>(shape(tTMEM_STOREVcS));
+          if constexpr (!skip_computation && kNeedOutput) {
+            tTMEM_STOREVrS(kIdxFinalRowMax) = row_max;
+            tTMEM_STOREVrS(kIdxFinalRowSum) = row_sum;
+          } else {
+            tTMEM_STOREVrS(kIdxFinalRowMax) = 0;
+            tTMEM_STOREVrS(kIdxFinalRowSum) = 0;
+          }
+          copy(tiled_tmem_storev, tTMEM_STOREVrS, l_tTMEM_STOREVtS);
         }
-        copy(tiled_tmem_storev, tTMEM_STOREVrS, l_tTMEM_STOREVtS);
       }}
     }  // end step()
   };
@@ -1313,6 +1381,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         real_masked_count = valid_tiles;
       }
       unmasked_count = 0;
+    } else if constexpr (kNeedIcp) {
+      total_trip_count = full_trip_count;
+      effective_end = full_trip_count;
+      skip_count = 0;
+      real_masked_count = total_trip_count;
+      unmasked_count = 0;
     } else if constexpr (IsSplitKV) {
       effective_end = full_trip_count < kv_tile_end ? full_trip_count : kv_tile_end;
       int local_trip = effective_end - kv_tile_begin;
@@ -1356,7 +1430,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     int sparse_tile_counter = 0;
     // Returns true if tile is fully unmasked (sorted blocks → all remaining are too)
     auto sparse_update_cS = [&]() -> bool {
-      if constexpr (kNeedSparse) {
+      if constexpr (kNeedBlockCoord) {
         int tile_from_end = effective_end - 1 - sparse_tile_counter;
         int q_s = get<0>(blk_coord) * get<0>(TileShape{})
                 + (stage % get<0>(ThreadShape{})) * get<0>(TileShapeQK{})
@@ -1366,20 +1440,36 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         uint page_idx = uint(sparse_linear_pos / KVPageSize);
         int offset_in_page = sparse_linear_pos % KVPageSize;
         sparse_tile_counter++;
-        if (page_idx >= params.load.kv_block_num) {
-          cS = domain_offset(make_coord(q_s, INT_MAX / 2), cS_base);
-          return false;
-        }
-        int pos = __ldg(&params.load.kv_block_indexes[kbi_off_s + page_idx]);
-        if (pos < 0) {
-          cS = domain_offset(make_coord(q_s, INT_MAX / 2), cS_base);
-          return false;
+        int pos;
+        if constexpr (kNeedIcp) {
+          // The causal mask maps these local rows to global token positions.
+          int nloc = Load::icp_local_blocks_exact(int(get<1>(problem_shape)), params.load.kv_block_num);
+          if (int(page_idx) >= nloc) {
+            cS = domain_offset(make_coord(q_s, INT_MAX / 16), cS_base);
+            return false;
+          }
+          pos = int(page_idx);
+        } else {
+          if (page_idx >= params.load.kv_block_num) {
+            cS = domain_offset(make_coord(q_s, INT_MAX / 2), cS_base);
+            return false;
+          }
+          pos = __ldg(&params.load.kv_block_indexes[kbi_off_s + page_idx]);
+          if (pos < 0) {
+            cS = domain_offset(make_coord(q_s, INT_MAX / 2), cS_base);
+            return false;
+          }
         }
         int kv_coord = pos * KVPageSize + offset_in_page;
         cS = domain_offset(make_coord(q_s, kv_coord), cS_base);
         int causal_bound = Mask{}.sparse_causal_bound(q_s, problem_shape);
         constexpr int sub_tile_kv = get<1>(TileShapeQK{});
-        return kv_coord + sub_tile_kv <= causal_bound + 1;
+        if constexpr (kNeedIcp) {
+          return Load::icp_global_row(kv_coord + sub_tile_kv - 1, params.load.kv_block_num)
+                     <= causal_bound;
+        } else {
+          return kv_coord + sub_tile_kv <= causal_bound + 1;
+        }
       }
       return false;
     };
@@ -1454,6 +1544,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         } else {
           packed_maxscore_path();
         }
+        if constexpr (kNeedIcp) {
+          if (KVPageSize * icp_c_of(params.load.kv_block_num) == 256 &&
+              !icp_compact_score_of(params.load.kv_block_num)) {
+            ms_base += icp_rank_of(params.load.kv_block_num) * KVPageSize / 128 * ms_stride_k;
+            ms_stride_k *= 2;
+          }
+        }
       }
 
 #ifdef FMHA_GMEM_BOUNDS_CHECK
@@ -1475,7 +1572,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     CUTLASS_PRAGMA_NO_UNROLL
     for (int i = 0; i < skip_count; i++) {
       bool is_last_step = (i == skip_count - 1) && (real_masked_count == 0) && (unmasked_count == 0);
-      softmax_ctx.template step<true, true /* skip_computation */>(
+      softmax_ctx.template step<true, true /* skip_computation */,
+                                kDirectScorePipeline<kSingleWG>>(
           row_max, row_sum, stage, is_last_step,
           blk_coord, cS, params, problem_shape, pipeline_s, pipeline_s_consumer_state, pipeline_c,
           pipeline_c_producer_state, ms_base, ms_stride_k, k_tile_idx, k_tile_idx_step
@@ -1487,7 +1585,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         #endif
         );
 
-      if constexpr (!kNeedSparse) {
+      if constexpr (!kNeedBlockCoord) {
         cS.data() = cS.data() + E<1>{} * (-(int)(get<1>(ThreadShape{}) * get<1>(TileShapeQK{})));
       }
       else {
@@ -1495,13 +1593,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       }
     }
 
-    if constexpr (kNeedSparse) {
+    if constexpr (kNeedBlockCoord) {
       // Masked loop: step<true> for skip-above + near-diagonal tiles.
       // Blocks are sorted so once we hit cls==1 (unmasked), all remaining are unmasked.
       int valid_remaining = real_masked_count;
       CUTLASS_PRAGMA_NO_UNROLL
       for (; valid_remaining > 0; ) {
-        softmax_ctx.template step<true /* masked */>(
+        softmax_ctx.template step<true /* masked */, false,
+                                  kDirectScorePipeline<kSingleWG>>(
             row_max, row_sum, stage,
             (valid_remaining == 1),
             blk_coord, cS, params, problem_shape, pipeline_s, pipeline_s_consumer_state, pipeline_c,
@@ -1519,7 +1618,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       CUTLASS_PRAGMA_NO_UNROLL
       for (; valid_remaining > 0; valid_remaining--) {
-        softmax_ctx.template step<false /* unmasked */>(
+        softmax_ctx.template step<false /* unmasked */, false,
+                                  kDirectScorePipeline<kSingleWG>>(
             row_max, row_sum, stage,
             (valid_remaining == 1),
             blk_coord, cS, params, problem_shape, pipeline_s, pipeline_s_consumer_state, pipeline_c,
@@ -1537,7 +1637,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       int mask_tile_count = real_masked_count;
       CUTLASS_PRAGMA_NO_UNROLL
       for (; mask_tile_count > 0; mask_tile_count -= 1) {
-        softmax_ctx.template step<true /* need_apply_mask */>(
+        softmax_ctx.template step<true /* need_apply_mask */, false,
+                                  kDirectScorePipeline<kSingleWG>>(
             row_max, row_sum, stage,
             (mask_tile_count == 1) && (unmasked_count == 0),
             blk_coord, cS, params, problem_shape, pipeline_s, pipeline_s_consumer_state, pipeline_c,
@@ -1557,7 +1658,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       mask_tile_count = unmasked_count;
       CUTLASS_PRAGMA_NO_UNROLL
       for (; mask_tile_count > 0; mask_tile_count -= 1) {
-        softmax_ctx.template step<false /* need_apply_mask */>(
+        softmax_ctx.template step<false /* need_apply_mask */, false,
+                                  kDirectScorePipeline<kSingleWG>>(
             row_max, row_sum, stage,
             mask_tile_count == 1,
             blk_coord, cS, params, problem_shape, pipeline_s, pipeline_s_consumer_state, pipeline_c,
@@ -1574,13 +1676,21 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       }
     }
 
-    pipeline_c.producer_commit(pipeline_c_producer_state);
-    ++pipeline_c_producer_state;
-
-    pipeline_c.producer_acquire(pipeline_c_producer_state);
+    if constexpr (!kDirectScorePipeline<kSingleWG>) {
+      pipeline_c.producer_commit(pipeline_c_producer_state);
+      ++pipeline_c_producer_state;
+      pipeline_c.producer_acquire(pipeline_c_producer_state);
+    }
     // empty step to sync against pipe s
     pipeline_s.consumer_release(pipeline_s_consumer_state);
     ++pipeline_s_consumer_state;
+
+    if constexpr (kDirectScorePipeline<kSingleWG>) {
+      // One completion token per stage and item, after all score stores.
+      pipeline_c.producer_commit(pipeline_c_producer_state);
+      ++pipeline_c_producer_state;
+      pipeline_c.producer_acquire(pipeline_c_producer_state);
+    }
     RELEASE_GPU_TRACE;
   }
 
@@ -1921,6 +2031,21 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       SplitKVParams split_kv = {}) {
 
     GET_GPU_TRACE(TRACE_CORR && (cutlass::canonical_warp_idx_sync() % 4 == 0));
+
+    if constexpr (kDirectScorePipeline<kSingleWG>) {
+      // No correction math: consume both stage tokens, then release the epilogue.
+      pipeline_s0_c.consumer_wait(pipeline_s0_c_consumer_state);
+      pipeline_s0_c.consumer_release(pipeline_s0_c_consumer_state);
+      ++pipeline_s0_c_consumer_state;
+      pipeline_s1_c.consumer_wait(pipeline_s1_c_consumer_state);
+      pipeline_s1_c.consumer_release(pipeline_s1_c_consumer_state);
+      ++pipeline_s1_c_consumer_state;
+      pipeline_epi.producer_acquire(pipeline_epi_producer_state);
+      pipeline_epi.producer_commit(pipeline_epi_producer_state);
+      ++pipeline_epi_producer_state;
+      RELEASE_GPU_TRACE;
+      return;
+    }
 
     int mask_tile_count = get_effective_trip_count(blk_coord, problem_shape,
                                                    kv_tile_begin, kv_tile_end, params.load.kv_block_num);
@@ -2302,6 +2427,37 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     ++pipeline_epi_producer_state;
     } // end Q-split/K-split
     RELEASE_GPU_TRACE;
+  }
+
+  template <class BlkCoord, class ProblemShape, class ParamsProblemShape, class CollectiveEpilogue>
+  CUTLASS_DEVICE void complete_icp_score_rows(
+      BlkCoord const& blk_coord, Params const& params, ProblemShape const& problem_shape,
+      ParamsProblemShape const& params_problem_shape, CollectiveEpilogue const& epilogue) {
+    if (KVPageSize * icp_c_of(params.load.kv_block_num) != 128) return;
+    constexpr int kColumnsPerTrip = get<1>(ThreadShape{});
+    int covered = Load::icp_local_blocks_exact(int(get<1>(problem_shape)),
+                                              params.load.kv_block_num) == 0
+                      ? 0 : get_full_trip_count(blk_coord, problem_shape,
+                                                params.load.kv_block_num) * kColumnsPerTrip;
+    int begin = int(get<0>(blk_coord)) * int(get<0>(TileShape{}));
+    int end = min(begin + int(get<0>(TileShape{})), int(get<0>(problem_shape)));
+    int offset = Mask::get_qo_offset(problem_shape);
+    int last = min(int(get<1>(problem_shape)), offset + end);
+    if (covered >= (last + 127) / 128) return;
+    int batch_idx = get<2, 1>(blk_coord);
+    int _seg_off_sz = get<3, 1>(params_problem_shape) + 1;
+    int segment_offset = SEG_OFF_LOAD(get<0>(params_problem_shape), batch_idx,
+                                      _seg_off_sz);
+    Tensor scores = make_tensor(make_gmem_ptr(epilogue.params.ptr_MaxScore),
+                                 epilogue.params.layout_MaxScore);
+    // These columns have no local K and are outside every softmax store.
+    for (int row = begin + threadIdx.x % 128; row < end; row += 128) {
+      int valid = min(int(get<1>(problem_shape)), offset + row + 1);
+      int columns = min((valid + 127) / 128, params.load.icp.max_k_tiles);
+      for (int column = covered; column < columns; ++column) {
+        scores(segment_offset + row, get<2, 0>(blk_coord), column) = -INFINITY;
+      }
+    }
   }
 
   template <class BlkCoord, class ProblemShape, class ParamsProblemShape, class TensorStorageEpi,
