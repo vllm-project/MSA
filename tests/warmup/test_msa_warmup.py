@@ -79,7 +79,7 @@ def _cache(kind, pages, heads, device):
     return (torch.randn((pages, heads, PAGE, 128), device=device) * 0.1).to(dtype)
 
 
-def _run_decode(config, device, batch, q_len):
+def _run_decode(config, device, batch, q_len, **kwargs):
     kind = config["kv_cache_dtype"].replace("auto", "bf16")
     heads, q_heads = config["num_kv_heads"], config["num_q_heads"]
     kv_len, pages = 32 * PAGE, 64  # requests share a pool of 64 physical pages
@@ -107,7 +107,7 @@ def _run_decode(config, device, batch, q_len):
         one = torch.ones(1, dtype=torch.float32, device=device)
         scales = dict(k_scale=one, v_scale=one)
     fmha_sm100(q, k, v, plan, kv_indices=kv_indices, kv_block_indexes=lists, sm_scale=0.088,
-               **scales)
+               **scales, **kwargs)
 
 
 def _run_q8kv4_prefill(config, device):
@@ -162,3 +162,17 @@ def test_serving_paths_need_no_build_after_warmup(device, monkeypatch, name):
     torch.cuda.synchronize()
     requested = set(jit.requested_fmha_variants()) - before
     assert requested <= set(report.fmha_variants), sorted(requested - set(report.fmha_variants))
+
+
+def test_mxfp8_decode_needs_no_build_after_warmup(device, monkeypatch):
+    config = CONFIGS["nvfp4_kv4_spec"]
+    warmup(**config, decode_output_mxfp8=True)
+    _no_native_builds(monkeypatch)
+    cols = config["num_q_heads"] * 128
+    for q_len in config["decode_query_lens"]:
+        for batch in BATCHES:
+            rows = batch * q_len
+            data = torch.empty((rows, cols), dtype=torch.float8_e4m3fn, device=device)
+            scale = torch.empty(-(-rows // 128) * 128 * cols // 32, dtype=torch.uint8, device=device)
+            _run_decode(config, device, batch, q_len, out_mxfp8=(data, scale))
+    torch.cuda.synchronize()

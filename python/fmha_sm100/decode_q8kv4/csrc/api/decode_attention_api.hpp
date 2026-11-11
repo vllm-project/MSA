@@ -67,7 +67,8 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
                             at::Tensor seq_lens, at::Tensor kv_indices, at::Tensor kv_indptr,
                             at::Tensor topk_indices, at::Tensor k_scale, at::Tensor v_scale,
                             at::Tensor out, float sm_scale, at::Tensor k_global_scale,
-                            at::Tensor v_global_scale, int block_scale_shift);
+                            at::Tensor v_global_scale, int block_scale_shift,
+                            at::Tensor out_mxfp8 = {}, at::Tensor out_mxfp8_scale = {});
 
 std::unique_ptr<PlanInfo> make_decode_plan(at::Tensor qo_segment_lens, at::Tensor kv_segment_lens,
                                            int num_qo_heads, int num_kv_heads, int num_kv_splits,
@@ -84,10 +85,15 @@ std::unique_ptr<PlanInfo> make_decode_plan(at::Tensor qo_segment_lens, at::Tenso
 // code x block_scale x global_scale); block_scale_shift selects the kernel that divides the block
 // scales by 2^shift before the dequant product (0: products already fit E4M3; 3: block scales use
 // the full E4M3 range, the vLLM / TransformerEngine convention).
+// out ([tokens, heads, 128] BF16) and/or out_mxfp8 (E4M3 [tokens, heads * 128] with
+// out_mxfp8_scale, UE8M0 in the 128x4 swizzled layout, rows padded to 128 and zeroed) receive
+// the output; at least one is required. Returns out (undefined without it).
 at::Tensor run_decode(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &plan_info,
                       at::Tensor seq_lens, at::Tensor kv_indices, at::Tensor kv_indptr,
                       at::Tensor topk_indices, at::Tensor k_scale, at::Tensor v_scale,
-                      at::Tensor out, float sm_scale, at::Tensor k_global_scale,
-                      at::Tensor v_global_scale, int block_scale_shift);
+                      std::optional<at::Tensor> out, float sm_scale, at::Tensor k_global_scale,
+                      at::Tensor v_global_scale, int block_scale_shift,
+                      std::optional<at::Tensor> out_mxfp8 = std::nullopt,
+                      std::optional<at::Tensor> out_mxfp8_scale = std::nullopt);
 
 } // namespace fmha_sm100::decode_q8kv4

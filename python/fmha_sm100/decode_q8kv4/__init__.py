@@ -64,6 +64,7 @@ try:
         device=None,
         gqa_ratio=16,
         block_scale_shift=0,
+        output_mxfp8=False,
     ):
         return get_fmha_fwd_variant(
             topk=int(topk),
@@ -71,6 +72,7 @@ try:
             gqa_ratio=int(gqa_ratio),
             device=None if device is None else int(device),
             block_scale_shift=int(block_scale_shift),
+            output_mxfp8=bool(output_mxfp8),
         )._fn
 
     def _jit_get_plan(device=None):

@@ -26,5 +26,6 @@ PYBIND11_MODULE(_fmha_sm100_decode_q8kv4_cpp, module) {
              py::arg("seq_lens"), py::arg("kv_indices"), py::arg("kv_indptr"),
              py::arg("topk_indices"), py::arg("k_scale"), py::arg("v_scale"), py::arg("out"),
              py::arg("sm_scale"), py::arg("k_global_scale"), py::arg("v_global_scale"),
-             py::arg("block_scale_shift"));
+             py::arg("block_scale_shift"), py::arg("out_mxfp8") = py::none(),
+             py::arg("out_mxfp8_scale") = py::none());
 }

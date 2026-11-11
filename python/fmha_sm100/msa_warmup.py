@@ -140,6 +140,7 @@ def plan_warmup(
     sparse_decode: bool = True,
     sparse_prefill: bool = True,
     prefill_backend: str = "auto",
+    decode_output_mxfp8: bool = False,
     device=None,
 ) -> list[WarmupItem]:
     """The native kernels ``warmup`` builds for this configuration (nothing is compiled)."""
@@ -184,10 +185,11 @@ def plan_warmup(
                              lambda: q8kv4_jit.get_reduction_module(device))]
         for split_kv in (False, True):
             items.append(WarmupItem(
-                f"q8kv4 decode gqa{gqa} split={split_kv} shift={block_scale_shift}",
+                f"q8kv4 decode gqa{gqa} split={split_kv} shift={block_scale_shift} "
+                f"mxfp8={decode_output_mxfp8}",
                 lambda split_kv=split_kv: q8kv4_jit.get_fmha_fwd_variant(
-                    topk=topk, split_kv=split_kv, gqa_ratio=gqa,
-                    device=device, block_scale_shift=block_scale_shift)))
+                    topk=topk, split_kv=split_kv, gqa_ratio=gqa, device=device,
+                    block_scale_shift=block_scale_shift, output_mxfp8=decode_output_mxfp8)))
     elif sparse_decode:
         dtype = "bf16" if kv_dtype == "bf16" else "fp8"
         kv_format = "nvfp4" if kv_dtype == "nvfp4" else None
@@ -255,6 +257,7 @@ def warmup(
     sparse_decode: bool = True,
     sparse_prefill: bool = True,
     prefill_backend: str = "auto",
+    decode_output_mxfp8: bool = False,
     device=None,
     max_workers: int | None = None,
 ) -> WarmupReport:
@@ -271,15 +274,17 @@ def warmup(
     ``"bf16"``/``"fp8"``, nothing for ``None``.
     Head counts are per rank; ``decode_query_lens`` are the uniform decode query lengths
     (``1 + num_speculative_tokens``); ``block_scale_shift`` is the NVFP4 staging shift the
-    plans use (3 by default). Kernels already in the cache are only loaded. Safe to call from
-    every rank at once: builds share the JIT's cache locks.
+    plans use (3 by default); ``decode_output_mxfp8`` builds the Q8KV4 decode kernels that write
+    MXFP8 instead of BF16. Kernels already in the cache are only loaded. Safe to call from every
+    rank at once: builds share the JIT's cache locks.
     """
     started = time.time()
     items = plan_warmup(
         kv_cache_dtype, index_cache_dtype, num_q_heads, num_kv_heads, topk, decode_query_lens,
         num_index_heads=num_index_heads, page_size=page_size, decode_backend=decode_backend,
         block_scale_shift=block_scale_shift, sparse_decode=sparse_decode,
-        sparse_prefill=sparse_prefill, prefill_backend=prefill_backend, device=device)
+        sparse_prefill=sparse_prefill, prefill_backend=prefill_backend,
+        decode_output_mxfp8=decode_output_mxfp8, device=device)
     from . import jit
 
     variants = [item.fmha_variant for item in items if item.fmha_variant]
@@ -319,6 +324,8 @@ def _main() -> None:
     parser.add_argument("--no-sparse-decode", action="store_true")
     parser.add_argument("--no-sparse-prefill", action="store_true")
     parser.add_argument("--prefill-backend", default="auto", choices=("auto", "q8kv4", "cute_dsl"))
+    parser.add_argument("--decode-output-mxfp8", action="store_true",
+                        help="build the Q8KV4 decode kernels that write MXFP8 output")
     parser.add_argument("--jobs", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true", help="list the kernels, build nothing")
     args = parser.parse_args()
@@ -328,7 +335,8 @@ def _main() -> None:
         decode_query_lens=[int(v) for v in args.decode_query_lens.split(",")],
         num_index_heads=args.num_index_heads, decode_backend=args.decode_backend,
         block_scale_shift=args.block_scale_shift, sparse_decode=not args.no_sparse_decode,
-        sparse_prefill=not args.no_sparse_prefill, prefill_backend=args.prefill_backend)
+        sparse_prefill=not args.no_sparse_prefill, prefill_backend=args.prefill_backend,
+        decode_output_mxfp8=args.decode_output_mxfp8)
     if args.dry_run:
         for item in plan_warmup(**kwargs):
             print(item.label)

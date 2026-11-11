@@ -14,6 +14,7 @@
 #include "cutlass/arch/barrier.h"
 #include "cutlass/cutlass.h"
 #include "fmha_common.hpp"
+#include "mxfp8_output.cuh"
 #include "sm100_fmha_fp4_transform.cuh"
 #include "sm100_fmha_kv_transform_tma_warpspecialized.hpp"
 #include "sm100_fmha_pipeline.hpp"
@@ -43,6 +44,11 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
     int selection_event = 0;
     uint32_t merge_stage_phase = 0;
     bool grid_dependency_synchronized = false;
+    // The item whose O tile waits in smem_o for commit_staged_o.
+    bool o_staged = false;
+    int staged_batch_idx = 0;
+    int staged_kv_head_idx = 0;
+    int staged_q_token_idx = 0;
     typename KvTransform::VState sparse_v_state;
     // Host scales x global scales, read once per CTA after the grid dependency.
     float scale_log2 = 0.f;
@@ -377,6 +383,12 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
         remaining_heads < Traits::kHeadGroup ? remaining_heads : Traits::kHeadGroup;
     int const qo_offset = fmha_fwd_q_token_global_index<Traits>(params, batch_idx, q_token_idx);
 
+    if constexpr (Traits::kOutputMxfp8) {
+      copy_o_smem_to_mxfp8(storage, params, kv_head_idx, qo_offset, valid_rows, warp_group_lane);
+      if (params.o_ptr == nullptr) {
+        return;
+      }
+    }
     uint8_t *smem_base = storage.smem_o.data;
     uint8_t *gmem_base = reinterpret_cast<uint8_t *>(params.o_ptr) +
                          (static_cast<int64_t>(qo_offset) * params.num_qo_heads_orig + head_base) *
@@ -402,6 +414,72 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
                                      cute::make_shape(cute::Int<4>{}));
         cute::copy(cute::AutoVectorizingCopyWithAssumedAlignment<128>{}, src, dst);
       }
+    }
+  }
+
+  // copy_o_smem_to_global's O tile quantized to MXFP8, in one pass: a thread takes
+  // 128 * kHeadGroup / 128 consecutive values of one head row (16 with 16 heads, two 16 B
+  // vectors; 8 with 8 heads), so 2 (4) adjacent lanes hold a 32-value block, and the block's
+  // first lane stores its scale. The item of the last token's first KV head also zeroes the
+  // padding rows' scales.
+  CUTLASS_DEVICE static void copy_o_smem_to_mxfp8(Storage &storage, Params const &params,
+                                                  int kv_head_idx, int qo_offset, int valid_rows,
+                                                  int warp_group_lane) {
+    namespace mx = fmha_sm100::decode_q8kv4::sm100::common;
+    static_assert(Traits::kHeadDim == 128, "a head row is four MXFP8 blocks");
+    constexpr int kVecBytes = 16;
+    constexpr int kSmemRowBytes = 128;
+    constexpr int kThreads = Traits::kNumSoftmaxWarps * cutlass::NumThreadsPerWarp;
+    constexpr int kValues = Traits::kHeadGroup * Traits::kHeadDim / kThreads;
+    constexpr int kWords = kValues / 2;
+    constexpr int kThreadsPerHead = Traits::kHeadDim / kValues;
+    constexpr int kLanesPerBlock = mx::kMxfp8Block / kValues;
+    static_assert(kValues == 8 || kValues == 16, "8 or 16 values per thread");
+
+    unsigned const lane = static_cast<unsigned>(warp_group_lane);
+    unsigned const head = lane / kThreadsPerHead;
+    unsigned const dim = (lane % kThreadsPerHead) * kValues;
+    // Smem rows [0, kHeadGroup) hold dims [0, 64) of each head, the next kHeadGroup rows
+    // dims [64, 128); 16 B vectors are XOR-swizzled within each 128 B row.
+    unsigned const smem_row = (dim >> 6) * Traits::kHeadGroup + head;
+    unsigned const row_offset = smem_row * kSmemRowBytes + (dim & 63u) * 2;
+    unsigned const swizzle = (smem_row & 7u) * kVecBytes;
+    uint8_t const *smem_base = storage.smem_o.data;
+    uint32_t words[kWords];
+    CUTLASS_PRAGMA_UNROLL
+    for (unsigned v = 0; v < kValues / 8; ++v) {
+      uint4 const vec = *reinterpret_cast<uint4 const *>(
+          smem_base + ((row_offset + v * kVecBytes) ^ swizzle));
+      words[4 * v + 0] = vec.x;
+      words[4 * v + 1] = vec.y;
+      words[4 * v + 2] = vec.z;
+      words[4 * v + 3] = vec.w;
+    }
+    uint32_t const scale = mx::mxfp8_block_scale(words);
+    uint32_t q[kWords / 2];
+    mx::mxfp8_quantize_words(words, scale, q);
+
+    int const row_values = params.num_qo_heads_orig * Traits::kHeadDim;
+    int const scale_cols = row_values / mx::kMxfp8Block;
+    if (static_cast<int>(head) < valid_rows) {
+      unsigned const q_head = static_cast<unsigned>(kv_head_idx) * Traits::kHeadGroup + head;
+      uint8_t *dst = params.o_mxfp8_ptr + static_cast<int64_t>(qo_offset) * row_values +
+                     q_head * Traits::kHeadDim + dim;
+      if constexpr (kValues == 16) {
+        *reinterpret_cast<uint4 *>(dst) = make_uint4(q[0], q[1], q[2], q[3]);
+      } else {
+        *reinterpret_cast<uint2 *>(dst) = make_uint2(q[0], q[1]);
+      }
+      if (lane % kLanesPerBlock == 0) {
+        params.o_mxfp8_scale_ptr[mx::mxfp8_scale_offset(static_cast<unsigned>(qo_offset),
+                                                        q_head * 4 + dim / 32,
+                                                        static_cast<unsigned>(scale_cols))] =
+            static_cast<uint8_t>(scale);
+      }
+    }
+    if (kv_head_idx == 0 && qo_offset == params.o_mxfp8_rows - 1) {
+      mx::mxfp8_zero_padding_scales(params.o_mxfp8_scale_ptr, params.o_mxfp8_rows, scale_cols,
+                                    warp_group_lane, kThreads);
     }
   }
 
@@ -522,11 +600,8 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
     }
   }
 
-  CUTLASS_DEVICE static void store_o_to_global(Storage &storage, Params const &params,
-                                               int batch_idx, int kv_head_idx, int q_token_idx,
-                                               int kv_split_idx, OFragment const &regs_o,
-                                               ScaleFragment const &scale, int warp_group_lane,
-                                               bool direct_store = false) {
+  CUTLASS_DEVICE static void stage_o(Storage &storage, OFragment const &regs_o,
+                                     ScaleFragment const &scale, int warp_group_lane) {
     Bf16OFragment regs_bf16;
     pack_scaled_o_bf16(regs_o, scale, regs_bf16);
     if constexpr (Traits::kHeadGroup == 8) {
@@ -534,6 +609,30 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
     } else {
       store_transposed_smem_16b_128x16(storage.smem_o.data, regs_bf16.data, warp_group_lane);
     }
+  }
+
+  // Quantize and store the tile staged by the previous item. The next item's V conversion waits
+  // for this warpgroup, so a store right after an item would hold it up; the output instead
+  // leaves while the warpgroup idles for the next item's O, and smem_o keeps the tile until then.
+  // Also runs after the last item, and before anything else that writes smem_o.
+  CUTLASS_DEVICE static void commit_staged_o(Storage &storage, Params const &params, State &state,
+                                             int warp_group_lane) {
+    if constexpr (Traits::kOutputMxfp8) {
+      if (state.o_staged) {
+        state.o_staged = false;
+        store_o_sync();
+        copy_o_smem_to_global(storage, params, state.staged_batch_idx, state.staged_kv_head_idx,
+                              state.staged_q_token_idx, warp_group_lane);
+      }
+    }
+  }
+
+  CUTLASS_DEVICE static void store_o_to_global(Storage &storage, Params const &params,
+                                               int batch_idx, int kv_head_idx, int q_token_idx,
+                                               int kv_split_idx, OFragment const &regs_o,
+                                               ScaleFragment const &scale, int warp_group_lane,
+                                               bool direct_store = false) {
+    stage_o(storage, regs_o, scale, warp_group_lane);
     store_o_sync();
     if (use_workspace_split(params) && !direct_store) {
       copy_o_smem_to_workspace(storage, params, batch_idx, kv_head_idx, q_token_idx, kv_split_idx,
@@ -739,10 +838,44 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
           packed[i] = static_cast<uint32_t>(lo.raw()) | (static_cast<uint32_t>(hi.raw()) << 16);
         }
       }
-      uint4 *out_vec = reinterpret_cast<uint4 *>(out_row + col);
-      out_vec[0] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
-      if constexpr (kPassElements == 16) {
-        out_vec[1] = make_uint4(packed[4], packed[5], packed[6], packed[7]);
+      if constexpr (Traits::kOutputMxfp8) {
+        // This thread's stretch of one row: two (8 heads: four) adjacent threads hold a
+        // 32-value MXFP8 block.
+        namespace mx = fmha_sm100::decode_q8kv4::sm100::common;
+        constexpr int kLanesPerBlock = mx::kMxfp8Block / kPassElements;
+        int const row_values = params.num_qo_heads_orig * Traits::kHeadDim;
+        int const out_col = (head_base + row) * Traits::kHeadDim + col;
+        uint32_t const scale = mx::mxfp8_block_scale(packed);
+        uint32_t q[kPassElements / 4];
+        mx::mxfp8_quantize_words(packed, scale, q);
+        uint8_t *dst = params.o_mxfp8_ptr +
+                       static_cast<int64_t>(item.q_token_global) * row_values + out_col;
+        if constexpr (kPassElements == 16) {
+          *reinterpret_cast<uint4 *>(dst) = make_uint4(q[0], q[1], q[2], q[3]);
+        } else {
+          *reinterpret_cast<uint2 *>(dst) = make_uint2(q[0], q[1]);
+        }
+        if (thread_idx % kLanesPerBlock == 0) {
+          params.o_mxfp8_scale_ptr[mx::mxfp8_scale_offset(
+              static_cast<unsigned>(item.q_token_global),
+              static_cast<unsigned>(head_base + row) * 4 + static_cast<unsigned>(col) / 32,
+              static_cast<unsigned>(row_values / mx::kMxfp8Block))] = static_cast<uint8_t>(scale);
+        }
+      }
+      if (!Traits::kOutputMxfp8 || params.o_ptr != nullptr) {
+        uint4 *out_vec = reinterpret_cast<uint4 *>(out_row + col);
+        out_vec[0] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+        if constexpr (kPassElements == 16) {
+          out_vec[1] = make_uint4(packed[4], packed[5], packed[6], packed[7]);
+        }
+      }
+    }
+    if constexpr (Traits::kOutputMxfp8) {
+      if (item.kv_head_idx == 0 && item.q_token_global == params.o_mxfp8_rows - 1) {
+        namespace mx = fmha_sm100::decode_q8kv4::sm100::common;
+        mx::mxfp8_zero_padding_scales(params.o_mxfp8_scale_ptr, params.o_mxfp8_rows,
+                                      params.num_qo_heads_orig * Traits::kHeadDim / mx::kMxfp8Block,
+                                      thread_idx, kThreads);
       }
     }
   }
@@ -795,6 +928,7 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
     bool const merge_in_kernel = balanced_schedule && kv_split_count > 1;
     bool const direct_store = balanced_schedule && kv_split_count <= 1;
     if (tiles <= 0) {
+      commit_staged_o(storage, params, state, warp_group_lane);
       if (merge_in_kernel) {
         // A segment past the request's pages still has to arrive; it publishes a zero partial
         // with -inf LSEs, which the fold weights by exp2(-inf) = 0 and adds as zeros, so the
@@ -858,6 +992,7 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
             KvTransform::visible_v_tokens(record, tile_range.begin + tile + 1));
       }
     }
+    commit_staged_o(storage, params, state, warp_group_lane);
     int const final_event = state.softmax_event;
     int const final_stage = final_event & 1;
     Sm100FmhaBarrier::wait(softmax_local_full_barrier(storage, final_stage),
@@ -884,8 +1019,16 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
       store_lse_to_workspace(params, batch_idx, kv_head_idx, q_token_idx, kv_split_idx, stats,
                              total_sum, warp_group_lane, state.scale_log2);
     }
-    store_o_to_global(storage, params, batch_idx, kv_head_idx, q_token_idx, kv_split_idx, regs_o,
-                      final_scale, warp_group_lane, direct_store);
+    if (Traits::kOutputMxfp8 && (!use_workspace_split(params) || direct_store)) {
+      stage_o(storage, regs_o, final_scale, warp_group_lane);
+      state.o_staged = true;
+      state.staged_batch_idx = batch_idx;
+      state.staged_kv_head_idx = kv_head_idx;
+      state.staged_q_token_idx = q_token_idx;
+    } else {
+      store_o_to_global(storage, params, batch_idx, kv_head_idx, q_token_idx, kv_split_idx, regs_o,
+                        final_scale, warp_group_lane, direct_store);
+    }
 
     // O has left TMEM; release it before the merge so the next item's MMA can start.
     Sm100FmhaBarrier::arrive(o_empty_barrier(storage));
@@ -906,6 +1049,8 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
     State state;
     run_tile(storage, params, batch_idx, kv_head_idx, q_token_idx, lane_idx, warp_group_warp_idx,
              state);
+    commit_staged_o(storage, params, state,
+                    warp_group_warp_idx * cutlass::NumThreadsPerWarp + lane_idx);
   }
 };
 
