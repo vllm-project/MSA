@@ -23,6 +23,7 @@ from cutlass import Float32, Int32, Int64, const_expr
 import cutlass.pipeline as cutlass_pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass.cutlass_dsl import BaseDSL
 
 logger = logging.getLogger(__name__)
 
@@ -274,7 +275,18 @@ class SparseAttentionForwardSm100:
         self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
         self.num_regs_mma = self.num_regs_other
         self.num_regs_load = self.num_regs_other
-        self.ex2_emu_freq = 16 if causal else 0
+        # SM103 (B300 / GB300) doubles the MUFU.EX2 rate, so the FFMA exp2
+        # emulation no longer pays off there; it also has tcgen05.ld.red, which
+        # returns each row's max with the S load. Rubin is left as it was.
+        arch = BaseDSL._get_dsl().get_arch_enum()
+        sm103f = getattr(arch.__class__, "sm_103f", None)
+        sm107 = getattr(arch.__class__, "sm_107", None)
+        self.is_sm103 = (
+            sm103f is not None
+            and arch.is_family_of(sm103f)
+            and not (sm107 is not None and arch.is_family_of(sm107))
+        )
+        self.ex2_emu_freq = 16 if causal and not self.is_sm103 else 0
         self.ex2_emu_start_frg = 1
         self.buffer_align_bytes = 1024
 
@@ -2493,7 +2505,20 @@ class SparseAttentionForwardSm100:
 
         tSrS_t2r = cute.make_rmem_tensor(tScS_t2r.shape, self.qk_acc_dtype)
         row_max = Float32(0.0)
-        cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+        if const_expr(self.is_sm103):
+            # ld.red MAX also returns the max of each 32-column repetition.
+            tSrS_red = cute.make_rmem_tensor(
+                cute.make_layout((1, cute.size(tSrS_t2r, mode=[2]))),
+                self.qk_acc_dtype,
+            )
+            for red_i in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[2])):
+                cute.copy_atom_call(
+                    tiled_tmem_load,
+                    tStS_t2r[None, 0, red_i],
+                    (tSrS_t2r[None, 0, red_i], tSrS_red[None, red_i]),
+                )
+        else:
+            cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
 
         seqlen_info = SeqlenInfoQK(
             Int32(0),
@@ -2553,7 +2578,20 @@ class SparseAttentionForwardSm100:
 
         # Each sparse CTA computes exactly one KV block for the current Q group,
         # so full-tile softmax is always the first and only online-softmax step.
-        row_max, _ = softmax.update_row_max(tSrS_t2r.load(), True)
+        if const_expr(self.is_sm103):
+            # The TMEM-side max holds only if no mask changed the fragment:
+            # a full KV block and, when causal, no masked token in the group.
+            use_tmem_row_max = kv_valid_cols == Int32(self.n_block_size)
+            if const_expr(self.causal and apply_causal_mask):
+                use_tmem_row_max = use_tmem_row_max & (masked_tok_count == Int32(0))
+            if use_tmem_row_max:
+                row_max_raw = tSrS_red.load().reduce(cute.ReductionOp.MAX, -Float32.inf, 0)
+                softmax.row_max[0] = row_max_raw
+                row_max = row_max_raw if row_max_raw != -Float32.inf else Float32(0.0)
+            else:
+                row_max, _ = softmax.update_row_max(tSrS_t2r.load(), True)
+        else:
+            row_max, _ = softmax.update_row_max(tSrS_t2r.load(), True)
         softmax.scale_subtract_rowmax(
             tSrS_t2r,
             row_max,
@@ -2672,10 +2710,18 @@ class SparseAttentionForwardSm100:
         tSAcc = tStS[(None, None), 0, 0, stage]
 
         softmax = SoftmaxSm100.create(softmax_scale_log2)
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
-            self.qk_acc_dtype,
-        )
+        if const_expr(self.is_sm103):
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.LdRed32x32bOp(
+                    tcgen05.copy.Repetition(32), redOp=tcgen05.TmemLoadRedOp.MAX
+                ),
+                self.qk_acc_dtype,
+            )
+        else:
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+                self.qk_acc_dtype,
+            )
         tiled_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tSAcc)
         thr_tmem_load = tiled_tmem_load.get_slice(
             group_tidx
